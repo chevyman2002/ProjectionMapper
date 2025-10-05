@@ -8,4 +8,20 @@
     <UseWPF>true</UseWPF>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Logging & Host -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+
+    <!-- FFmpeg wrapper (runtime native FFmpeg still required) -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="5.1.0" />
+
+    <!-- Direct3D bindings - used later by the D3D renderer. Vortice is recommended. -->
+    <PackageReference Include="Vortice.Windows" Version="2.0.0" />
+
+    <!-- Optional WPF docking library to add later if you decide to use dockable panes (not used in initial UI) -->
+    <!--<PackageReference Include="AvalonDock" Version="3.2.0" />-->
+  </ItemGroup>
+
 </Project>

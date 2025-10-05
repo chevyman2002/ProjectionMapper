@@ -1,0 +1,74 @@
+<Window x:Class="ProjectionMapper.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:views="clr-namespace:ProjectionMapper.Views"
+        Title="ProjectionMapper" Height="720" Width="1200">
+    <DockPanel>
+        <!-- Menu -->
+        <Menu DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem Header="_Open..." />
+                <MenuItem Header="_Save" />
+                <Separator />
+                <MenuItem Header="E_xit" />
+            </MenuItem>
+            <MenuItem Header="_Edit">
+                <MenuItem Header="_Undo" />
+                <MenuItem Header="_Redo" />
+            </MenuItem>
+            <MenuItem Header="_View">
+                <MenuItem Header="_Preview" />
+            </MenuItem>
+            <MenuItem Header="_Help">
+                <MenuItem Header="_About" />
+            </MenuItem>
+        </Menu>
+
+        <!-- Tool bar -->
+        <ToolBarTray DockPanel.Dock="Top" IsLocked="False">
+            <ToolBar>
+                <Button Content="New Surface" />
+                <Button Content="Import" />
+                <Button Content="Preview" />
+            </ToolBar>
+        </ToolBarTray>
+
+        <!-- Status bar -->
+        <StatusBar DockPanel.Dock="Bottom">
+            <TextBlock Text="{Binding StatusText}" />
+        </StatusBar>
+
+        <!-- Main content: left panel (project/layers), center (mesh editor), right (properties) -->
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="300" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Project / Layers -->
+            <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="0,0,1,0" Padding="6">
+                <StackPanel>
+                    <TextBlock FontWeight="Bold" Text="Project" Margin="0,0,0,8"/>
+                    <TreeView>
+                        <!-- Bound to project structure in future -->
+                    </TreeView>
+                </StackPanel>
+            </Border>
+
+            <!-- Mesh editor -->
+            <Border Grid.Column="1" Background="Black" Margin="4">
+                <views:MeshEditorControl />
+            </Border>
+
+            <!-- Properties -->
+            <Border Grid.Column="2" BorderBrush="Gray" BorderThickness="1,0,0,0" Padding="6">
+                <StackPanel>
+                    <TextBlock FontWeight="Bold" Text="Properties" Margin="0,0,0,8"/>
+                    <!-- Simple placeholders for properties inspector -->
+                    <TextBlock Text="Selected: None" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </DockPanel>
+</Window>
