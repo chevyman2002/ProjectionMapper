@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -17,11 +17,13 @@
     <!-- FFmpeg wrapper (runtime native FFmpeg still required) -->
     <PackageReference Include="FFmpeg.AutoGen" Version="5.1.0" />
 
-    <!-- Direct3D bindings - used later by the D3D renderer. Vortice is recommended. -->
-    <PackageReference Include="Vortice.Windows" Version="2.0.0" />
-
-    <!-- Optional WPF docking library to add later if you decide to use dockable panes (not used in initial UI) -->
-    <!--<PackageReference Include="AvalonDock" Version="3.2.0" />-->
+    <!-- NOTE: D3D interop packages are intentionally omitted for now to avoid restore failures.
+         When ready to implement the D3D11 renderer, add the specific Vortice packages such as:
+           <PackageReference Include="Vortice.Direct3D11" Version="2.17.0" />
+           <PackageReference Include="Vortice.DXGI" Version="2.17.0" />
+           <PackageReference Include="Vortice.D3DCompiler" Version="2.17.0" />
+         Confirm the exact versions via nuget.org or Visual Studio's package manager.
+    -->
   </ItemGroup>
 
 </Project>
