@@ -4,7 +4,7 @@ namespace ProjectionMapper.Models
 {
     /// <summary>
     /// Represents a single layer inside a surface.
-    /// Mirrors the properties used by LayerViewModel.
+    /// Mirrors the properties used by LayerViewModel. Includes mapping bounds for output composition.
     /// </summary>
     public class LayerModel
     {
@@ -32,6 +32,16 @@ namespace ProjectionMapper.Models
         /// Whether the layer is visible.
         /// </summary>
         public bool Visible { get; set; } = true;
+
+        /// <summary>
+        /// Mapping rectangle (in surface coordinates) where this layer's content should be drawn.
+        /// X,Y are the top-left coordinates; Width/Height define the bounding box.
+        /// Defaults to 0,0,0,0 — set after creating the layer.
+        /// </summary>
+        public int X { get; set; } = 0;
+        public int Y { get; set; } = 0;
+        public int Width { get; set; } = 0;
+        public int Height { get; set; } = 0;
 
         // Future: Add blend mode, transform, mask, timeline/keyframes, etc.
     }
