@@ -1,15 +1,15 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows;
+using System.Windows.Media.Imaging;
+using ProjectionMapper.Models;
 using ProjectionMapper.Views;
 
 namespace ProjectionMapper.Rendering
 {
     /// <summary>
     /// Coordinates the renderer, a render loop, and a host control.
-    /// This version subscribes to IRenderer.FrameReady and forwards BitmapSource frames to the RenderHostControl.
-    /// It uses RenderLoop to call RenderFrameAsync at a target FPS.
+    /// Exposes SubmitLayerFrame as a convenience for decoders/services to push per-layer frames.
     /// </summary>
     public sealed class RendererManager : IDisposable
     {
@@ -25,18 +25,11 @@ namespace ProjectionMapper.Rendering
             _renderer.FrameReady += OnFrameReady;
         }
 
-        /// <summary>
-        /// Attach a RenderHostControl which will receive frames.
-        /// Attaching can be done before StartAsync.
-        /// </summary>
         public void AttachHost(RenderHostControl host)
         {
             _host = host ?? throw new ArgumentNullException(nameof(host));
         }
 
-        /// <summary>
-        /// Start rendering with the provided viewport size.
-        /// </summary>
         public async Task StartAsync(int width, int height, CancellationToken token = default)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RendererManager));
@@ -44,19 +37,15 @@ namespace ProjectionMapper.Rendering
 
             await _renderer.InitializeAsync(width, height, token).ConfigureAwait(false);
 
-            // Create simple render loop that calls into the renderer
             _renderLoop = new RenderLoop(async ct =>
             {
                 await _renderer.RenderFrameAsync(ct).ConfigureAwait(false);
-            }, targetFps: 30.0); // default 30 FPS for software renderer usage
+            }, targetFps: 30.0);
 
             _renderLoop.Start();
             _started = true;
         }
 
-        /// <summary>
-        /// Stop rendering and release resources.
-        /// </summary>
         public async Task StopAsync()
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RendererManager));
@@ -71,25 +60,32 @@ namespace ProjectionMapper.Rendering
             _started = false;
         }
 
-        private void OnFrameReady(System.Windows.Media.Imaging.BitmapSource? bmp)
+        private void OnFrameReady(BitmapSource? bmp)
         {
             if (_host == null) return;
 
             if (bmp == null)
             {
-                // Optionally clear host
-                Application.Current?.Dispatcher?.Invoke(() => _host.Clear());
+                _host.Clear();
                 return;
             }
 
-            // Ensure UI thread update
-            if (Application.Current?.Dispatcher?.CheckAccess() == true)
+            _host.SetFrame(bmp);
+        }
+
+        /// <summary>
+        /// Submit a per-layer frame to the underlying renderer for composition.
+        /// destRect is in renderer output coordinates (pixels).
+        /// </summary>
+        public void SubmitLayerFrame(string layerId, BitmapSource? frame, System.Windows.Rect destRect, double opacity)
+        {
+            try
             {
-                _host.SetFrame(bmp);
+                _renderer.SubmitLayerFrame(layerId, frame, destRect, opacity);
             }
-            else
+            catch (Exception)
             {
-                Application.Current?.Dispatcher?.Invoke(() => _host.SetFrame(bmp));
+                // swallow - renderer may not support layering (no-op)
             }
         }
 

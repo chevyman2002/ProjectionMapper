@@ -28,7 +28,7 @@
         <ToolBarTray DockPanel.Dock="Top" IsLocked="False">
             <ToolBar>
                 <Button Content="New Surface" />
-                <Button Content="Import" />
+                <Button Content="Import" Click="ImportButton_Click" />
                 <Button Content="Preview" />
             </ToolBar>
         </ToolBarTray>
@@ -38,7 +38,7 @@
             <TextBlock Text="{Binding StatusText}" />
         </StatusBar>
 
-        <!-- Main content: left panel (project/layers), center (mesh editor), right (properties) -->
+        <!-- Main content: left panel (project/layers), center (mesh editor + preview), right (properties) -->
         <Grid>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="260" />
@@ -56,9 +56,13 @@
                 </StackPanel>
             </Border>
 
-            <!-- Mesh editor -->
+            <!-- Center: preview (RenderHostControl) and MeshEditor on top -->
             <Border Grid.Column="1" Background="Black" Margin="4">
-                <views:MeshEditorControl />
+                <Grid>
+                    <views:RenderHostControl x:Name="PART_RenderHost" />
+                    <!-- Mesh editor overlay (transparent) -->
+                    <views:MeshEditorControl VerticalAlignment="Stretch" HorizontalAlignment="Stretch" />
+                </Grid>
             </Border>
 
             <!-- Properties -->
