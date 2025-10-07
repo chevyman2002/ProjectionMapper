@@ -5,10 +5,30 @@
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              mc:Ignorable="d"
              MinHeight="200" MinWidth="200">
-    <Grid Background="{DynamicResource {x:Static SystemColors.ControlLightBrushKey}}">
-        <!-- A simple canvas where mesh editing will be implemented.
-             Future: custom Adorner layer, handles, snapping grid, zoom/pan transforms.
-        -->
-        <Canvas Name="PART_Canvas" Background="Transparent" ClipToBounds="True"/>
+    <Grid Background="Transparent">
+        <Canvas Name="PART_Canvas" Background="Transparent" ClipToBounds="True">
+            <!-- Actual input image supplied by renderer -->
+            <Image x:Name="PART_InputImage" Stretch="Fill" Canvas.Left="0" Canvas.Top="0" />
+
+            <!-- Mesh polygon (editable quad) -->
+            <Polygon x:Name="PART_InputPolygon" Visibility="Collapsed" Stroke="DodgerBlue" StrokeThickness="2" Fill="#403498DB" Points="0,0 0,0 0,0 0,0" />
+
+            <!-- Input corner handles -->
+            <Thumb x:Name="PART_InputHandle_TL" Visibility="Collapsed" Width="12" Height="12" Background="White" BorderBrush="Black" BorderThickness="1" />
+            <Thumb x:Name="PART_InputHandle_TR" Visibility="Collapsed" Width="12" Height="12" Background="White" BorderBrush="Black" BorderThickness="1" />
+            <Thumb x:Name="PART_InputHandle_BL" Visibility="Collapsed" Width="12" Height="12" Background="White" BorderBrush="Black" BorderThickness="1" />
+            <Thumb x:Name="PART_InputHandle_BR" Visibility="Collapsed" Width="12" Height="12" Background="White" BorderBrush="Black" BorderThickness="1" />
+
+            <!-- Output rectangle (green) which can be moved as a whole -->
+            <Rectangle x:Name="PART_OutputRect" Visibility="Collapsed" Stroke="LimeGreen" StrokeThickness="2" Fill="#4033DB33" />
+            <Thumb x:Name="PART_OutputDrag" Visibility="Collapsed" Width="0" Height="0" Background="Transparent">
+                <Thumb.Template>
+                    <ControlTemplate TargetType="Thumb">
+                        <!-- Invisible hit target -->
+                        <Rectangle Fill="Transparent" />
+                    </ControlTemplate>
+                </Thumb.Template>
+            </Thumb>
+        </Canvas>
     </Grid>
 </UserControl>

@@ -1,8 +1,16 @@
-<Window x:Class="ProjectionMapper.MainWindow"
+﻿<Window x:Class="ProjectionMapper.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:views="clr-namespace:ProjectionMapper.Views"
-        Title="ProjectionMapper" Height="720" Width="1200">
+        xmlns:vm="clr-namespace:ProjectionMapper.ViewModels;assembly=ProjectionMapper"
+        xmlns:models="clr-namespace:ProjectionMapper.Models;assembly=ProjectionMapper"
+        xmlns:conv="clr-namespace:ProjectionMapper.Converters"
+        Title="Projection Mapper" Height="720" Width="1200">
+
+    <Window.Resources>
+        <conv:NullToVisibilityConverter x:Key="NullToVisibilityConverter" />
+    </Window.Resources>
+
     <DockPanel>
         <!-- Menu -->
         <Menu DockPanel.Dock="Top">
@@ -27,9 +35,36 @@
         <!-- Tool bar -->
         <ToolBarTray DockPanel.Dock="Top" IsLocked="False">
             <ToolBar>
-                <Button Content="New Surface" />
-                <Button Content="Import" Click="ImportButton_Click" />
-                <Button Content="Preview" />
+                <Button Content="New Surface" Command="{Binding AddSurfaceCommand}" />
+                <Button Content="Import" Command="{Binding ImportCommand}" />
+
+                <!-- Play / Pause (icon changes based on IsPlaying) -->
+                <Button Command="{Binding PlayPauseCommand}" ToolTip="Play / Pause">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Setter Property="Content" Value="▶" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsPlaying}" Value="True">
+                                    <Setter Property="Content" Value="⏸" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+
+                <Button Command="{Binding RestartCommand}" ToolTip="Restart">
+                    <Button.Content>
+                        <TextBlock Text="⟲" />
+                    </Button.Content>
+                </Button>
+
+                <Button Content="Preview" Command="{Binding PreviewCommand}" />
+
+                <Separator />
+                <TextBlock Text="Input Zoom" VerticalAlignment="Center" Margin="8,0,4,0" />
+                <Slider Width="120" Minimum="0.1" Maximum="4" Value="{Binding InputZoom, Mode=TwoWay}" />
+                <TextBlock Text="Output Zoom" VerticalAlignment="Center" Margin="8,0,4,0" />
+                <Slider Width="120" Minimum="0.1" Maximum="4" Value="{Binding OutputZoom, Mode=TwoWay}" />
             </ToolBar>
         </ToolBarTray>
 
@@ -38,40 +73,120 @@
             <TextBlock Text="{Binding StatusText}" />
         </StatusBar>
 
-        <!-- Main content: left panel (project/layers), center (mesh editor + preview), right (properties) -->
+        <!-- Main content: left panel (project/layers + properties), center (input/output split horizontal) -->
         <Grid>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="260" />
+                <ColumnDefinition Width="360" />
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="300" />
             </Grid.ColumnDefinitions>
 
-            <!-- Project / Layers -->
+            <!-- Left: Project / Layers + Properties -->
             <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="0,0,1,0" Padding="6">
                 <StackPanel>
                     <TextBlock FontWeight="Bold" Text="Project" Margin="0,0,0,8"/>
-                    <TreeView>
-                        <!-- Bound to project structure in future -->
+
+                    <!-- TreeView shows ImportedVideos as parents, mesh layers as children -->
+                    <TreeView ItemsSource="{Binding ImportedVideos}" SelectedItemChanged="TreeView_SelectedItemChanged" PreviewMouseRightButtonDown="TreeView_PreviewMouseRightButtonDown">
+                        <TreeView.Resources>
+                            <HierarchicalDataTemplate x:Key="ImportedVideoTemplate" ItemsSource="{Binding MeshLayers}">
+                                <StackPanel Orientation="Horizontal">
+                                    <StackPanel.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Header="Create Mesh Layer" Click="CreateMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                            <MenuItem Header="Delete Mesh Layer" Click="DeleteMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                            <Separator />
+                                            <MenuItem Header="Copy Mesh" Click="CopyMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                            <MenuItem Header="Paste Mesh" Click="PasteMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                            <Separator />
+                                            <MenuItem Header="Delete Source" Click="DeleteSourceMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                        </ContextMenu>
+                                    </StackPanel.ContextMenu>
+                                    <TextBlock Text="{Binding Name}" />
+                                </StackPanel>
+                            </HierarchicalDataTemplate>
+
+                            <DataTemplate x:Key="MeshLayerTemplate">
+                                <StackPanel Orientation="Horizontal">
+                                    <StackPanel.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Header="Delete Mesh Layer" Click="DeleteMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                            <MenuItem Header="Copy Mesh" Click="CopyMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                            <MenuItem Header="Paste Mesh" Click="PasteMeshMenuItem_Click" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                        </ContextMenu>
+                                    </StackPanel.ContextMenu>
+                                    <TextBlock Text="{Binding Name}" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </TreeView.Resources>
+
+                        <TreeView.ItemTemplate>
+                            <StaticResource ResourceKey="ImportedVideoTemplate" />
+                        </TreeView.ItemTemplate>
+
                     </TreeView>
+
+                    <Separator Margin="0,8,0,8" />
+
+                    <TextBlock FontWeight="Bold" Text="Properties" Margin="0,0,0,8"/>
+                    <!-- Simple inspector for selected mesh layer -->
+                    <StackPanel DataContext="{Binding SelectedMeshLayer}">
+                        <TextBlock Text="Selected:" FontWeight="Bold" />
+                        <TextBlock Text="{Binding Name}" />
+                        <TextBlock Text="Source:" FontWeight="Bold" Margin="0,8,0,0" />
+                        <TextBlock Text="{Binding SourcePath}" TextWrapping="Wrap" />
+                        <TextBlock Text="Opacity:" FontWeight="Bold" Margin="0,8,0,0" />
+                        <TextBlock Text="{Binding Opacity}" />
+                        <TextBlock Text="Visible:" FontWeight="Bold" Margin="0,8,0,0" />
+                        <TextBlock Text="{Binding Visible}" />
+
+                        <!-- If a mesh layer is selected, allow rotation -->
+                        <StackPanel Margin="0,8,0,0" Visibility="{Binding Name, Converter={StaticResource NullToVisibilityConverter}}">
+                            <TextBlock Text="Rotation (deg):" FontWeight="Bold" />
+                            <Slider Minimum="-180" Maximum="180" Value="{Binding RotationDegrees, Mode=TwoWay}" />
+                        </StackPanel>
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
-            <!-- Center: preview (RenderHostControl) and MeshEditor on top -->
+            <!-- Center: split input (top) and output (bottom) with a horizontal divider -->
             <Border Grid.Column="1" Background="Black" Margin="4">
                 <Grid>
-                    <views:RenderHostControl x:Name="PART_RenderHost" />
-                    <!-- Mesh editor overlay (transparent) -->
-                    <views:MeshEditorControl VerticalAlignment="Stretch" HorizontalAlignment="Stretch" />
-                </Grid>
-            </Border>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="6" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
 
-            <!-- Properties -->
-            <Border Grid.Column="2" BorderBrush="Gray" BorderThickness="1,0,0,0" Padding="6">
-                <StackPanel>
-                    <TextBlock FontWeight="Bold" Text="Properties" Margin="0,0,0,8"/>
-                    <!-- Simple placeholders for properties inspector -->
-                    <TextBlock Text="Selected: None" />
-                </StackPanel>
+                    <!-- Input panel (top) -->
+                    <DockPanel Grid.Row="0" LastChildFill="True">
+                        <TextBlock Text="Input Preview" Foreground="White" FontWeight="Bold" DockPanel.Dock="Top" Margin="6" />
+                        <ScrollViewer x:Name="PART_InputScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" PanningMode="Both">
+                            <Grid RenderTransformOrigin="0.5,0.5">
+                                <Grid.RenderTransform>
+                                    <ScaleTransform ScaleX="{Binding InputZoom}" ScaleY="{Binding InputZoom}" />
+                                </Grid.RenderTransform>
+                                <views:RenderHostControl x:Name="PART_InputHost" />
+                                <views:MeshEditorControl x:Name="PART_MeshEditor" VerticalAlignment="Stretch" HorizontalAlignment="Stretch" SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}" />
+                            </Grid>
+                        </ScrollViewer>
+                    </DockPanel>
+
+                    <!-- Divider -->
+                    <GridSplitter Grid.Row="1" Height="6" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="Gray" ShowsPreview="True" />
+
+                    <!-- Output panel (bottom) -->
+                    <DockPanel Grid.Row="2" LastChildFill="True">
+                        <TextBlock Text="Output Preview" Foreground="White" FontWeight="Bold" DockPanel.Dock="Top" Margin="6" />
+                        <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" PanningMode="Both">
+                            <Grid RenderTransformOrigin="0.5,0.5">
+                                <Grid.RenderTransform>
+                                    <ScaleTransform ScaleX="{Binding OutputZoom}" ScaleY="{Binding OutputZoom}" />
+                                </Grid.RenderTransform>
+                                <views:RenderHostControl x:Name="PART_OutputHost" />
+                            </Grid>
+                        </ScrollViewer>
+                    </DockPanel>
+                </Grid>
             </Border>
         </Grid>
     </DockPanel>

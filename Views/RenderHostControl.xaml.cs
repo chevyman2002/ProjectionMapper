@@ -14,6 +14,15 @@ namespace ProjectionMapper.Views
             InitializeComponent();
         }
 
+        public static readonly DependencyProperty CurrentFrameProperty = DependencyProperty.Register(
+            nameof(CurrentFrame), typeof(BitmapSource), typeof(RenderHostControl), new PropertyMetadata(null));
+
+        public BitmapSource? CurrentFrame
+        {
+            get => (BitmapSource?)GetValue(CurrentFrameProperty);
+            private set => SetValue(CurrentFrameProperty, value);
+        }
+
         /// <summary>
         /// Set a bitmap frame produced by the renderer (BitmapSource must be frozen).
         /// This method is safe to call from the UI thread; calls from background threads will be dispatched.
@@ -39,10 +48,15 @@ namespace ProjectionMapper.Views
             if (Dispatcher.CheckAccess())
             {
                 PART_Backbuffer.Source = frame;
+                CurrentFrame = frame;
             }
             else
             {
-                Dispatcher.Invoke(() => PART_Backbuffer.Source = frame);
+                Dispatcher.Invoke(() =>
+                {
+                    PART_Backbuffer.Source = frame;
+                    CurrentFrame = frame;
+                });
             }
         }
 
@@ -53,9 +67,18 @@ namespace ProjectionMapper.Views
         {
             if (_disposed) return;
             if (Dispatcher.CheckAccess())
+            {
                 PART_Backbuffer.Source = null;
+                CurrentFrame = null;
+            }
             else
-                Dispatcher.Invoke(() => PART_Backbuffer.Source = null);
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    PART_Backbuffer.Source = null;
+                    CurrentFrame = null;
+                });
+            }
         }
 
         public void Dispose()

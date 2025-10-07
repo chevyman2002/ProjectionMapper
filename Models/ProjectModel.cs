@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Generic;
+using System.Collections.ObjectModel;
 
 namespace ProjectionMapper.Models
 {
@@ -12,6 +12,7 @@ namespace ProjectionMapper.Models
         public string? Name { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
-        public List<SurfaceModel> Surfaces { get; } = new List<SurfaceModel>();
+        // Make surfaces observable for UI binding
+        public ObservableCollection<SurfaceModel> Surfaces { get; } = new ObservableCollection<SurfaceModel>();
     }
 }

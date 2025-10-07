@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Numerics;
 
 namespace ProjectionMapper.Models
@@ -18,7 +18,7 @@ namespace ProjectionMapper.Models
         public int Height { get; set; } = 1080;
 
         // Per-surface layers (ordered front-to-back)
-        public List<LayerModel> Layers { get; } = new List<LayerModel>();
+        public ObservableCollection<LayerModel> Layers { get; } = new ObservableCollection<LayerModel>();
 
         // Placeholder matrix describing transform from surface-local to output coordinates
         public Matrix3x2 Transform { get; set; } = Matrix3x2.Identity;

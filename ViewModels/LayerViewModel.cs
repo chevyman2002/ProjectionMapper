@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Numerics;
 using ProjectionMapper.Models;
 
 namespace ProjectionMapper.ViewModels
@@ -58,6 +59,70 @@ namespace ProjectionMapper.ViewModels
             {
                 if (_model.Visible == value) return;
                 _model.Visible = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int X
+        {
+            get => _model.X;
+            set
+            {
+                if (_model.X == value) return;
+                _model.X = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int Y
+        {
+            get => _model.Y;
+            set
+            {
+                if (_model.Y == value) return;
+                _model.Y = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int Width
+        {
+            get => _model.Width;
+            set
+            {
+                if (_model.Width == value) return;
+                _model.Width = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int Height
+        {
+            get => _model.Height;
+            set
+            {
+                if (_model.Height == value) return;
+                _model.Height = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public Vector2[] MeshPoints => _model.MeshPoints;
+
+        public void SetMeshPoint(int index, Vector2 pt)
+        {
+            if (index < 0 || index >= _model.MeshPoints.Length) throw new ArgumentOutOfRangeException(nameof(index));
+            _model.MeshPoints[index] = pt;
+            RaisePropertyChanged(nameof(MeshPoints));
+        }
+
+        public double RotationDegrees
+        {
+            get => _model.RotationDegrees;
+            set
+            {
+                if (Math.Abs(_model.RotationDegrees - value) < 1e-6) return;
+                _model.RotationDegrees = value;
                 RaisePropertyChanged();
             }
         }
