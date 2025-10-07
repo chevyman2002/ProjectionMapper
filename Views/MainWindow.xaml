@@ -76,17 +76,17 @@
         <!-- Main content: left panel (project/layers + properties), center (input/output split horizontal) -->
         <Grid>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="360" />
-                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="228" />
+                <ColumnDefinition />
             </Grid.ColumnDefinitions>
 
             <!-- Left: Project / Layers + Properties -->
-            <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="0,0,1,0" Padding="6">
+            <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="0,0,1,0" Padding="6" Margin="0,0,10,0">
                 <StackPanel>
                     <TextBlock FontWeight="Bold" Text="Project" Margin="0,0,0,8"/>
 
                     <!-- TreeView shows ImportedVideos as parents, mesh layers as children -->
-                    <TreeView ItemsSource="{Binding ImportedVideos}" SelectedItemChanged="TreeView_SelectedItemChanged" PreviewMouseRightButtonDown="TreeView_PreviewMouseRightButtonDown">
+                    <TreeView ItemsSource="{Binding ImportedVideos}" SelectedItemChanged="TreeView_SelectedItemChanged" PreviewMouseRightButtonDown="TreeView_PreviewMouseRightButtonDown" Height="298">
                         <TreeView.Resources>
                             <HierarchicalDataTemplate x:Key="ImportedVideoTemplate" ItemsSource="{Binding MeshLayers}">
                                 <StackPanel Orientation="Horizontal">
@@ -149,7 +149,7 @@
             </Border>
 
             <!-- Center: split input (top) and output (bottom) with a horizontal divider -->
-            <Border Grid.Column="1" Background="Black" Margin="4">
+            <Border Grid.Column="1" Background="Black" Margin="4,4,4,4">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*" />
