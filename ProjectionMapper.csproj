@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -22,6 +22,7 @@
 
     <!-- FFmpeg wrapper (runtime native FFmpeg still required) -->
     <PackageReference Include="FFmpeg.AutoGen" Version="5.1.0" />
+    <PackageReference Include="NAudio" Version="2.1.0" />
 
     <!-- NOTE: D3D interop packages are intentionally omitted for now to avoid restore failures.
          When ready to implement the D3D11 renderer, add the specific Vortice packages such as:

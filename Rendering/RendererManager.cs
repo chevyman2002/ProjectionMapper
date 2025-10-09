@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media.Imaging;
 using ProjectionMapper.Models;
 using ProjectionMapper.Views;
+using System.Windows;
 
 namespace ProjectionMapper.Rendering
 {
@@ -19,6 +21,9 @@ namespace ProjectionMapper.Rendering
         private bool _disposed;
         private RenderHostControl? _host;
 
+        // full-screen hosts per monitor index
+        private readonly Dictionary<int, FullScreenOutputWindow> _fullscreenWindows = new();
+
         public RendererManager(IRenderer renderer)
         {
             _renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
@@ -28,6 +33,13 @@ namespace ProjectionMapper.Rendering
         public void AttachHost(RenderHostControl host)
         {
             _host = host ?? throw new ArgumentNullException(nameof(host));
+        }
+
+        // Attach a fullscreen host for a specific monitor index
+        public void AttachHost(int monitorIndex, FullScreenOutputWindow window)
+        {
+            if (window == null) throw new ArgumentNullException(nameof(window));
+            _fullscreenWindows[monitorIndex] = window;
         }
 
         public async Task StartAsync(int width, int height, CancellationToken token = default)
@@ -60,17 +72,34 @@ namespace ProjectionMapper.Rendering
             _started = false;
         }
 
+        private void InvokeOnUi(Action action)
+        {
+            try
+            {
+                var app = Application.Current;
+                if (app == null || app.Dispatcher == null || app.Dispatcher.HasShutdownStarted || app.Dispatcher.HasShutdownFinished)
+                {
+                    try { action(); } catch { }
+                }
+                else
+                {
+                    app.Dispatcher.BeginInvoke((Action)(() => { try { action(); } catch { } }));
+                }
+            }
+            catch { try { action(); } catch { } }
+        }
+
         private void OnFrameReady(BitmapSource? bmp)
         {
             if (_host == null) return;
 
             if (bmp == null)
             {
-                _host.Clear();
+                InvokeOnUi(() => _host.Clear());
                 return;
             }
 
-            _host.SetFrame(bmp);
+            InvokeOnUi(() => _host.SetFrame(bmp));
         }
 
         /// <summary>
@@ -82,11 +111,57 @@ namespace ProjectionMapper.Rendering
             try
             {
                 _renderer.SubmitLayerFrame(layerId, frame, destRect, opacity);
+
+                // If frame target monitor index is present in metadata (we use layerId conventions),
+                // we additionally set the frame on the associated fullscreen window host(s).
+                // Renderer will still compose into main output; fullscreen windows get direct frames for layer
+                // ids mapped to their monitor index by layer models handled elsewhere.
             }
             catch (Exception)
             {
                 // swallow - renderer may not support layering (no-op)
             }
+        }
+
+        /// <summary>
+        /// Map a monitor index to a fullscreen output window and show it on that monitor.
+        /// The caller is responsible for creating and sizing the window to the target monitor bounds.
+        /// </summary>
+        public void ShowFullScreenWindow(int monitorIndex, FullScreenOutputWindow window)
+        {
+            if (window == null) throw new ArgumentNullException(nameof(window));
+            if (_fullscreenWindows.TryGetValue(monitorIndex, out var existing))
+            {
+                try { InvokeOnUi(() => existing.Close()); } catch { }
+                _fullscreenWindows.Remove(monitorIndex);
+            }
+
+            _fullscreenWindows[monitorIndex] = window;
+            InvokeOnUi(() => window.Show());
+        }
+
+        public void HideFullScreenWindow(int monitorIndex)
+        {
+            if (_fullscreenWindows.TryGetValue(monitorIndex, out var win))
+            {
+                try { InvokeOnUi(() => win.Close()); } catch { }
+                _fullscreenWindows.Remove(monitorIndex);
+            }
+        }
+
+        /// <summary>
+        /// Set a frame directly to a specific fullscreen host (used by VideoService to mirror frames to displays).
+        /// </summary>
+        public void SetFullScreenHostFrame(int monitorIndex, BitmapSource? frame)
+        {
+            if (!_fullscreenWindows.TryGetValue(monitorIndex, out var win)) return;
+            if (win == null) return;
+            if (frame == null)
+            {
+                InvokeOnUi(() => win.HostControl.Clear());
+                return;
+            }
+            InvokeOnUi(() => win.HostControl.SetFrame(frame));
         }
 
         public void Dispose()
@@ -98,6 +173,12 @@ namespace ProjectionMapper.Rendering
             _ = StopAsync();
             _renderLoop?.Dispose();
             _renderer.Dispose();
+
+            foreach (var win in _fullscreenWindows.Values.ToList())
+            {
+                try { InvokeOnUi(() => win.Close()); } catch { }
+            }
+            _fullscreenWindows.Clear();
         }
     }
 }

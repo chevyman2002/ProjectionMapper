@@ -10,6 +10,13 @@ using ProjectionMapper.Rendering;
 using ProjectionMapper.Services;
 using ProjectionMapper.Models;
 using ProjectionMapper.ViewModels;
+using System.Collections.ObjectModel;
+using System.Windows.Threading;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using ProjectionMapper.Views;
+using System.Windows.Interop;
+using System.Windows.Media.Imaging;
 
 namespace ProjectionMapper
 {
@@ -24,6 +31,17 @@ namespace ProjectionMapper
         // Services
         private readonly VideoService _videoService;
         private readonly FileDialogService _fileDialog;
+
+        // Monitor list for UI
+        private readonly ObservableCollection<MonitorItem> _monitorItems = new();
+        private List<MonitorInfo> _monitors = new();
+
+        private class MonitorItem
+        {
+            public int Index { get; set; }
+            public string Name { get; set; } = string.Empty;
+            public override string ToString() => Name;
+        }
 
         public MainWindow()
         {
@@ -53,6 +71,64 @@ namespace ProjectionMapper
             _vm.PreviewRequested += () => { _vm.StatusText = "Preview requested"; };
             _vm.DeleteImportedRequested += async imported => await HandleDeleteImportedAsync(imported);
 
+            // Wire playback controls to VideoService
+            _vm.PlayPauseRequested += async () =>
+            {
+                try
+                {
+                    if (_vm.IsPlaying)
+                    {
+                        await _videoService.ResumeAllAsync();
+                    }
+                    else
+                    {
+                        await _videoService.PauseAllAsync();
+                    }
+                }
+                catch { }
+            };
+
+            _vm.RestartRequested += async () =>
+            {
+                try
+                {
+                    await _videoService.RestartAllAsync();
+                }
+                catch { }
+            };
+
+            // populate monitor list for UI using Win32 EnumDisplayMonitors and store monitor info
+            try
+            {
+                _monitors = EnumerateMonitors();
+                for (int i = 0; i < _monitors.Count; i++)
+                {
+                    var m = _monitors[i];
+                    _monitorItems.Add(new MonitorItem { Index = i, Name = $"Display {i + 1} ({m.Width}x{m.Height})" });
+                }
+            }
+            catch { }
+
+            // assign itemsource for combo (ComboBox defined in XAML with x:Name PART_MonitorCombo)
+            Loaded += (_, __) =>
+            {
+                if (PART_MonitorCombo != null)
+                {
+                    PART_MonitorCombo.ItemsSource = _monitorItems;
+                    PART_MonitorCombo.SelectionChanged += PART_MonitorCombo_SelectionChanged;
+                }
+
+                // Wire mesh monitor combo for per-mesh assignment
+                if (PART_MeshMonitorCombo != null)
+                {
+                    PART_MeshMonitorCombo.ItemsSource = _monitorItems;
+                    PART_MeshMonitorCombo.SelectionChanged += PART_MeshMonitorCombo_SelectionChanged;
+                }
+
+                // Wire up audio control event handlers
+                HookAudioControls();
+            };
+
             // Start renderer (use output host size; fallback to 1280x720)
             Loaded += async (_, __) =>
             {
@@ -70,6 +146,183 @@ namespace ProjectionMapper
                 _videoService.Dispose();
                 _rendererManager.Dispose();
             };
+
+            // Hook mesh layer created event so we can register with VideoService
+            _vm.MeshLayerCreated += async mesh =>
+            {
+                if (mesh != null && !string.IsNullOrEmpty(mesh.Id))
+                {
+                    await _videoService.RegisterMeshLayerAsync(mesh);
+                }
+            };
+        }
+
+        private void HookAudioControls()
+        {
+            try
+            {
+                // Wire PlayAudio checkbox
+                if (PART_PlayAudioCheckbox != null)
+                {
+                    PART_PlayAudioCheckbox.Checked += PlayAudioCheckbox_CheckedChanged;
+                    PART_PlayAudioCheckbox.Unchecked += PlayAudioCheckbox_CheckedChanged;
+                }
+
+                // Wire volume slider
+                if (PART_VolumeSlider != null)
+                {
+                    PART_VolumeSlider.ValueChanged += VolumeSlider_ValueChanged;
+                }
+
+                // Wire mute checkbox
+                if (PART_MuteCheckbox != null)
+                {
+                    PART_MuteCheckbox.Checked += MuteCheckbox_CheckedChanged;
+                    PART_MuteCheckbox.Unchecked += MuteCheckbox_CheckedChanged;
+                }
+            }
+            catch { }
+        }
+
+        private void PlayAudioCheckbox_CheckedChanged(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var imported = _vm.SelectedImportedVideo;
+                if (imported?.HostLayer == null) return;
+
+                var playAudio = imported.PlayAudio; // This reads from the bound property
+
+                if (playAudio)
+                {
+                    // Start audio for host layer by re-registering with audio enabled
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _videoService.RegisterLayerAsync(imported.HostLayer, playAudio: true);
+                        }
+                        catch { }
+                    });
+                }
+                else
+                {
+                    // Stop audio for host layer
+                    if (!string.IsNullOrEmpty(imported.HostLayer.Id))
+                    {
+                        _videoService.StopAudioForLayer(imported.HostLayer.Id);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            try
+            {
+                var imported = _vm.SelectedImportedVideo;
+                if (imported?.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
+                {
+                    // The binding will update the model property, but also update the audio service
+                    _videoService.SetLayerVolume(imported.HostLayer.Id, (float)e.NewValue);
+                }
+            }
+            catch { }
+        }
+
+        private void MuteCheckbox_CheckedChanged(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var imported = _vm.SelectedImportedVideo;
+                if (imported?.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
+                {
+                    // The binding will update the model property, but also update the audio service
+                    var muted = imported.Muted; // This reads from the bound property
+                    _videoService.SetLayerMute(imported.HostLayer.Id, muted);
+                }
+            }
+            catch { }
+        }
+
+        private void PART_MeshMonitorCombo_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+        {
+            var combo = sender as ComboBox;
+            if (combo == null) return;
+            var item = combo.SelectedItem as MonitorItem;
+            var meshVm = _vm.SelectedMeshLayer;
+            if (meshVm == null) return;
+
+            // set target monitor on underlying model
+            if (meshVm.Model != null)
+            {
+                meshVm.Model.TargetMonitorIndex = item != null ? item.Index : -1;
+
+                // show fullscreen for this mesh if assigned
+                if (meshVm.Model.TargetMonitorIndex >= 0 && meshVm.Model.TargetMonitorIndex < _monitors.Count)
+                {
+                    CreateOrShowFullScreenForMonitor(meshVm.Model.TargetMonitorIndex);
+                }
+            }
+        }
+
+        private void CreateOrShowFullScreenForMonitor(int monitorIndex)
+        {
+            if (monitorIndex < 0 || monitorIndex >= _monitors.Count) return;
+            var mon = _monitors[monitorIndex];
+
+            // create fullscreen window and position it using monitor bounds converted to DIPs
+            var win = new FullScreenOutputWindow
+            {
+                WindowStyle = WindowStyle.None,
+                ResizeMode = ResizeMode.NoResize,
+                ShowInTaskbar = false,
+                Topmost = true
+            };
+
+            // Convert monitor pixel bounds to WPF device-independent units
+            var source = PresentationSource.FromVisual(this);
+            double dpiX = 1.0, dpiY = 1.0;
+            if (source != null && source.CompositionTarget != null)
+            {
+                // TransformFromDevice is a Matrix, but CompositionTarget has TransformFromDevice
+                dpiX = source.CompositionTarget.TransformFromDevice.M11;
+                dpiY = source.CompositionTarget.TransformFromDevice.M22;
+            }
+
+            win.Left = mon.Left * dpiX;
+            win.Top = mon.Top * dpiY;
+            win.Width = mon.Width * dpiX;
+            win.Height = mon.Height * dpiY;
+
+            win.WindowStartupLocation = WindowStartupLocation.Manual;
+            win.Show();
+
+            _rendererManager.ShowFullScreenWindow(monitorIndex, win);
+        }
+
+        private void PART_MonitorCombo_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+        {
+            var combo = sender as ComboBox;
+            if (combo == null) return;
+            var item = combo.SelectedItem as MonitorItem;
+            var imported = _vm.SelectedImportedVideo;
+            if (imported?.HostLayer != null && item != null)
+            {
+                imported.HostLayer.TargetMonitorIndex = item.Index;
+
+                // Create or show fullscreen window on the selected monitor
+                if (item.Index >= 0 && item.Index < _monitors.Count)
+                {
+                    CreateOrShowFullScreenForMonitor(item.Index);
+                }
+                else
+                {
+                    // hide any existing fullscreen for this index
+                    _rendererManager.HideFullScreenWindow(item.Index);
+                }
+            }
         }
 
         private async Task HandleImportAsync()
@@ -91,7 +344,7 @@ namespace ProjectionMapper
                     Id = id,
                     Name = importedVm.Name,
                     SourcePath = path,
-                    // mark as preview-only so frames do not get submitted to main renderer
+                    // play immediately for isolated preview only; do not submit frames to main renderer until mesh created
                     PreviewOnly = true
                 };
 
@@ -102,15 +355,27 @@ namespace ProjectionMapper
                 if (w == 0 || h == 0) { w = 1280; h = 720; }
                 hostLayer.X = 0; hostLayer.Y = 0; hostLayer.Width = w; hostLayer.Height = h;
 
-                // Register decoder for the imported video so MeshEditor can show isolated preview
+                // Register decoder for the imported video so MeshEditor can show isolated preview and so output is submitted to renderer
                 await _videoService.RegisterLayerAsync(hostLayer);
                 importedVm.HostLayer = hostLayer;
 
-                // Add to view model collection (parent node). Do NOT create mesh layer automatically.
-                _vm.ImportedVideos.Add(importedVm);
+                // Notify the ImportedVideoViewModel that HostLayer changed so bindings update
+                importedVm.NotifyHostLayerChanged();
 
-                // Select the imported video in the VM
-                _vm.SelectedImportedVideo = importedVm;
+                // Add to view model collection (parent node). Do NOT create mesh layer automatically.
+                // Ensure we marshal back to UI thread
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    _vm.ImportedVideos.Add(importedVm);
+                    // Select the imported video in the VM
+                    _vm.SelectedImportedVideo = importedVm;
+
+                    // update monitor combo selection if available
+                    if (PART_MonitorCombo != null && importedVm.HostLayer != null)
+                    {
+                        PART_MonitorCombo.SelectedIndex = importedVm.HostLayer.TargetMonitorIndex >= 0 ? importedVm.HostLayer.TargetMonitorIndex : -1;
+                    }
+                }, DispatcherPriority.Normal);
             }
             catch (Exception ex)
             {
@@ -143,11 +408,14 @@ namespace ProjectionMapper
             catch { }
 
             // Remove from VM collection
-            _vm.ImportedVideos.Remove(imported);
+            await Dispatcher.InvokeAsync(() =>
+            {
+                _vm.ImportedVideos.Remove(imported);
 
-            // Clear selection if it was the deleted one
-            if (_vm.SelectedImportedVideo == imported) _vm.SelectedImportedVideo = null;
-            if (_vm.SelectedMeshLayer != null && imported.MeshLayers.Contains(_vm.SelectedMeshLayer)) _vm.SelectedMeshLayer = null;
+                // Clear selection if it was the deleted one
+                if (_vm.SelectedImportedVideo == imported) _vm.SelectedImportedVideo = null;
+                if (_vm.SelectedMeshLayer != null && imported.MeshLayers.Contains(_vm.SelectedMeshLayer)) _vm.SelectedMeshLayer = null;
+            });
         }
 
         private void TreeView_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
@@ -156,6 +424,11 @@ namespace ProjectionMapper
             if (e.NewValue is LayerViewModel layerVm)
             {
                 _vm.SelectedMeshLayer = layerVm;
+                // reflect current mesh monitor selection in UI
+                if (PART_MeshMonitorCombo != null && layerVm.Model != null)
+                {
+                    PART_MeshMonitorCombo.SelectedIndex = layerVm.Model.TargetMonitorIndex >= 0 ? layerVm.Model.TargetMonitorIndex : -1;
+                }
                 return;
             }
 
@@ -165,6 +438,24 @@ namespace ProjectionMapper
                 _vm.SelectedImportedVideo = imported;
                 // Optionally select nothing for mesh layer
                 _vm.SelectedMeshLayer = null;
+
+                // update monitor combo selection
+                if (PART_MonitorCombo != null && imported.HostLayer != null)
+                {
+                    PART_MonitorCombo.SelectedIndex = imported.HostLayer.TargetMonitorIndex >= 0 ? imported.HostLayer.TargetMonitorIndex : -1;
+                }
+
+                // Ensure PlayAudio checkbox reflects state; it's bound in XAML so this is just to ensure service state
+                try
+                {
+                    // If PlayAudio is true and no audio player exists, start audio
+                    if (imported.HostLayer != null && imported.HostLayer.PlayAudio)
+                    {
+                        _ = _videoService.RegisterLayerAsync(imported.HostLayer, playAudio: true);
+                    }
+                }
+                catch { }
+
                 return;
             }
 
@@ -221,6 +512,101 @@ namespace ProjectionMapper
             }
         }
 
+        private void ImportedContextMenu_Opened(object sender, RoutedEventArgs e)
+        {
+            var cm = sender as ContextMenu;
+            if (cm == null) return;
+            var fe = cm.PlacementTarget as FrameworkElement;
+            var imported = fe?.DataContext as ImportedVideoViewModel;
+            if (imported == null) return;
+
+            // find hide/show menu item by Tag
+            var mi = cm.Items.OfType<MenuItem>().FirstOrDefault(m => m.Tag as string == "HideShowToggle");
+            if (mi == null) return;
+
+            // If host layer is paused/hidden, show 'Show', otherwise 'Hide'
+            if (imported.HostLayer == null)
+            {
+                mi.Header = "Hide Source Output/Meshes";
+                return;
+            }
+
+            var visible = imported.HostLayer.Visible;
+            mi.Header = visible ? "Hide Source Output/Meshes" : "Show Source Output/Meshes";
+        }
+
+        private async void HideSourceOutputMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            var mi = sender as MenuItem;
+            var cm = FindParentContextMenu(mi);
+            var imported = (cm?.PlacementTarget as FrameworkElement)?.DataContext as ImportedVideoViewModel;
+            if (imported != null)
+            {
+                try
+                {
+                    if (imported.HostLayer != null)
+                    {
+                        // toggle
+                        if (imported.HostLayer.Visible)
+                        {
+                            // hide: update UI immediately
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                foreach (var meshVm in imported.MeshLayers.ToList()) meshVm.Visible = false;
+                                imported.HostLayer.Visible = false;
+                            }, DispatcherPriority.Normal);
+
+                            // pause decoding and hide via service
+                            await _videoService.HideSourceOutputAndMeshesAsync(imported.HostLayer.Id);
+
+                            // hide any fullscreen assigned to host
+                            if (imported.HostLayer.TargetMonitorIndex >= 0)
+                            {
+                                _rendererManager.HideFullScreenWindow(imported.HostLayer.TargetMonitorIndex);
+                            }
+
+                            // hide any fullscreen assigned to mesh layers
+                            foreach (var meshVm in imported.MeshLayers)
+                            {
+                                if (meshVm.Model?.TargetMonitorIndex >= 0)
+                                {
+                                    _rendererManager.HideFullScreenWindow(meshVm.Model.TargetMonitorIndex);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // show: resume decoding via service first
+                            await _videoService.ShowSourceOutputAndMeshesAsync(imported.HostLayer.Id);
+
+                            // update UI on UI thread
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                imported.HostLayer.Visible = true;
+                                foreach (var meshVm in imported.MeshLayers.ToList()) meshVm.Visible = true;
+                            }, DispatcherPriority.Normal);
+
+                            // restore fullscreen for host if assigned
+                            if (imported.HostLayer.TargetMonitorIndex >= 0)
+                            {
+                                CreateOrShowFullScreenForMonitor(imported.HostLayer.TargetMonitorIndex);
+                            }
+
+                            // restore fullscreen for meshes if assigned
+                            foreach (var meshVm in imported.MeshLayers)
+                            {
+                                if (meshVm.Model?.TargetMonitorIndex >= 0)
+                                {
+                                    CreateOrShowFullScreenForMonitor(meshVm.Model.TargetMonitorIndex);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
         private void DeleteMeshMenuItem_Click(object sender, RoutedEventArgs e)
         {
             var mi = sender as MenuItem;
@@ -270,6 +656,84 @@ namespace ProjectionMapper
             }
         }
 
+        private void RenameMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            var mi = sender as MenuItem;
+            LayerViewModel? layerVm = null;
+
+            // Try command parameter first (safer when context menu is separated)
+            try
+            {
+                layerVm = mi?.CommandParameter as LayerViewModel;
+            }
+            catch { }
+
+            // Fallback: attempt to find the placement target's DataContext
+            if (layerVm == null)
+            {
+                try
+                {
+                    var cm = FindParentContextMenu(mi);
+                    layerVm = (cm?.PlacementTarget as FrameworkElement)?.DataContext as LayerViewModel;
+                }
+                catch { }
+            }
+
+            // Final fallback: use currently selected mesh in VM
+            if (layerVm == null) layerVm = _vm.SelectedMeshLayer;
+            if (layerVm == null) return;
+
+            // Simple prompt dialog
+            var prompt = new Window
+            {
+                Title = "Rename Mesh",
+                Width = 400,
+                Height = 140,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                ResizeMode = ResizeMode.NoResize
+            };
+
+            var sp = new StackPanel { Margin = new Thickness(10) };
+            sp.Children.Add(new TextBlock { Text = "Enter new name:", Margin = new Thickness(0,0,0,6) });
+            var tb = new TextBox { Text = layerVm.Name ?? string.Empty };
+            sp.Children.Add(tb);
+            var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0,10,0,0) };
+            var ok = new Button { Content = "OK", Width = 80, IsDefault = true };
+            var cancel = new Button { Content = "Cancel", Width = 80, IsCancel = true, Margin = new Thickness(8,0,0,0) };
+            btnPanel.Children.Add(ok); btnPanel.Children.Add(cancel);
+            sp.Children.Add(btnPanel);
+            prompt.Content = sp;
+
+            ok.Click += (_, __) => prompt.DialogResult = true;
+
+            if (prompt.ShowDialog() == true)
+            {
+                var newName = tb.Text?.Trim();
+                if (!string.IsNullOrEmpty(newName))
+                {
+                    // Ensure uniqueness - if name exists, append numeric suffix
+                    var baseName = newName;
+                    int suffix = 1;
+                    bool exists;
+                    do
+                    {
+                        exists = _vm.ImportedVideos.SelectMany(iv => iv.MeshLayers).Any(m => m != layerVm && string.Equals(m.Name, newName, StringComparison.OrdinalIgnoreCase));
+                        if (exists)
+                        {
+                            newName = baseName + " " + (++suffix).ToString();
+                        }
+                    } while (exists);
+
+                    // Update viewmodel property which updates underlying model and notifies UI
+                    layerVm.Name = newName;
+
+                    // Ensure selection reflects renamed item
+                    try { _vm.SelectedMeshLayer = layerVm; } catch { }
+                }
+            }
+        }
+
         private static ContextMenu? FindParentContextMenu(DependencyObject d)
         {
             while (d != null)
@@ -278,6 +742,60 @@ namespace ProjectionMapper
                 d = VisualTreeHelper.GetParent(d);
             }
             return null;
+        }
+
+        private record MonitorInfo(int Width, int Height, int Left, int Top);
+
+        private static List<MonitorInfo> EnumerateMonitors()
+        {
+            var list = new List<MonitorInfo>();
+
+            MonitorEnumDelegate del = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
+            {
+                var mi = new MONITORINFOEX();
+                mi.cbSize = Marshal.SizeOf<MONITORINFOEX>();
+                if (GetMonitorInfo(hMonitor, ref mi))
+                {
+                    var w = mi.rcMonitor.Right - mi.rcMonitor.Left;
+                    var h = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
+                    var l = mi.rcMonitor.Left;
+                    var t = mi.rcMonitor.Top;
+                    list.Add(new MonitorInfo(w, h, l, t));
+                }
+                return true;
+            };
+
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, del, IntPtr.Zero);
+
+            return list;
+        }
+
+        private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+        [DllImport("user32.dll", SetLastError = false)]
+        private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumDelegate lpfnEnum, IntPtr dwData);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
         }
     }
 }

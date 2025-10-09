@@ -25,6 +25,11 @@ namespace ProjectionMapper.Models
         public string? SourcePath { get; set; }
 
         /// <summary>
+        /// If this layer is a mesh derived from an imported source, this links to the host source layer id.
+        /// </summary>
+        public string? SourceId { get; set; }
+
+        /// <summary>
         /// Layer opacity (0.0 = transparent, 1.0 = opaque).
         /// </summary>
         public double Opacity { get; set; } = 1.0;
@@ -59,6 +64,21 @@ namespace ProjectionMapper.Models
         };
 
         /// <summary>
+        /// Separate normalized mesh corner points for the output mapping.
+        /// These control how the source (cropped or full) is mapped/warped onto the output surface.
+        /// Kept independent from MeshPoints so input cropping and output mapping do not interfere.
+        /// Order: TopLeft, TopRight, BottomLeft, BottomRight
+        /// Defaults to full-rect.
+        /// </summary>
+        public Vector2[] OutputMeshPoints { get; } = new[]
+        {
+            new Vector2(0f, 0f), // TL
+            new Vector2(1f, 0f), // TR
+            new Vector2(0f, 1f), // BL
+            new Vector2(1f, 1f)  // BR
+        };
+
+        /// <summary>
         /// Rotation in degrees to apply to the source when rendering. Rotation is clockwise around the layer center.
         /// </summary>
         public double RotationDegrees { get; set; } = 0.0;
@@ -68,6 +88,27 @@ namespace ProjectionMapper.Models
         /// submitted to the main renderer for composition (i.e. they should not appear in the output preview).
         /// </summary>
         public bool PreviewOnly { get; set; } = false;
+
+        /// <summary>
+        /// The index of the monitor (0-based) to which this layer's output should be sent. -1 = not assigned / use default.
+        /// </summary>
+        public int TargetMonitorIndex { get; set; } = -1;
+
+        /// <summary>
+        /// When true, the layer's audio should be played alongside decoded video frames (if supported).
+        /// This is a user preference stored on the model so services can resume/pause playback appropriately.
+        /// </summary>
+        public bool PlayAudio { get; set; } = false;
+
+        /// <summary>
+        /// Per-layer volume (0.0 = silent, 1.0 = original). Used by audio playback pipeline.
+        /// </summary>
+        public double Volume { get; set; } = 1.0;
+
+        /// <summary>
+        /// When true, audio playback for this layer is muted.
+        /// </summary>
+        public bool Muted { get; set; } = false;
 
         // Future: Add blend mode, transform, mask, timeline/keyframes, etc.
     }

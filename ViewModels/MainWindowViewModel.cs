@@ -1,7 +1,9 @@
 using System;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Windows.Input;
 using ProjectionMapper.Models;
+using System.Numerics;
 
 namespace ProjectionMapper.ViewModels
 {
@@ -118,6 +120,9 @@ namespace ProjectionMapper.ViewModels
         // Event requested when an imported video should be deleted (UI may show confirmation)
         public event Action<ImportedVideoViewModel?>? DeleteImportedRequested;
 
+        // New event: notify host to register mesh layer with services when created
+        public event Action<LayerModel?>? MeshLayerCreated;
+
         // Zoom properties bound to the UI sliders
         private double _inputZoom;
         public double InputZoom
@@ -183,20 +188,127 @@ namespace ProjectionMapper.ViewModels
 
         private LayerModel? _copiedMesh;
 
+        private string GenerateUniqueMeshName()
+        {
+            // Find highest existing "Mesh N" and increment
+            int max = 0;
+            foreach (var imported in ImportedVideos)
+            {
+                foreach (var vm in imported.MeshLayers)
+                {
+                    if (vm.Name != null && vm.Name.StartsWith("Mesh "))
+                    {
+                        var tail = vm.Name.Substring(5).Trim();
+                        if (int.TryParse(tail, out var n)) max = Math.Max(max, n);
+                    }
+                }
+            }
+            return $"Mesh {max + 1}";
+        }
+
         private void ExecuteCreateMeshCommand(object? _)
         {
             if (SelectedImportedVideo == null) return;
-            // create an empty/default layer (not registered with decoder until user sets source)
-            var layerModel = new LayerModel { Id = Guid.NewGuid().ToString("N"), Name = "Mesh Layer" };
+            // create a mesh layer linked to the host
+            var host = SelectedImportedVideo.HostLayer;
+
+            // Default to a centered, smaller rect (50% of host) so multiple layers are easier to work with
+            int defaultW = 640, defaultH = 360, defaultX = 0, defaultY = 0;
+            if (host != null && host.Width > 0 && host.Height > 0)
+            {
+                defaultW = Math.Max(1, host.Width / 2);
+                defaultH = Math.Max(1, host.Height / 2);
+                defaultX = host.X + (host.Width - defaultW) / 2;
+                defaultY = host.Y + (host.Height - defaultH) / 2;
+            }
+
+            var layerModel = new LayerModel
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Name = GenerateUniqueMeshName(),
+                SourceId = host?.Id,
+                // default to centered smaller bounds
+                X = defaultX,
+                Y = defaultY,
+                Width = defaultW,
+                Height = defaultH,
+                Visible = true // show output by default
+            };
+
+            // Set normalized mesh points so input mapping matches the output rectangle.
+            try
+            {
+                if (host != null && host.Width > 0 && host.Height > 0)
+                {
+                    var dst = layerModel.MeshPoints;
+                    var leftNorm = (float)((double)(defaultX - host.X) / host.Width);
+                    var topNorm = (float)((double)(defaultY - host.Y) / host.Height);
+                    var wNorm = (float)((double)defaultW / host.Width);
+                    var hNorm = (float)((double)defaultH / host.Height);
+
+                    // Clamp
+                    leftNorm = Math.Max(0f, Math.Min(1f, leftNorm));
+                    topNorm = Math.Max(0f, Math.Min(1f, topNorm));
+                    wNorm = Math.Max(0f, Math.Min(1f, wNorm));
+                    hNorm = Math.Max(0f, Math.Min(1f, hNorm));
+
+                    dst[0] = new Vector2(leftNorm, topNorm); // TL
+                    dst[1] = new Vector2(leftNorm + wNorm, topNorm); // TR
+                    dst[2] = new Vector2(leftNorm, topNorm + hNorm); // BL
+                    dst[3] = new Vector2(leftNorm + wNorm, topNorm + hNorm); // BR
+                }
+                else
+                {
+                    // fallback to full rect
+                    var dst = layerModel.MeshPoints;
+                    dst[0] = new Vector2(0f, 0f);
+                    dst[1] = new Vector2(1f, 0f);
+                    dst[2] = new Vector2(0f, 1f);
+                    dst[3] = new Vector2(1f, 1f);
+                }
+            }
+            catch { }
+
             var vm = new LayerViewModel(layerModel);
             SelectedImportedVideo.MeshLayers.Add(vm);
             SelectedMeshLayer = vm;
+
+            // notify host so it can register this mesh with services (VideoService)
+            MeshLayerCreated?.Invoke(layerModel);
+
+            // Prevent host from submitting full-frame into renderer (avoid duplicate output)
+            try
+            {
+                if (host != null)
+                {
+                    host.PreviewOnly = true;
+                }
+            }
+            catch { }
         }
 
         private void ExecuteDeleteMeshCommand(object? _)
         {
             if (SelectedImportedVideo == null || SelectedMeshLayer == null) return;
+
+            var removed = SelectedMeshLayer;
             SelectedImportedVideo.MeshLayers.Remove(SelectedMeshLayer);
+
+            // if no remaining meshes reference the host, restore host preview behavior
+            try
+            {
+                var host = SelectedImportedVideo.HostLayer;
+                if (host != null)
+                {
+                    bool any = SelectedImportedVideo.MeshLayers.Any(m => string.Equals(m.Model.SourceId, host.Id, StringComparison.OrdinalIgnoreCase));
+                    if (!any)
+                    {
+                        host.PreviewOnly = false;
+                    }
+                }
+            }
+            catch { }
+
             SelectedMeshLayer = null;
         }
 
@@ -204,30 +316,70 @@ namespace ProjectionMapper.ViewModels
         {
             if (SelectedMeshLayer == null) return;
             // copy dimensions and mesh points into a temp LayerModel for paste
-            _copiedMesh = new LayerModel
+            var model = new LayerModel
             {
                 Width = SelectedMeshLayer.Width,
                 Height = SelectedMeshLayer.Height,
                 X = SelectedMeshLayer.X,
                 Y = SelectedMeshLayer.Y
             };
+
+            try
+            {
+                var src = SelectedMeshLayer.Model.MeshPoints;
+                var dst = model.MeshPoints;
+                var len = Math.Min(src.Length, dst.Length);
+                for (int i = 0; i < len; ++i) dst[i] = src[i];
+            }
+            catch { }
+
+            _copiedMesh = model;
         }
 
         private void ExecutePasteMeshCommand(object? _)
         {
             if (SelectedImportedVideo == null || _copiedMesh == null) return;
+            var host = SelectedImportedVideo.HostLayer;
+
+            // If host exists, center pasted mesh on host; otherwise use copied coords
+            int defaultX = _copiedMesh.X, defaultY = _copiedMesh.Y, defaultW = _copiedMesh.Width, defaultH = _copiedMesh.Height;
+            if (host != null && host.Width > 0 && host.Height > 0)
+            {
+                defaultW = Math.Max(1, Math.Min(_copiedMesh.Width > 0 ? _copiedMesh.Width : host.Width / 2, host.Width));
+                defaultH = Math.Max(1, Math.Min(_copiedMesh.Height > 0 ? _copiedMesh.Height : host.Height / 2, host.Height));
+                defaultX = host.X + (host.Width - defaultW) / 2;
+                defaultY = host.Y + (host.Height - defaultH) / 2;
+            }
+
             var copied = new LayerModel
             {
                 Id = Guid.NewGuid().ToString("N"),
-                Name = "Mesh Layer",
-                X = _copiedMesh.X,
-                Y = _copiedMesh.Y,
-                Width = _copiedMesh.Width,
-                Height = _copiedMesh.Height
+                Name = GenerateUniqueMeshName(),
+                X = defaultX,
+                Y = defaultY,
+                Width = defaultW,
+                Height = defaultH,
+                SourceId = host?.Id,
+                Visible = true
             };
+
+            try
+            {
+                var src = _copiedMesh.MeshPoints;
+                var dst = copied.MeshPoints;
+                var len = Math.Min(src.Length, dst.Length);
+                for (int i = 0; i < len; ++i) dst[i] = src[i];
+            }
+            catch { }
+
             var vm = new LayerViewModel(copied);
             SelectedImportedVideo.MeshLayers.Add(vm);
             SelectedMeshLayer = vm;
+
+            MeshLayerCreated?.Invoke(copied);
+
+            // prevent host full-frame output to avoid duplicate
+            try { if (host != null) host.PreviewOnly = true; } catch { }
         }
 
         private void ExecuteDeleteImportedCommand(object? param)

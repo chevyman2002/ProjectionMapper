@@ -17,6 +17,9 @@ namespace ProjectionMapper.ViewModels
             _model = model ?? throw new ArgumentNullException(nameof(model));
         }
 
+        // Expose underlying model for scenarios where the host needs to register mesh layers with services
+        public LayerModel Model => _model;
+
         public string? Id => _model.Id;
 
         public string Name
@@ -107,13 +110,39 @@ namespace ProjectionMapper.ViewModels
             }
         }
 
+        // Source-side mesh points (used for cropping/input selection)
         public Vector2[] MeshPoints => _model.MeshPoints;
+
+        // Output-side mesh points (used for output mapping/warping)
+        public Vector2[] OutputMeshPoints => _model.OutputMeshPoints;
 
         public void SetMeshPoint(int index, Vector2 pt)
         {
             if (index < 0 || index >= _model.MeshPoints.Length) throw new ArgumentOutOfRangeException(nameof(index));
-            _model.MeshPoints[index] = pt;
+
+            // Clamp to normalized range [0,1] to prevent runaway coordinates from UI drags
+            var clampedX = Math.Max(0f, Math.Min(1f, pt.X));
+            var clampedY = Math.Max(0f, Math.Min(1f, pt.Y));
+
+            var old = _model.MeshPoints[index];
+            if (Math.Abs(old.X - clampedX) < 1e-6f && Math.Abs(old.Y - clampedY) < 1e-6f) return;
+
+            _model.MeshPoints[index] = new Vector2(clampedX, clampedY);
             RaisePropertyChanged(nameof(MeshPoints));
+        }
+
+        public void SetOutputMeshPoint(int index, Vector2 pt)
+        {
+            if (index < 0 || index >= _model.OutputMeshPoints.Length) throw new ArgumentOutOfRangeException(nameof(index));
+
+            var clampedX = Math.Max(0f, Math.Min(1f, pt.X));
+            var clampedY = Math.Max(0f, Math.Min(1f, pt.Y));
+
+            var old = _model.OutputMeshPoints[index];
+            if (Math.Abs(old.X - clampedX) < 1e-6f && Math.Abs(old.Y - clampedY) < 1e-6f) return;
+
+            _model.OutputMeshPoints[index] = new Vector2(clampedX, clampedY);
+            RaisePropertyChanged(nameof(OutputMeshPoints));
         }
 
         public double RotationDegrees
