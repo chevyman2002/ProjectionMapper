@@ -3,7 +3,7 @@
 # separate terms of service, privacy policy, and support
 # documentation.
 
-# This workflow will build a WPF or Windows Forms desktop application
+# This workflow will build, test, sign and package a WPF or Windows Forms desktop application
 # built on .NET Core.
 # To learn how to migrate your existing application to .NET Core,
 # refer to https://docs.microsoft.com/en-us/dotnet/desktop-wpf/migration/convert-project-from-net-framework
@@ -36,7 +36,7 @@
 # For a complete CI/CD sample to get started with GitHub Action workflows for Desktop Applications,
 # refer to https://github.com/microsoft/github-actions-for-desktop-apps
 
-name: .NET Desktop Build
+name: .NET Core Desktop
 
 on:
   push:
@@ -45,15 +45,21 @@ on:
     branches: [ "master" ]
 
 jobs:
+
   build:
+
     strategy:
       matrix:
         configuration: [Debug, Release]
 
-    runs-on: windows-latest
+    runs-on: windows-latest  # For a list of available runner types, refer to
+                             # https://help.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idruns-on
 
     env:
-      Solution_Name: ProjectionMapper.csproj
+      Solution_Name: your-solution-name                         # Replace with your solution name, i.e. MyWpfApp.sln.
+      Test_Project_Path: your-test-project-path                 # Replace with the path to your test project, i.e. MyWpfApp.Tests\MyWpfApp.Tests.csproj.
+      Wap_Project_Directory: your-wap-project-directory-name    # Replace with the Wap project directory relative to the solution, i.e. MyWpfApp.Package.
+      Wap_Project_Path: your-wap-project-path                   # Replace with the path to your Wap project, i.e. MyWpf.App.Package\MyWpfApp.Package.wapproj.
 
     steps:
     - name: Checkout
@@ -61,33 +67,64 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Setup FFmpeg (optional)
+    - name: Setup FFmpeg
+      # You may pin to the exact commit or the version.
+      # uses: federicocarboni/setup-ffmpeg@37062fbf7149fc5578d6c57e08aed62458b375d6
       uses: federicocarboni/setup-ffmpeg@v3.1
       with:
-        ffmpeg-version: release
-        architecture: x64
-        linking-type: static
-        github-token: ${{ github.server_url == 'https://github.com' && github.token || '' }}
+        # Version of ffmpeg to use. Version Spec is only fully supported on Windows.
+        ffmpeg-version: release # optional, default is release
+        # Target architecture for FFmpeg, on Windows and MacOS only x64 is supported; on Linux arm64 may also be used. Defaults to the system architecture.
+        architecture: x64 # optional
+        # Linking type of the binaries. Use "shared" to download shared binaries and "static" for statically linked ones. Shared builds are currently only available for windows releases. Defaults to "static"
+        linking-type: static # optional, default is static
+        # Used to pull Windows builds from GyanD/codexffmpeg. Since there's a default, this is typically not supplied by the user.
+        github-token: ${{ github.server_url == 'https://github.com' && github.token || '' }} # optional, default is ${{ github.server_url == 'https://github.com' && github.token || '' }}
+          
 
-    - name: Install .NET
+    # Install the .NET Core workload
+    - name: Install .NET Core
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: 9.0.x
+        dotnet-version: 8.0.x
 
-    - name: Restore
-      run: dotnet restore ${{ env.Solution_Name }}
+    # Add  MSBuild to the PATH: https://github.com/microsoft/setup-msbuild
+    - name: Setup MSBuild.exe
+      uses: microsoft/setup-msbuild@v2
 
-    - name: Build
-      run: dotnet build ${{ env.Solution_Name }} -c ${{ matrix.configuration }} --no-restore
+    # Execute all unit tests in the solution
+    - name: Execute unit tests
+      run: dotnet test
 
-    - name: Publish
-      if: matrix.configuration == 'Release'
+    # Restore the application to populate the obj folder with RuntimeIdentifiers
+    - name: Restore the application
+      run: msbuild $env:Solution_Name /t:Restore /p:Configuration=$env:Configuration
+      env:
+        Configuration: ${{ matrix.configuration }}
+
+    # Decode the base 64 encoded pfx and save the Signing_Certificate
+    - name: Decode the pfx
       run: |
-        dotnet publish ${{ env.Solution_Name }} -c Release -o ${{ runner.temp }}\publish --no-restore
+        $pfx_cert_byte = [System.Convert]::FromBase64String("${{ secrets.Base64_Encoded_Pfx }}")
+        $certificatePath = Join-Path -Path $env:Wap_Project_Directory -ChildPath GitHubActionsWorkflow.pfx
+        [IO.File]::WriteAllBytes("$certificatePath", $pfx_cert_byte)
 
-    - name: Upload build artifact
-      if: matrix.configuration == 'Release'
+    # Create the app package by building and packaging the Windows Application Packaging project
+    - name: Create the app package
+      run: msbuild $env:Wap_Project_Path /p:Configuration=$env:Configuration /p:UapAppxPackageBuildMode=$env:Appx_Package_Build_Mode /p:AppxBundle=$env:Appx_Bundle /p:PackageCertificateKeyFile=GitHubActionsWorkflow.pfx /p:PackageCertificatePassword=${{ secrets.Pfx_Key }}
+      env:
+        Appx_Bundle: Always
+        Appx_Bundle_Platforms: x86|x64
+        Appx_Package_Build_Mode: StoreUpload
+        Configuration: ${{ matrix.configuration }}
+
+    # Remove the pfx
+    - name: Remove the pfx
+      run: Remove-Item -path $env:Wap_Project_Directory\GitHubActionsWorkflow.pfx
+
+    # Upload the MSIX package: https://github.com/marketplace/actions/upload-a-build-artifact
+    - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ProjectionMapper-publish
-        path: ${{ runner.temp }}\publish
+        name: MSIX Package
+        path: ${{ env.Wap_Project_Directory }}\AppPackages
