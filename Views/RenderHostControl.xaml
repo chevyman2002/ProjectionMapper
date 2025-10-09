@@ -1,0 +1,14 @@
+<UserControl x:Class="ProjectionMapper.Views.RenderHostControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             MinHeight="100" MinWidth="100">
+    <!--
+      RenderHostControl:
+      - Acts as the WPF host for GPU-backed rendering.
+      - Initially it contains an Image which will be bound to a D3DImage in code-behind.
+      - Later we will replace/extend this with a SwapChainPanel/CompositionHost approach if we move to WinUI or use a direct swapchain.
+    -->
+    <Grid Background="Black">
+        <Image x:Name="PART_Backbuffer" Stretch="Uniform" SnapsToDevicePixels="True" />
+    </Grid>
+</UserControl>

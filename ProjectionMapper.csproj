@@ -2,10 +2,35 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFramework>net9.0-windows10.0.26100.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <ApplicationIcon>ProjectionMapper.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="ProjectionMapper.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Logging & Host -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+
+    <!-- FFmpeg wrapper (runtime native FFmpeg still required) -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="5.1.0" />
+    <PackageReference Include="NAudio" Version="2.1.0" />
+
+    <!-- NOTE: D3D interop packages are intentionally omitted for now to avoid restore failures.
+         When ready to implement the D3D11 renderer, add the specific Vortice packages such as:
+           <PackageReference Include="Vortice.Direct3D11" Version="2.17.0" />
+           <PackageReference Include="Vortice.DXGI" Version="2.17.0" />
+           <PackageReference Include="Vortice.D3DCompiler" Version="2.17.0" />
+         Confirm the exact versions via nuget.org or Visual Studio's package manager.
+    -->
+  </ItemGroup>
 
 </Project>
