@@ -1,6 +1,6 @@
 # ProjectionMapper
 
-Open source projection mapping software, loosely based on/inspired by the MapMap project.
+Open source projection mapping software, inspired by the MapMap project.
 
 I attempted to fork MapMap and modernize it, while fixing a bug causing a crash in Win11, as well as tweak features I wanted. However, the various Qt libraries have changed over the years and I rapidly grew annoyed by endless battles between compilation errors and behavioral issues.
 
