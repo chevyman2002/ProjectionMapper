@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
 namespace ProjectionMapper.Rendering
@@ -41,7 +42,7 @@ namespace ProjectionMapper.Rendering
         }
 
         // Accept layer frames (placeholder). GPU renderer will handle texture uploads and composition.
-        public void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, double opacity)
+        public void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, double opacity, Geometry? clip = null)
         {
             // no-op in the stub
         }

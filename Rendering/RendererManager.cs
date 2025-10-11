@@ -6,6 +6,7 @@ using System.Windows.Media.Imaging;
 using ProjectionMapper.Models;
 using ProjectionMapper.Views;
 using System.Windows;
+using System.Windows.Media;
 
 namespace ProjectionMapper.Rendering
 {
@@ -106,11 +107,11 @@ namespace ProjectionMapper.Rendering
         /// Submit a per-layer frame to the underlying renderer for composition.
         /// destRect is in renderer output coordinates (pixels).
         /// </summary>
-        public void SubmitLayerFrame(string layerId, BitmapSource? frame, System.Windows.Rect destRect, double opacity)
+        public void SubmitLayerFrame(string layerId, BitmapSource? frame, System.Windows.Rect destRect, double opacity, Geometry? clip = null)
         {
             try
             {
-                _renderer.SubmitLayerFrame(layerId, frame, destRect, opacity);
+                _renderer.SubmitLayerFrame(layerId, frame, destRect, opacity, clip);
 
                 // If frame target monitor index is present in metadata (we use layerId conventions),
                 // we additionally set the frame on the associated fullscreen window host(s).

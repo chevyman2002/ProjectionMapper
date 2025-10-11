@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
 namespace ProjectionMapper.Rendering
@@ -28,7 +29,8 @@ namespace ProjectionMapper.Rendering
         /// frame: frozen BitmapSource containing the decoded source frame (may be null to indicate no frame).
         /// destRect: destination rectangle (in renderer output coordinates) where the frame should be drawn.
         /// opacity: layer opacity (0..1).
+        /// clip: optional geometry to clip the drawing (e.g., for polygon shapes).
         /// </summary>
-        void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, double opacity);
+        void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, double opacity, Geometry? clip = null);
     }
 }

@@ -10,6 +10,7 @@ using System.Numerics;
 using ProjectionMapper.ViewModels;
 using ProjectionMapper.Services;
 using ProjectionMapper.Rendering;
+using System.Windows.Media.Media3D;
 
 namespace ProjectionMapper.Views
 {
@@ -33,9 +34,6 @@ namespace ProjectionMapper.Views
         public OutputMeshEditorControl()
         {
             InitializeComponent();
-
-            // drag whole rect
-            PART_Drag.DragDelta += PART_Drag_DragDelta;
 
             // corner handles -> move corners independently
             PART_Handle_TL.DragDelta += (s, e) => MoveCorner(0, e.HorizontalChange, e.VerticalChange);
@@ -78,6 +76,12 @@ namespace ProjectionMapper.Views
             if (oldVm != null)
             {
                 oldVm.PropertyChanged -= SelectedLayer_PropertyChanged;
+                // Clear the old layer from renderer
+                var layerId = oldVm.Model?.Id ?? oldVm.Id;
+                if (!string.IsNullOrEmpty(layerId))
+                {
+                    RendererManager?.SubmitLayerFrame(layerId, null, new Rect(), 0);
+                }
             }
             if (newVm != null)
             {
@@ -87,8 +91,7 @@ namespace ProjectionMapper.Views
             _vm = newVm;
             if (_vm == null)
             {
-                PART_OutputRect.Visibility = Visibility.Collapsed;
-                PART_Drag.Visibility = Visibility.Collapsed;
+                PART_OutputPolygon.Visibility = Visibility.Collapsed;
                 PART_Handle_TL.Visibility = Visibility.Collapsed;
                 PART_Handle_TR.Visibility = Visibility.Collapsed;
                 PART_Handle_BL.Visibility = Visibility.Collapsed;
@@ -97,8 +100,7 @@ namespace ProjectionMapper.Views
                 return;
             }
 
-            PART_OutputRect.Visibility = Visibility.Visible;
-            PART_Drag.Visibility = Visibility.Visible;
+            PART_OutputPolygon.Visibility = Visibility.Visible;
             PART_Handle_TL.Visibility = Visibility.Visible;
             PART_Handle_TR.Visibility = Visibility.Visible;
             PART_Handle_BL.Visibility = Visibility.Visible;
@@ -302,15 +304,27 @@ namespace ProjectionMapper.Views
 
                 var rect = new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
 
-                Canvas.SetLeft(PART_OutputRect, rect.X);
-                Canvas.SetTop(PART_OutputRect, rect.Y);
-                PART_OutputRect.Width = rect.Width;
-                PART_OutputRect.Height = rect.Height;
+                double width = rect.Width;
+                double height = rect.Height;
 
-                Canvas.SetLeft(PART_Drag, rect.X);
-                Canvas.SetTop(PART_Drag, rect.Y);
-                PART_Drag.Width = rect.Width;
-                PART_Drag.Height = rect.Height;
+                // Position and clip the preview image to fill the polygon
+                Canvas.SetLeft(PART_CroppedPreview, minX);
+                Canvas.SetTop(PART_CroppedPreview, minY);
+                PART_CroppedPreview.Width = width;
+                PART_CroppedPreview.Height = height;
+                PART_CroppedPreview.Stretch = Stretch.Fill;
+
+                // Create clip geometry for the polygon shape, offset by the bounding box position
+                var clipGeometry = new PathGeometry();
+                var figure = new PathFigure();
+                figure.StartPoint = new Point(_corners[0].X - minX, _corners[0].Y - minY);
+                figure.Segments.Add(new LineSegment(new Point(_corners[1].X - minX, _corners[1].Y - minY), true));
+                figure.Segments.Add(new LineSegment(new Point(_corners[3].X - minX, _corners[3].Y - minY), true));
+                figure.Segments.Add(new LineSegment(new Point(_corners[2].X - minX, _corners[2].Y - minY), true));
+                clipGeometry.Figures.Add(figure);
+                PART_CroppedPreview.Clip = clipGeometry;
+
+                PART_OutputPolygon.Points = new PointCollection { _corners[0], _corners[1], _corners[3], _corners[2] };
 
                 Canvas.SetLeft(PART_Handle_TL, _corners[0].X - 6);
                 Canvas.SetTop(PART_Handle_TL, _corners[0].Y - 6);
@@ -320,17 +334,6 @@ namespace ProjectionMapper.Views
                 Canvas.SetTop(PART_Handle_BL, _corners[2].Y - 6);
                 Canvas.SetLeft(PART_Handle_BR, _corners[3].X - 6);
                 Canvas.SetTop(PART_Handle_BR, _corners[3].Y - 6);
-
-                // Position and perspective-warp the preview image using the 4 corners
-                Canvas.SetLeft(PART_CroppedPreview, 0);
-                Canvas.SetTop(PART_CroppedPreview, 0);
-                PART_CroppedPreview.Width = PART_Canvas.ActualWidth;
-                PART_CroppedPreview.Height = PART_Canvas.ActualHeight;
-                PART_CroppedPreview.Stretch = Stretch.Fill;
-
-                // Apply perspective transform to warp the image to the 4 corners
-                var transform = ComputePerspectiveTransform(_corners[0], _corners[1], _corners[2], _corners[3]);
-                PART_CroppedPreview.RenderTransform = transform;
             }
             catch { }
         }
@@ -356,27 +359,6 @@ namespace ProjectionMapper.Views
             transformGroup.Children.Add(new TranslateTransform(minX, minY));
 
             return transformGroup;
-        }
-
-        private void PART_Drag_DragDelta(object sender, DragDeltaEventArgs e)
-        {
-            if (_isDisposed) return;
-
-            OffsetOutputAndCorners(e.HorizontalChange, e.VerticalChange);
-            ApplyLayout();
-            WriteBackMeshPoints();
-        }
-
-        private void OffsetOutputAndCorners(double dx, double dy)
-        {
-            if (_isDisposed) return;
-
-            _suppressVmRebind = true;
-            try
-            {
-                for (int i = 0; i < 4; i++) _corners[i] = new Point(_corners[i].X + dx, _corners[i].Y + dy);
-            }
-            finally { _suppressVmRebind = false; }
         }
 
         private void MoveCorner(int index, double dx, double dy)
@@ -453,6 +435,49 @@ namespace ProjectionMapper.Views
                         try { frameToSubmit = frame == null ? null : CropFrameToMesh(frame, _vm.MeshPoints); } catch { frameToSubmit = frame; }
 
                         var destRect = new Rect(_vm.X, _vm.Y, Math.Max(1, _vm.Width), Math.Max(1, _vm.Height));
+
+                        var clipPoints = new PointCollection();
+                        Geometry? clip = null;
+                        if (HostRenderHost != null && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
+                        {
+                            var scaleX = destRect.Width / (maxX - minX);
+                            var scaleY = destRect.Height / (maxY - minY);
+
+                            
+                            for (int i = 0; i < 4; i++)
+                            {
+                                var px = _corners[i].X * scaleX - destRect.Left;
+                                var py = _corners[i].Y * scaleY - destRect.Top;
+                                clipPoints.Add(new Point(px, py));
+                            }
+
+                            clip = new PathGeometry
+                            {
+                                FillRule = FillRule.Nonzero,
+                                Figures = new PathFigureCollection
+                                {
+                                    new PathFigure
+                                    {
+                                        IsClosed = true,
+                                        StartPoint = clipPoints[0],
+                                        Segments = new PathSegmentCollection
+                                        {
+                                            new LineSegment(clipPoints[1], true),
+                                            new LineSegment(clipPoints[3], true),
+                                            new LineSegment(clipPoints[2], true)
+                                        }
+                                    }
+                                }
+                            };
+                        }
+
+                        if (clip != null && frameToSubmit != null)
+                        {
+                            var clipPointsArray = new Point[4];
+                            for (int i = 0; i < 4; i++) clipPointsArray[i] = clipPoints[i];
+                            frameToSubmit = WarpBitmap(frameToSubmit, clipPointsArray, destRect);
+                        }
+
                         try { RendererManager.SubmitLayerFrame(layerId, frameToSubmit, destRect, _vm.Opacity); } catch { }
                     }
                 }
@@ -516,6 +541,55 @@ namespace ProjectionMapper.Views
         {
             _isDisposed = true;
             if (_videoService != null) try { _videoService.FrameDecoded -= VideoService_FrameDecoded; } catch { }
+        }
+
+        private BitmapSource? WarpBitmap(BitmapSource? source, Point[] quadPoints, Rect destRect)
+        {
+            if (source == null || quadPoints.Length < 4) return source;
+
+            var viewport = new Viewport3D();
+            var model = new GeometryModel3D();
+            var mesh = new MeshGeometry3D();
+
+            mesh.Positions = new Point3DCollection
+            {
+                new Point3D(quadPoints[0].X, quadPoints[0].Y, 0),
+                new Point3D(quadPoints[1].X, quadPoints[1].Y, 0),
+                new Point3D(quadPoints[3].X, quadPoints[3].Y, 0),
+                new Point3D(quadPoints[2].X, quadPoints[2].Y, 0)
+            };
+
+            mesh.TextureCoordinates = new PointCollection
+            {
+                new Point(0, 0),
+                new Point(1, 0),
+                new Point(1, 1),
+                new Point(0, 1)
+            };
+
+            mesh.TriangleIndices = new Int32Collection { 0, 1, 2, 0, 2, 3 };
+
+            model.Geometry = mesh;
+            model.Material = new DiffuseMaterial(new ImageBrush(source) { Stretch = Stretch.Fill });
+
+            var visual = new ModelVisual3D { Content = model };
+            viewport.Children.Add(visual);
+
+            var camera = new OrthographicCamera
+            {
+                Position = new Point3D(destRect.Width / 2, destRect.Height / 2, 1),
+                LookDirection = new Vector3D(0, 0, -1),
+                UpDirection = new Vector3D(0, 1, 0),
+                Width = destRect.Width
+            };
+
+            viewport.Camera = camera;
+
+            var rtb = new RenderTargetBitmap((int)destRect.Width, (int)destRect.Height, 96, 96, PixelFormats.Pbgra32);
+            rtb.Render(viewport);
+            rtb.Freeze();
+
+            return rtb;
         }
     }
 }

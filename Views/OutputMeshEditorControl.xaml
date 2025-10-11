@@ -5,17 +5,9 @@
     <Grid Background="Transparent">
         <Canvas x:Name="PART_Canvas" Background="Transparent" IsHitTestVisible="True">
             <!-- Live preview of the cropped frame for the selected mesh -->
-            <Image x:Name="PART_CroppedPreview" Stretch="Fill" Visibility="Collapsed" />
+            <Image x:Name="PART_CroppedPreview" Stretch="Fill" Visibility="Collapsed" IsHitTestVisible="False" />
 
-            <Rectangle x:Name="PART_OutputRect" Stroke="LimeGreen" StrokeThickness="2" Fill="#4033DB33" Visibility="Collapsed" />
-            <!-- Drag thumb covers the rect for moving -->
-            <Thumb x:Name="PART_Drag" Width="0" Height="0" Visibility="Collapsed">
-                <Thumb.Template>
-                    <ControlTemplate TargetType="Thumb">
-                        <Rectangle Fill="Transparent" />
-                    </ControlTemplate>
-                </Thumb.Template>
-            </Thumb>
+            <Polygon x:Name="PART_OutputPolygon" Stroke="LimeGreen" StrokeThickness="2" Fill="#4033DB33" Visibility="Collapsed" IsHitTestVisible="False" />
             <!-- Corner resize thumbs -->
             <Thumb x:Name="PART_Handle_TL" Width="12" Height="12" Visibility="Collapsed" Background="White" BorderBrush="Black" BorderThickness="1" />
             <Thumb x:Name="PART_Handle_TR" Width="12" Height="12" Visibility="Collapsed" Background="White" BorderBrush="Black" BorderThickness="1" />

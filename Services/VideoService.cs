@@ -343,19 +343,11 @@ namespace ProjectionMapper.Services
                 {
                     if (removed != null && !string.IsNullOrEmpty(removed.SourceId))
                     {
-                        bool any = false;
-                        foreach (var kv in _meshLayers)
+                        bool any = _meshLayers.Values.Any(m => m != null && m.SourceId == removed.SourceId);
+                        if (!any)
                         {
-                            var m = kv.Value;
-                            if (m != null && m.SourceId == removed.SourceId)
-                            {
-                                any = true; break;
-                            }
-                        }
-
-                        if (!any && _decoders.TryGetValue(removed.SourceId, out var tup) && tup.model != null)
-                        {
-                            try { tup.model.PreviewOnly = false; } catch { }
+                            // No more meshes for this source, clear the output for this source
+                            InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(removed.SourceId, null, new Rect(), 0); } catch { } });
                         }
                     }
                 }

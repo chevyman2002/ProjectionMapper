@@ -20,8 +20,8 @@ namespace ProjectionMapper.Rendering
         private int _height;
         private bool _initialized;
 
-        // LayerId -> (frame, destRect, opacity)
-        private readonly ConcurrentDictionary<string, (BitmapSource? Frame, Rect DestRect, double Opacity)> _layers
+        // LayerId -> (frame, destRect, opacity, clip)
+        private readonly ConcurrentDictionary<string, (BitmapSource? Frame, Rect DestRect, double Opacity, Geometry? Clip)> _layers
             = new();
 
         public event Action<BitmapSource?>? FrameReady;
@@ -74,12 +74,30 @@ namespace ProjectionMapper.Rendering
                             if (entry.Opacity < 0.999)
                             {
                                 dc.PushOpacity(entry.Opacity);
-                                dc.DrawImage(frame, entry.DestRect);
+                                if (entry.Clip != null)
+                                {
+                                    dc.PushClip(entry.Clip);
+                                    dc.DrawImage(frame, entry.DestRect);
+                                    dc.Pop();
+                                }
+                                else
+                                {
+                                    dc.DrawImage(frame, entry.DestRect);
+                                }
                                 dc.Pop();
                             }
                             else
                             {
-                                dc.DrawImage(frame, entry.DestRect);
+                                if (entry.Clip != null)
+                                {
+                                    dc.PushClip(entry.Clip);
+                                    dc.DrawImage(frame, entry.DestRect);
+                                    dc.Pop();
+                                }
+                                else
+                                {
+                                    dc.DrawImage(frame, entry.DestRect);
+                                }
                             }
                         }
                     }
@@ -102,9 +120,9 @@ namespace ProjectionMapper.Rendering
         /// <summary>
         /// Accept a layer frame for later composition.
         /// </summary>
-        public void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, double opacity)
+        public void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, double opacity, Geometry? clip = null)
         {
-            _layers[layerId] = (frame, destRect, opacity);
+            _layers[layerId] = (frame, destRect, opacity, clip);
         }
     }
 }
