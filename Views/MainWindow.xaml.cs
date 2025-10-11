@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Diagnostics;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -117,13 +118,10 @@ namespace ProjectionMapper
                     PART_MonitorCombo.ItemsSource = _monitorItems;
                     PART_MonitorCombo.SelectionChanged += PART_MonitorCombo_SelectionChanged;
                 }
-
-                // Wire mesh monitor combo for per-mesh assignment
-                if (PART_MeshMonitorCombo != null)
-                {
-                    PART_MeshMonitorCombo.ItemsSource = _monitorItems;
-                    PART_MeshMonitorCombo.SelectionChanged += PART_MeshMonitorCombo_SelectionChanged;
-                }
+                // We prefer a single monitor combo for selecting the output monitor for the selected source.
+                // Hide the per-mesh combo to avoid duplicate controls; the PART_MonitorCombo will be used to
+                // assign the host and all its mesh layers to the chosen monitor.
+                try { if (PART_MeshMonitorCombo != null) PART_MeshMonitorCombo.Visibility = Visibility.Collapsed; } catch { }
 
                 // Wire up audio control event handlers
                 HookAudioControls();
@@ -297,9 +295,47 @@ namespace ProjectionMapper
             win.Height = mon.Height * dpiY;
 
             win.WindowStartupLocation = WindowStartupLocation.Manual;
-            win.Show();
 
-            _rendererManager.ShowFullScreenWindow(monitorIndex, win);
+            // Ensure native handle exists so we can position the window before showing it
+            try
+            {
+                var helper = new WindowInteropHelper(win);
+                var hwnd = helper.EnsureHandle();
+
+                const uint SWP_SHOWWINDOW = 0x0040;
+                var flags = SWP_SHOWWINDOW;
+
+                Debug.WriteLine($"CreateOrShowFullScreenForMonitor: calling SetWindowPos for monitor {monitorIndex} -> rect {mon.Left},{mon.Top} {mon.Width}x{mon.Height}");
+                bool ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, flags);
+                var err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                Debug.WriteLine($"CreateOrShowFullScreenForMonitor: SetWindowPos returned {ok}, GetLastError={err}");
+
+                if (!ok)
+                {
+                    try
+                    {
+                        const int GWL_STYLE = -16;
+                        const int WS_POPUP = unchecked((int)0x80000000);
+                        var prev = GetWindowLong(hwnd, GWL_STYLE);
+                        SetWindowLong(hwnd, GWL_STYLE, prev | WS_POPUP);
+                        ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, flags);
+                        err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                        Debug.WriteLine($"CreateOrShowFullScreenForMonitor: retry SetWindowPos returned {ok}, GetLastError={err}");
+                    }
+                    catch (Exception ex) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: retry SetWindowPos exception: {ex}"); }
+                }
+
+                // Show the window after native positioning
+                win.Show();
+
+                try { _rendererManager.ShowFullScreenWindow(monitorIndex, win); Debug.WriteLine($"CreateOrShowFullScreenForMonitor: ShowFullScreenWindow success for monitor {monitorIndex}"); } catch (Exception ex) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: ShowFullScreenWindow failed: {ex}"); }
+                try { _rendererManager.AttachHost(monitorIndex, win); Debug.WriteLine($"CreateOrShowFullScreenForMonitor: AttachHost success for monitor {monitorIndex}"); } catch (Exception ex) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: AttachHost failed: {ex}"); }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"CreateOrShowFullScreenForMonitor: placement/show failed: {ex}");
+                try { win.Show(); _rendererManager.ShowFullScreenWindow(monitorIndex, win); _rendererManager.AttachHost(monitorIndex, win); } catch (Exception ex2) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: fallback show failed: {ex2}"); }
+            }
         }
 
         private void PART_MonitorCombo_SelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -310,7 +346,14 @@ namespace ProjectionMapper
             var imported = _vm.SelectedImportedVideo;
             if (imported?.HostLayer != null && item != null)
             {
+                // Apply selection to host layer
                 imported.HostLayer.TargetMonitorIndex = item.Index;
+
+                // Apply same monitor to all mesh layers of this imported video so they collectively display on the chosen monitor
+                foreach (var meshVm in imported.MeshLayers)
+                {
+                    try { if (meshVm.Model != null) meshVm.Model.TargetMonitorIndex = item.Index; } catch { }
+                }
 
                 // Create or show fullscreen window on the selected monitor
                 if (item.Index >= 0 && item.Index < _monitors.Count)
@@ -777,6 +820,17 @@ namespace ProjectionMapper
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+        // P/Invoke for positioning windows
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct RECT

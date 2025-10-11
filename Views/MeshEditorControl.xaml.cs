@@ -601,7 +601,7 @@ namespace ProjectionMapper.Views
                 // Convert canvas coords to renderer coordinates. Assume render host size equals canvas size for now.
                 var dest = new Rect(_outputRect.X, _outputRect.Y, _outputRect.Width, _outputRect.Height);
                 // Request the renderer to move the layer mapping - easiest is to submit an empty frame with the new dest rect and current opacity
-                _rendererManager.SubmitLayerFrame(SelectedLayer.Id ?? string.Empty, null, dest, SelectedLayer.Opacity);
+                _rendererManager.SubmitLayerFrame(SelectedLayer.Id ?? string.Empty, null, dest, null, SelectedLayer.Opacity);
             }
             catch { }
         }
