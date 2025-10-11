@@ -184,16 +184,9 @@ namespace ProjectionMapper.Services
             }
             catch { }
 
-            try
-            {
-                if (layer.TargetMonitorIndex >= 0)
-                {
-                    var clone = bmpToSubmit;
-                    try { if (clone != null && !clone.IsFrozen) { var c = clone.Clone(); c.Freeze(); clone = c; } } catch (Exception exFreeze) { Debug.WriteLine($"VideoService: freeze clone failed: {exFreeze}"); }
-                    try { Debug.WriteLine($"VideoService: forwarding frame to fullscreen monitor {layer.TargetMonitorIndex} for layer {layer.Id}"); _rendererManager.SetFullScreenHostFrame(layer.TargetMonitorIndex, clone); } catch (Exception exFs) { Debug.WriteLine($"VideoService: SetFullScreenHostFrame threw: {exFs}"); }
-                }
-            }
-            catch { }
+            // Do not forward raw decoded frames directly to fullscreen hosts here. The renderer composes layers
+            // and RendererManager mirrors composed frames to any registered fullscreen windows. Forwarding raw
+            // frames from the decoder directly caused duplicate SetFrame calls and cross-thread access issues.
 
             var destRect = new Rect(layer.X, layer.Y, layer.Width > 0 ? layer.Width : defaultW, layer.Height > 0 ? layer.Height : defaultH);
 
@@ -302,7 +295,7 @@ namespace ProjectionMapper.Services
                     }
                     catch (Exception ex) { Debug.WriteLine($"VideoService: SubmitLayerFrame for mesh failed: {ex}"); }
 
-                    try { if (mesh.TargetMonitorIndex >= 0) _rendererManager.SetFullScreenHostFrame(mesh.TargetMonitorIndex, frameForMesh); } catch { }
+                    // Do not directly forward mesh frames to fullscreen hosts; renderer will mirror composed output.
                 }
             }
             catch (Exception ex) { Debug.WriteLine($"VideoService: Post-frame handling failed: {ex}"); }

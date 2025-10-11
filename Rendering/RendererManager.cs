@@ -161,25 +161,80 @@ namespace ProjectionMapper.Rendering
             {
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
-                    try
+                try
+                {
+                    // All accesses to Window/Control properties must be done on UI thread.
+                    InvokeOnUi(() =>
                     {
-                        if (win == null)
+                        try
                         {
-                            Debug.WriteLine("OnFrameReady: encountered null fullscreen window in collection");
-                            continue;
+                            if (win == null)
+                            {
+                                Debug.WriteLine("OnFrameReady: encountered null fullscreen window in collection (UI thread)");
+                                return;
+                            }
+                            if (win.HostControl == null)
+                            {
+                                Debug.WriteLine("OnFrameReady: fullscreen window has null HostControl (UI thread)");
+                                return;
+                            }
+                            try
+                            {
+                                Debug.WriteLine($"OnFrameReady: preparing to mirror frame to fullscreen host for window '{win.Title}' (UI thread). Visible={win.IsVisible}, State={win.WindowState}");
+                                if (!win.IsVisible || win.WindowState == WindowState.Minimized)
+                                {
+                                    Debug.WriteLine($"OnFrameReady: skipping SetFrame because window not visible or minimized for monitor host '{win.Title}'");
+                                    return;
+                                }
+
+                                try
+                                {
+                                    win.HostControl.SetFrame(bmp);
+
+                                    // Log diagnostic about the host control's current frame
+                                    try
+                                    {
+                                        var cf = win.HostControl.CurrentFrame;
+                                        if (cf != null)
+                                        {
+                                            Debug.WriteLine($"OnFrameReady: SetFrame succeeded; HostControl.CurrentFrame size={cf.PixelWidth}x{cf.PixelHeight}");
+                                        }
+                                        else
+                                        {
+                                            Debug.WriteLine($"OnFrameReady: SetFrame completed but HostControl.CurrentFrame is null");
+                                        }
+                                    }
+                                    catch (Exception exInner2)
+                                    {
+                                        Debug.WriteLine($"OnFrameReady: failed to read HostControl.CurrentFrame (UI thread): {exInner2}");
+                                    }
+
+                                    try
+                                    {
+                                        Debug.WriteLine($"OnFrameReady: fullscreen window bounds L,T,W,H = {win.Left},{win.Top},{win.Width},{win.Height}");
+                                    }
+                                    catch { }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine($"OnFrameReady set fullscreen failed (UI thread): {ex}");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"OnFrameReady inner UI action failed: {ex}");
+                            }
                         }
-                        if (win.HostControl == null)
+                        catch (Exception ex)
                         {
-                            Debug.WriteLine("OnFrameReady: fullscreen window has null HostControl");
-                            continue;
+                            Debug.WriteLine($"OnFrameReady inner UI action failed: {ex}");
                         }
-                        Debug.WriteLine($"OnFrameReady: mirroring frame to fullscreen host for window {win.Title}");
-                        InvokeOnUi(() => { try { win.HostControl.SetFrame(bmp); } catch (Exception ex) { Debug.WriteLine($"OnFrameReady set fullscreen failed: {ex}"); } });
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"OnFrameReady: exception while mirroring to fullscreen window: {ex}");
-                    }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"OnFrameReady: exception while scheduling mirror to fullscreen window: {ex}");
+                }
                 }
             }
         }
@@ -255,18 +310,31 @@ namespace ProjectionMapper.Rendering
         {
             try
             {
+                // Show and activate on UI thread, then register the window
                 InvokeOnUi(() =>
                 {
-                    window.Show();
-                    window.Activate();
+                    try
+                    {
+                        // Window may have been positioned via native APIs before; ensure we show it but keep it in Normal state
+                        window.Show();
+                        window.Activate();
+                        try { window.WindowState = WindowState.Normal; } catch { }
+                        try { window.Topmost = true; } catch { }
+                        try { window.Focus(); } catch { }
+
+                        // Force layout/update so the hosted control can initialize its visual tree on the UI thread
+                        try { window.UpdateLayout(); } catch { }
+
+                        _fullscreenWindows[monitorIndex] = window;
+                        try
+                        {
+                            var hasHost = window.HostControl != null;
+                            Debug.WriteLine($"ShowFullScreenWindow (UI): monitor {monitorIndex} window registered, HostControl present: {hasHost}, bounds={window.Left},{window.Top},{window.Width}x{window.Height}");
+                        }
+                        catch (Exception exInner) { Debug.WriteLine($"ShowFullScreenWindow (UI): error inspecting HostControl for monitor {monitorIndex}: {exInner}"); }
+                    }
+                    catch (Exception exUi) { Debug.WriteLine($"ShowFullScreenWindow (UI) failed: {exUi}"); }
                 });
-                _fullscreenWindows[monitorIndex] = window;
-                try
-                {
-                    var hasHost = window.HostControl != null;
-                    Debug.WriteLine($"ShowFullScreenWindow: monitor {monitorIndex} window registered, HostControl present: {hasHost}");
-                }
-                catch (Exception ex) { Debug.WriteLine($"ShowFullScreenWindow: error inspecting HostControl for monitor {monitorIndex}: {ex}"); }
             }
             catch (Exception ex) { Debug.WriteLine($"ShowFullScreenWindow failed: {ex}"); }
         }
