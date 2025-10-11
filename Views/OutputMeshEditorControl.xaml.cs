@@ -1,16 +1,17 @@
+using ProjectionMapper.Rendering;
+using ProjectionMapper.Services;
+using ProjectionMapper.ViewModels;
 using System;
+using System.Diagnostics;
+using System.Numerics;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using System.Windows.Threading;
-using System.Numerics;
-using ProjectionMapper.ViewModels;
-using ProjectionMapper.Services;
-using ProjectionMapper.Rendering;
 using System.Windows.Media.Media3D;
+using System.Windows.Threading;
 
 namespace ProjectionMapper.Views
 {
@@ -80,7 +81,8 @@ namespace ProjectionMapper.Views
                 var layerId = oldVm.Model?.Id ?? oldVm.Id;
                 if (!string.IsNullOrEmpty(layerId))
                 {
-                    RendererManager?.SubmitLayerFrame(layerId, null, new Rect(), 0);
+                    // clear layer by submitting null frame; no destQuad -> null, opacity 0
+                    RendererManager?.SubmitLayerFrame(layerId, null, new Rect(), null, 0.0);
                 }
             }
             if (newVm != null)
@@ -349,7 +351,7 @@ namespace ProjectionMapper.Views
             var minX = Math.Min(Math.Min(tl.X, tr.X), Math.Min(bl.X, br.X));
             var minY = Math.Min(Math.Min(tl.Y, tr.Y), Math.Min(bl.Y, br.Y));
             var maxX = Math.Max(Math.Max(tl.X, tr.X), Math.Max(bl.X, br.X));
-            var maxY = Math.Max(Math.Max(tl.Y, tr.Y), Math.Max(bl.Y, br.Y));
+            var maxY = Math.Max(Math.Max(tl.Y, tr.Y), Math.Min(bl.Y, br.Y));
 
             var width = Math.Max(1, maxX - minX);
             var height = Math.Max(1, maxY - minY);
@@ -386,10 +388,10 @@ namespace ProjectionMapper.Views
             try
             {
                 // Write corners back to OutputMeshPoints (normalized 0-1 coords relative to output canvas)
-                var tl = new Vector2((float)(_corners[0].X / cw), (float)(_corners[0].Y / ch));
-                var tr = new Vector2((float)(_corners[1].X / cw), (float)(_corners[1].Y / ch));
-                var bl = new Vector2((float)(_corners[2].X / cw), (float)(_corners[2].Y / ch));
-                var br = new Vector2((float)(_corners[3].X / cw), (float)(_corners[3].Y / ch));
+                var tl = new System.Numerics.Vector2((float)(_corners[0].X / cw), (float)(_corners[0].Y / ch));
+                var tr = new System.Numerics.Vector2((float)(_corners[1].X / cw), (float)(_corners[1].Y / ch));
+                var bl = new System.Numerics.Vector2((float)(_corners[2].X / cw), (float)(_corners[2].Y / ch));
+                var br = new System.Numerics.Vector2((float)(_corners[3].X / cw), (float)(_corners[3].Y / ch));
 
                 _vm.SetOutputMeshPoint(0, tl);
                 _vm.SetOutputMeshPoint(1, tr);
@@ -421,68 +423,65 @@ namespace ProjectionMapper.Views
                     _vm.Height = (int)Math.Round(maxY - minY);
                 }
 
-                // Submit to renderer with current (cropped) frame
+                // Submit to renderer with current (cropped) frame and pass a destination quad in renderer coordinates
                 if (RendererManager != null)
                 {
                     var layerId = _vm.Model?.Id ?? _vm.Id;
                     if (!string.IsNullOrEmpty(layerId))
                     {
                         BitmapSource? frame = null;
-                        try { if (!string.IsNullOrEmpty(_vm.Model?.SourceId)) _videoService?.TryGetLastFrame(_vm.Model.SourceId, out frame); } catch { }
-
-                        // If we have a frame and source-side mesh points, crop the frame before submission
-                        BitmapSource? frameToSubmit = null;
-                        try { frameToSubmit = frame == null ? null : CropFrameToMesh(frame, _vm.MeshPoints); } catch { frameToSubmit = frame; }
-
-                        var destRect = new Rect(_vm.X, _vm.Y, Math.Max(1, _vm.Width), Math.Max(1, _vm.Height));
-
-                        var clipPoints = new PointCollection();
-                        Geometry? clip = null;
-                        if (HostRenderHost != null && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
+                        try
                         {
-                            var scaleX = destRect.Width / (maxX - minX);
-                            var scaleY = destRect.Height / (maxY - minY);
+                            // If the layer has a source, try to grab last frame (so UI shows live preview)
+                            try { if (!string.IsNullOrEmpty(_vm.Model?.SourceId)) _videoService?.TryGetLastFrame(_vm.Model.SourceId, out frame); } catch (Exception exFrame) { Debug.WriteLine($"WriteBackMeshPoints: TryGetLastFrame failed: {exFrame}"); }
 
-                            
-                            for (int i = 0; i < 4; i++)
-                            {
-                                var px = _corners[i].X * scaleX - destRect.Left;
-                                var py = _corners[i].Y * scaleY - destRect.Top;
-                                clipPoints.Add(new Point(px, py));
-                            }
+                            // If we have a frame and source-side mesh points, crop the frame before submission
+                            BitmapSource? frameToSubmit = null;
+                            try { frameToSubmit = frame == null ? null : CropFrameToMesh(frame, _vm.MeshPoints); } catch (Exception exCrop) { Debug.WriteLine($"WriteBackMeshPoints: CropFrameToMesh failed: {exCrop}"); frameToSubmit = frame; }
 
-                            clip = new PathGeometry
+                            // Build destination quad in renderer coordinates (TopLeft, TopRight, BottomLeft, BottomRight)
+                            Point[]? destQuad = null;
+                            try
                             {
-                                FillRule = FillRule.Nonzero,
-                                Figures = new PathFigureCollection
+                                if (HostRenderHost != null && HostRenderHost.CurrentFrame != null && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
                                 {
-                                    new PathFigure
+                                    var scaleX = HostRenderHost.CurrentFrame.PixelWidth / PART_Canvas.ActualWidth;
+                                    var scaleY = HostRenderHost.CurrentFrame.PixelHeight / PART_Canvas.ActualHeight;
+
+                                    destQuad = new Point[4]
                                     {
-                                        IsClosed = true,
-                                        StartPoint = clipPoints[0],
-                                        Segments = new PathSegmentCollection
-                                        {
-                                            new LineSegment(clipPoints[1], true),
-                                            new LineSegment(clipPoints[3], true),
-                                            new LineSegment(clipPoints[2], true)
-                                        }
-                                    }
+                                        new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY), // TL
+                                        new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY), // TR
+                                        new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY), // BL
+                                        new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)  // BR
+                                    };
                                 }
-                            };
-                        }
+                                else
+                                {
+                                    destQuad = new Point[4]
+                                    {
+                                        new Point(_corners[0].X, _corners[0].Y), // TL
+                                        new Point(_corners[1].X, _corners[1].Y), // TR
+                                        new Point(_corners[2].X, _corners[2].Y), // BL
+                                        new Point(_corners[3].X, _corners[3].Y)  // BR
+                                    };
+                                }
+                            }
+                            catch (Exception exQuad) { Debug.WriteLine($"WriteBackMeshPoints: create destQuad failed: {exQuad}"); destQuad = null; }
 
-                        if (clip != null && frameToSubmit != null)
-                        {
-                            var clipPointsArray = new Point[4];
-                            for (int i = 0; i < 4; i++) clipPointsArray[i] = clipPoints[i];
-                            frameToSubmit = WarpBitmap(frameToSubmit, clipPointsArray, destRect);
+                            var destRect = new Rect(_vm.X, _vm.Y, Math.Max(1, _vm.Width), Math.Max(1, _vm.Height));
+                            try
+                            {
+                                // Pass destQuad to RendererManager; it will pass through to the renderer which will warp if supported.
+                                RendererManager.SubmitLayerFrame(layerId, frameToSubmit, destRect, destQuad, _vm.Opacity);
+                            }
+                            catch (Exception exSubmit) { Debug.WriteLine($"WriteBackMeshPoints: SubmitLayerFrame failed: {exSubmit}"); }
                         }
-
-                        try { RendererManager.SubmitLayerFrame(layerId, frameToSubmit, destRect, _vm.Opacity); } catch { }
+                        catch (Exception exGlobal) { Debug.WriteLine($"WriteBackMeshPoints global failure: {exGlobal}"); }
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { Debug.WriteLine($"WriteBackMeshPoints top-level error: {ex}"); }
         }
 
         private void MapSelectedLayerMeshToRects()

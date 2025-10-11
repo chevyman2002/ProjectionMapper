@@ -189,8 +189,8 @@ namespace ProjectionMapper.Services
                 if (layer.TargetMonitorIndex >= 0)
                 {
                     var clone = bmpToSubmit;
-                    try { clone.Freeze(); } catch { }
-                    try { _rendererManager.SetFullScreenHostFrame(layer.TargetMonitorIndex, clone); } catch { }
+                    try { if (clone != null && !clone.IsFrozen) { var c = clone.Clone(); c.Freeze(); clone = c; } } catch (Exception exFreeze) { Debug.WriteLine($"VideoService: freeze clone failed: {exFreeze}"); }
+                    try { Debug.WriteLine($"VideoService: forwarding frame to fullscreen monitor {layer.TargetMonitorIndex} for layer {layer.Id}"); _rendererManager.SetFullScreenHostFrame(layer.TargetMonitorIndex, clone); } catch (Exception exFs) { Debug.WriteLine($"VideoService: SetFullScreenHostFrame threw: {exFs}"); }
                 }
             }
             catch { }
@@ -199,7 +199,12 @@ namespace ProjectionMapper.Services
 
             if (!layer.PreviewOnly && layer.Visible)
             {
-                try { _rendererManager.SubmitLayerFrame(layer.Id ?? Guid.NewGuid().ToString("N"), bmpToSubmit, destRect, layer.Opacity); } catch { }
+                try
+                {
+                    // No destQuad available here (this is a simple per-layer rect submission).
+                    _rendererManager.SubmitLayerFrame(layer.Id ?? Guid.NewGuid().ToString("N"), bmpToSubmit, destRect, null, layer.Opacity);
+                }
+                catch (Exception ex) { Debug.WriteLine($"VideoService: SubmitLayerFrame failed: {ex}"); }
             }
 
             try
@@ -249,12 +254,58 @@ namespace ProjectionMapper.Services
                     catch { frameForMesh = bmpToSubmit; }
 
                     var meshDest = new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height));
-                    try { _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, mesh.Opacity); } catch { }
+                    try
+                    {
+                        // If the mesh provides OutputMeshPoints, build a destQuad in renderer coordinates
+                        Point[]? destQuad = null;
+                        try
+                        {
+                            // Prefer mapping normalized output mesh points to renderer pixels via RendererManager
+                            try
+                            {
+                                destQuad = _rendererManager.MapNormalizedToRendererPoints(mesh.OutputMeshPoints, mesh.TargetMonitorIndex >= 0 ? mesh.TargetMonitorIndex : null);
+                            }
+                            catch (Exception exMap)
+                            {
+                                Debug.WriteLine($"VideoService: MapNormalizedToRendererPoints threw: {exMap}");
+                                destQuad = null;
+                            }
+
+                            // Fallback: construct from mesh.X/Y + normalized offsets if MapNormalizedToRendererPoints unavailable
+                            if (destQuad == null)
+                            {
+                                var pts = mesh.OutputMeshPoints;
+                                if (pts != null && pts.Length >= 4)
+                                {
+                                    destQuad = new Point[4]
+                                    {
+                                        new Point(mesh.X + pts[0].X * mesh.Width, mesh.Y + pts[0].Y * mesh.Height), // TL
+                                        new Point(mesh.X + pts[1].X * mesh.Width, mesh.Y + pts[1].Y * mesh.Height), // TR
+                                        new Point(mesh.X + pts[2].X * mesh.Width, mesh.Y + pts[2].Y * mesh.Height), // BL
+                                        new Point(mesh.X + pts[3].X * mesh.Width, mesh.Y + pts[3].Y * mesh.Height)  // BR
+                                    };
+                                }
+                                else
+                                {
+                                    Debug.WriteLine("VideoService: OutputMeshPoints not available for mesh, destQuad remains null");
+                                }
+                            }
+
+                            if (destQuad == null)
+                            {
+                                Debug.WriteLine($"VideoService: destQuad is null for mesh {mesh.Id}, mesh.TargetMonitorIndex={mesh.TargetMonitorIndex}");
+                            }
+                        }
+                        catch (Exception exQuad) { Debug.WriteLine($"VideoService: build destQuad failed: {exQuad}"); destQuad = null; }
+
+                        _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity);
+                    }
+                    catch (Exception ex) { Debug.WriteLine($"VideoService: SubmitLayerFrame for mesh failed: {ex}"); }
 
                     try { if (mesh.TargetMonitorIndex >= 0) _rendererManager.SetFullScreenHostFrame(mesh.TargetMonitorIndex, frameForMesh); } catch { }
                 }
             }
-            catch { }
+            catch (Exception ex) { Debug.WriteLine($"VideoService: Post-frame handling failed: {ex}"); }
 
             try
             {
@@ -326,10 +377,23 @@ namespace ProjectionMapper.Services
                     catch { frameForMesh = sourceFrame; }
 
                     var meshDest = new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height));
-                    try { _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, mesh.Opacity); } catch { }
+                    try
+                    {
+                        // Try to build destQuad from normalized OutputMeshPoints if available
+                        Point[]? destQuad = null;
+                        try { destQuad = _rendererManager.MapNormalizedToRendererPoints(mesh.OutputMeshPoints); } catch { destQuad = null; }
+                        if (destQuad == null) destQuad = null; // keep as null to draw rect if mapping unavailable
+
+                        _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"VideoService.RegisterMeshLayerAsync: SubmitLayerFrame failed: {ex}");
+                    }
                 }
             }
             catch { }
+
 
             return Task.CompletedTask;
         }
@@ -347,7 +411,7 @@ namespace ProjectionMapper.Services
                         if (!any)
                         {
                             // No more meshes for this source, clear the output for this source
-                            InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(removed.SourceId, null, new Rect(), 0); } catch { } });
+                    InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(removed.SourceId, null, new Rect(), null, 0.0); } catch { } });
                         }
                     }
                 }
@@ -617,7 +681,7 @@ namespace ProjectionMapper.Services
                 var (decoder, cts, model, lastFrame) = kv.Value;
                 if (model != null && model.Id == sourceId)
                 {
-                    try { model.Visible = false; await PauseLayerAsync(model.Id ?? string.Empty).ConfigureAwait(false); InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(model.Id ?? string.Empty, null, new Rect(model.X, model.Y, Math.Max(1, model.Width), Math.Max(1, model.Height)), model.Opacity); } catch { } }); } catch { }
+                    try { model.Visible = false; await PauseLayerAsync(model.Id ?? string.Empty).ConfigureAwait(false); InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(model.Id ?? string.Empty, null, new Rect(model.X, model.Y, Math.Max(1, model.Width), Math.Max(1, model.Height)), null, model.Opacity); } catch { } }); } catch { }
                 }
             }
 
@@ -626,7 +690,7 @@ namespace ProjectionMapper.Services
                 var mesh = kv.Value; if (mesh == null) continue;
                 if (mesh.SourceId == sourceId)
                 {
-                    try { mesh.Visible = false; InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(mesh.Id ?? string.Empty, null, new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height)), mesh.Opacity); } catch { } }); } catch { }
+                    try { mesh.Visible = false; InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(mesh.Id ?? string.Empty, null, new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height)), null, mesh.Opacity); } catch { } }); } catch { }
                 }
             }
         }
@@ -690,7 +754,7 @@ namespace ProjectionMapper.Services
                             catch { }
 
                             var meshDest = new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height));
-                            InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, mesh.Opacity); } catch { } });
+                            InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, null, mesh.Opacity); } catch { } });
                         }
                     }
                     catch { }
