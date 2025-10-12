@@ -125,6 +125,25 @@ namespace ProjectionMapper
 
                 // Wire up audio control event handlers
                 HookAudioControls();
+
+                // Wire mesh overlay checkbox
+                try
+                {
+                    if (PART_ShowMeshOverlayCheckbox != null)
+                    {
+                        PART_ShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
+                        PART_ShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
+                        // default checked
+                        PART_ShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                    }
+                    if (PART_GlobalShowMeshOverlayCheckbox != null)
+                    {
+                        PART_GlobalShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
+                        PART_GlobalShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
+                        PART_GlobalShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                    }
+                }
+                catch { }
             };
 
             // Start renderer (use output host size; fallback to 1280x720)

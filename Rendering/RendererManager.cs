@@ -30,7 +30,13 @@ namespace ProjectionMapper.Rendering
         {
             _renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
             _renderer.FrameReady += OnFrameReady;
+            ShowMeshOverlay = true; // enabled by default
         }
+
+        /// <summary>
+        /// When true, mesh overlay (quad outline and points) will be shown on output hosts when provided.
+        /// </summary>
+        public bool ShowMeshOverlay { get; set; }
 
         /// <summary>
         /// Map normalized output coordinates (0..1) to renderer pixel coordinates using the attached host's current frame
@@ -154,89 +160,74 @@ namespace ProjectionMapper.Rendering
             {
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
-                    try { InvokeOnUi(() => win?.HostControl?.Clear()); } catch (Exception ex) { Debug.WriteLine($"OnFrameReady clear fullscreen failed: {ex}"); }
+                    try { InvokeOnUi(() => win?.HostControl?.Clear()); } catch { }
                 }
             }
             else
             {
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
-                try
-                {
-                    // All accesses to Window/Control properties must be done on UI thread.
-                    InvokeOnUi(() =>
+                    try
                     {
-                        try
+                        InvokeOnUi(() =>
                         {
-                            if (win == null)
-                            {
-                                Debug.WriteLine("OnFrameReady: encountered null fullscreen window in collection (UI thread)");
-                                return;
-                            }
-                            if (win.HostControl == null)
-                            {
-                                Debug.WriteLine("OnFrameReady: fullscreen window has null HostControl (UI thread)");
-                                return;
-                            }
-                            try
-                            {
-                                Debug.WriteLine($"OnFrameReady: preparing to mirror frame to fullscreen host for window '{win.Title}' (UI thread). Visible={win.IsVisible}, State={win.WindowState}");
-                                if (!win.IsVisible || win.WindowState == WindowState.Minimized)
-                                {
-                                    Debug.WriteLine($"OnFrameReady: skipping SetFrame because window not visible or minimized for monitor host '{win.Title}'");
-                                    return;
-                                }
-
-                                try
-                                {
-                                    win.HostControl.SetFrame(bmp);
-
-                                    // Log diagnostic about the host control's current frame
-                                    try
-                                    {
-                                        var cf = win.HostControl.CurrentFrame;
-                                        if (cf != null)
-                                        {
-                                            Debug.WriteLine($"OnFrameReady: SetFrame succeeded; HostControl.CurrentFrame size={cf.PixelWidth}x{cf.PixelHeight}");
-                                        }
-                                        else
-                                        {
-                                            Debug.WriteLine($"OnFrameReady: SetFrame completed but HostControl.CurrentFrame is null");
-                                        }
-                                    }
-                                    catch (Exception exInner2)
-                                    {
-                                        Debug.WriteLine($"OnFrameReady: failed to read HostControl.CurrentFrame (UI thread): {exInner2}");
-                                    }
-
-                                    try
-                                    {
-                                        Debug.WriteLine($"OnFrameReady: fullscreen window bounds L,T,W,H = {win.Left},{win.Top},{win.Width},{win.Height}");
-                                    }
-                                    catch { }
-                                }
-                                catch (Exception ex)
-                                {
-                                    Debug.WriteLine($"OnFrameReady set fullscreen failed (UI thread): {ex}");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"OnFrameReady inner UI action failed: {ex}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"OnFrameReady inner UI action failed: {ex}");
-                        }
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"OnFrameReady: exception while scheduling mirror to fullscreen window: {ex}");
-                }
+                            if (win == null || win.HostControl == null) return;
+                            if (!win.IsVisible || win.WindowState == WindowState.Minimized) return;
+                            try { win.HostControl.SetFrame(bmp); } catch { }
+                        });
+                    }
+                    catch { }
                 }
             }
+        }
+
+        /// <summary>
+        /// Set mesh overlay (quad outline and optional points) on either the main attached host or a fullscreen host for a monitor.
+        /// If monitorIndex is null, the main attached host will be used. If quadPoints is null the overlay will be cleared.
+        /// </summary>
+        public void SetMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints)
+        {
+            if (!ShowMeshOverlay)
+            {
+                // If overlays disabled globally, ensure cleared
+                ClearAllOverlays();
+                return;
+            }
+
+            try
+            {
+                if (monitorIndex.HasValue)
+                {
+                    if (_fullscreenWindows.TryGetValue(monitorIndex.Value, out var win) && win != null)
+                    {
+                        InvokeOnUi(() => win.HostControl.SetMeshOverlay(quadPoints, showPoints));
+                        return;
+                    }
+                }
+
+                // fallback to main host
+                if (_host != null)
+                {
+                    InvokeOnUi(() => _host.SetMeshOverlay(quadPoints, showPoints));
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"SetMeshOverlayForMonitor failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Clear overlays on all hosts (main and fullscreen).
+        /// </summary>
+        public void ClearAllOverlays()
+        {
+            try
+            {
+                if (_host != null) InvokeOnUi(() => _host.ClearOverlay());
+                foreach (var win in _fullscreenWindows.Values.ToList())
+                {
+                    if (win?.HostControl != null) InvokeOnUi(() => win.HostControl.ClearOverlay());
+                }
+            }
+            catch { }
         }
 
         /// <summary>

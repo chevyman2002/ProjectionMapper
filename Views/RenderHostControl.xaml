@@ -10,5 +10,7 @@
     -->
     <Grid Background="Black">
         <Image x:Name="PART_Backbuffer" Stretch="Uniform" SnapsToDevicePixels="True" />
+        <!-- Overlay canvas drawn on top of the backbuffer. All visuals here are non-interactive and used for mesh preview outlines. -->
+        <Canvas x:Name="PART_Overlay" IsHitTestVisible="False" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
     </Grid>
 </UserControl>

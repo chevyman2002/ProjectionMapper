@@ -130,6 +130,10 @@
                     <Separator Margin="0,8,0,8" />
 
                     <TextBlock FontWeight="Bold" Text="Properties" Margin="0,0,0,8"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                        <TextBlock Text="Show Mesh Overlay (global):" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <CheckBox x:Name="PART_GlobalShowMeshOverlayCheckbox" IsChecked="True" VerticalAlignment="Center" />
+                    </StackPanel>
                     <!-- Simple inspector for selected mesh layer -->
                     <StackPanel DataContext="{Binding SelectedMeshLayer}" Margin="0,8,0,0">
                         <TextBlock Text="Selected:" FontWeight="Bold" />
@@ -151,6 +155,10 @@
                             <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                 <TextBlock Text="Output Display:" VerticalAlignment="Center" Margin="0,0,6,0" />
                                 <ComboBox x:Name="PART_MeshMonitorCombo" Width="150" SelectedIndex="-1" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0" VerticalAlignment="Center">
+                                <TextBlock Text="Show Mesh Overlay on Output:" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                <CheckBox x:Name="PART_ShowMeshOverlayCheckbox" IsChecked="True" VerticalAlignment="Center" />
                             </StackPanel>
                         </StackPanel>
                     </StackPanel>

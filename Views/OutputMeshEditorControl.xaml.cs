@@ -474,6 +474,67 @@ namespace ProjectionMapper.Views
                             {
                                 // Pass destQuad to RendererManager; it will pass through to the renderer which will warp if supported.
                                 RendererManager.SubmitLayerFrame(layerId, frameToSubmit, destRect, destQuad, _vm.Opacity);
+
+                                // Also instruct RendererManager to show the mesh overlay on the output host/fullscreen for this layer
+                                try
+                                {
+                                    bool showPoints = true;
+                                    // respect per-layer preference if present
+                                    var targetMonitor = _vm.Model?.TargetMonitorIndex;
+                                    var showOverlayPref = _vm.Model?.ShowOverlay ?? true;
+                                    if (!showOverlayPref || RendererManager == null)
+                                    {
+                                        // clear overlay on host if disabled
+                                        try { HostRenderHost?.ClearOverlay(); } catch { }
+                                    }
+                                    else
+                                    {
+                                        // Map normalized output mesh points to renderer coordinates
+                                        Point[]? quadForRenderer = null;
+                                        try
+                                        {
+                                            quadForRenderer = RendererManager?.MapNormalizedToRendererPoints(_vm.OutputMeshPoints, targetMonitor);
+                                        }
+                                        catch { quadForRenderer = null; }
+
+                                        if (quadForRenderer != null && quadForRenderer.Length >= 4)
+                                        {
+                                            try
+                                            {
+                                                RendererManager.SetMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadForRenderer, showPoints);
+                                            }
+                                            catch { }
+                                        }
+                                        else
+                                        {
+                                            // fallback to host-based mapping using HostRenderHost current frame
+                                            if (HostRenderHost != null)
+                                            {
+                                                try
+                                                {
+                                                    var scaleX = 1.0;
+                                                    var scaleY = 1.0;
+                                                    var cf = HostRenderHost.CurrentFrame;
+                                                    if (cf != null && cf.PixelWidth > 0 && cf.PixelHeight > 0 && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
+                                                    {
+                                                        scaleX = cf.PixelWidth / PART_Canvas.ActualWidth;
+                                                        scaleY = cf.PixelHeight / PART_Canvas.ActualHeight;
+                                                    }
+                                                    var fallbackQuad = new Point[4]
+                                                    {
+                                                        new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY),
+                                                        new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY),
+                                                        new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY),
+                                                        new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)
+                                                    };
+                                                    try { HostRenderHost.SetMeshOverlay(fallbackQuad, showPoints); } catch { }
+                                                }
+                                                catch { }
+                                            }
+                                        }
+                                    }
+                                }
+                                catch { }
                             }
                             catch (Exception exSubmit) { Debug.WriteLine($"WriteBackMeshPoints: SubmitLayerFrame failed: {exSubmit}"); }
                         }
