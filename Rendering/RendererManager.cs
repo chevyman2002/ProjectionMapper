@@ -33,6 +33,17 @@ namespace ProjectionMapper.Rendering
             ShowMeshOverlay = true; // enabled by default
         }
 
+        public async Task ResizeAsync(int width, int height, CancellationToken token = default)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(RendererManager));
+            await _renderer.ResizeAsync(width, height, token).ConfigureAwait(false);
+            OutputWidth = width; OutputHeight = height;
+        }
+
+        // Current renderer output size in pixels (set when StartAsync is called)
+        public int OutputWidth { get; private set; }
+        public int OutputHeight { get; private set; }
+
         /// <summary>
         /// When true, mesh overlay (quad outline and points) will be shown on output hosts when provided.
         /// </summary>
@@ -50,22 +61,26 @@ namespace ProjectionMapper.Rendering
             {
                 BitmapSource? frame = null;
 
-                // If a specific monitor index is requested, prefer that fullscreen host's current frame
+                // If a specific monitor index is requested and a fullscreen host exists for it, prefer that host's current frame
+                // because the mapping should use the pixel space of the target display. Otherwise fall back to the main attached host.
                 if (monitorIndex.HasValue && _fullscreenWindows.TryGetValue(monitorIndex.Value, out var win) && win != null)
                 {
                     try { frame = win.HostControl?.CurrentFrame; }
                     catch (Exception ex) { Debug.WriteLine($"MapNormalizedToRendererPoints: failed reading fullscreen host frame: {ex}"); frame = null; }
                 }
 
-                // Fallback to main attached host
+                // Fallback to main attached host if fullscreen host not available
                 if (frame == null)
                 {
                     if (_host == null) return null;
                     frame = _host.CurrentFrame;
                 }
-                if (frame == null) return null;
-                double w = frame.PixelWidth;
-                double h = frame.PixelHeight;
+                // Prefer using the renderer's canonical output size when available so normalized coordinates
+                // map into renderer pixel space deterministically. Fall back to the host frame pixel size
+                // only if the renderer output size is not known.
+                double w = OutputWidth > 0 ? OutputWidth : (frame?.PixelWidth ?? 0);
+                double h = OutputHeight > 0 ? OutputHeight : (frame?.PixelHeight ?? 0);
+                if (w <= 0 || h <= 0) return null;
                 var pts = new Point[4];
                 for (int i = 0; i < 4; ++i)
                 {

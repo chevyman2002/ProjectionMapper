@@ -213,6 +213,7 @@ namespace ProjectionMapper.Services
                     BitmapSource frameForMesh = bmpToSubmit;
                     try
                     {
+                        // Crop to the mesh's MeshPoints (input selection) so only the selected portion is submitted to renderer
                         float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
                         foreach (var p in mesh.MeshPoints)
                         {
@@ -336,36 +337,33 @@ namespace ProjectionMapper.Services
                     BitmapSource frameForMesh = sourceFrame;
                     try
                     {
-                        float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
-                        foreach (var p in mesh.MeshPoints)
-                        {
-                            minX = Math.Min(minX, p.X);
-                            minY = Math.Min(minY, p.Y);
-                            maxX = Math.Max(maxX, p.X);
-                            maxY = Math.Max(maxY, p.Y);
-                        }
-
-                        minX = Math.Max(0f, Math.Min(1f, minX));
-                        minY = Math.Max(0f, Math.Min(1f, minY));
-                        maxX = Math.Max(0f, Math.Min(1f, maxX));
-                        maxY = Math.Max(0f, Math.Min(1f, maxY));
-
-                        int srcW = frameForMesh.PixelWidth; int srcH = frameForMesh.PixelHeight;
-                        int srcX = (int)Math.Floor(minX * srcW);
-                        int srcY = (int)Math.Floor(minY * srcH);
-                        int cropW = Math.Max(1, (int)Math.Ceiling((maxX - minX) * srcW));
-                        int cropH = Math.Max(1, (int)Math.Ceiling((maxY - minY) * srcH));
-
-                        if (srcX < 0) srcX = 0; if (srcY < 0) srcY = 0;
-                        if (srcX + cropW > srcW) cropW = srcW - srcX;
-                        if (srcY + cropH > srcH) cropH = srcH - srcY;
-
-                        if (cropW > 0 && cropH > 0)
-                        {
-                            var cb = new CroppedBitmap(frameForMesh, new Int32Rect(srcX, srcY, cropW, cropH));
-                            try { cb.Freeze(); } catch { }
-                            frameForMesh = cb;
-                        }
+                        // Removed cropping to stretch the full source frame to fill the output mesh
+                        // float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+                        // foreach (var p in mesh.MeshPoints)
+                        // {
+                        //     minX = Math.Min(minX, p.X);
+                        //     minY = Math.Min(minY, p.Y);
+                        //     maxX = Math.Max(maxX, p.X);
+                        //     maxY = Math.Max(maxY, p.Y);
+                        // }
+                        // minX = Math.Max(0f, Math.Min(1f, minX));
+                        // minY = Math.Max(0f, Math.Min(1f, minY));
+                        // maxX = Math.Max(0f, Math.Min(1f, maxX));
+                        // maxY = Math.Max(0f, Math.Min(1f, maxY));
+                        // int srcW = frameForMesh.PixelWidth; int srcH = frameForMesh.PixelHeight;
+                        // int srcX = (int)Math.Floor(minX * srcW);
+                        // int srcY = (int)Math.Floor(minY * srcH);
+                        // int cropW = Math.Max(1, (int)Math.Ceiling((maxX - minX) * srcW));
+                        // int cropH = Math.Max(1, (int)Math.Ceiling((maxY - minY) * srcH));
+                        // if (srcX < 0) srcX = 0; if (srcY < 0) srcY = 0;
+                        // if (srcX + cropW > srcW) cropW = srcW - srcX;
+                        // if (srcY + cropH > srcH) cropH = srcH - srcY;
+                        // if (cropW > 0 && cropH > 0)
+                        // {
+                        //     var cb = new CroppedBitmap(frameForMesh, new Int32Rect(srcX, srcY, cropW, cropH));
+                        //     try { cb.Freeze(); } catch { }
+                        //     frameForMesh = cb;
+                        // }
                     }
                     catch { frameForMesh = sourceFrame; }
 
@@ -713,36 +711,33 @@ namespace ProjectionMapper.Services
                             var frameForMesh = tup.lastFrame;
                             try
                             {
-                                float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
-                                foreach (var p in mesh.MeshPoints)
-                                {
-                                    minX = Math.Min(minX, p.X);
-                                    minY = Math.Min(minY, p.Y);
-                                    maxX = Math.Max(maxX, p.X);
-                                    maxY = Math.Max(maxY, p.Y);
-                                }
-
-                                minX = Math.Max(0f, Math.Min(1f, minX));
-                                minY = Math.Max(0f, Math.Min(1f, minY));
-                                maxX = Math.Max(0f, Math.Min(1f, maxX));
-                                maxY = Math.Max(0f, Math.Min(1f, maxY));
-
-                                int srcW = frameForMesh.PixelWidth; int srcH = frameForMesh.PixelHeight;
-                                int srcX = (int)Math.Floor(minX * srcW);
-                                int srcY = (int)Math.Floor(minY * srcH);
-                                int cropW = Math.Max(1, (int)Math.Ceiling((maxX - minX) * srcW));
-                                int cropH = Math.Max(1, (int)Math.Ceiling((maxY - minY) * srcH));
-
-                                if (srcX < 0) srcX = 0; if (srcY < 0) srcY = 0;
-                                if (srcX + cropW > srcW) cropW = srcW - srcX;
-                                if (srcY + cropH > srcH) cropH = srcH - srcY;
-
-                                if (cropW > 0 && cropH > 0)
-                                {
-                                    var cb = new CroppedBitmap(frameForMesh, new Int32Rect(srcX, srcY, cropW, cropH));
-                                    try { cb.Freeze(); } catch { }
-                                    frameForMesh = cb;
-                                }
+                                // Removed cropping to stretch the full source frame to fill the output mesh
+                                // float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+                                // foreach (var p in mesh.MeshPoints)
+                                // {
+                                //     minX = Math.Min(minX, p.X);
+                                //     minY = Math.Min(minY, p.Y);
+                                //     maxX = Math.Max(maxX, p.X);
+                                //     maxY = Math.Max(maxY, p.Y);
+                                // }
+                                // minX = Math.Max(0f, Math.Min(1f, minX));
+                                // minY = Math.Max(0f, Math.Min(1f, minY));
+                                // maxX = Math.Max(0f, Math.Min(1f, maxX));
+                                // maxY = Math.Max(0f, Math.Min(1f, maxY));
+                                // int srcW = frameForMesh.PixelWidth; int srcH = frameForMesh.PixelHeight;
+                                // int srcX = (int)Math.Floor(minX * srcW);
+                                // int srcY = (int)Math.Floor(minY * srcH);
+                                // int cropW = Math.Max(1, (int)Math.Ceiling((maxX - minX) * srcW));
+                                // int cropH = Math.Max(1, (int)Math.Ceiling((maxY - minY) * srcH));
+                                // if (srcX < 0) srcX = 0; if (srcY < 0) srcY = 0;
+                                // if (srcX + cropW > srcW) cropW = srcW - srcX;
+                                // if (srcY + cropH > srcH) cropH = srcH - srcY;
+                                // if (cropW > 0 && cropH > 0)
+                                // {
+                                //     var cb = new CroppedBitmap(frameForMesh, new Int32Rect(srcX, srcY, cropW, cropH));
+                                //     try { cb.Freeze(); } catch { }
+                                //     frameForMesh = cb;
+                                // }
                             }
                             catch { }
 

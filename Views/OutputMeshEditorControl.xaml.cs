@@ -323,6 +323,7 @@ namespace ProjectionMapper.Views
                 figure.Segments.Add(new LineSegment(new Point(_corners[1].X - minX, _corners[1].Y - minY), true));
                 figure.Segments.Add(new LineSegment(new Point(_corners[3].X - minX, _corners[3].Y - minY), true));
                 figure.Segments.Add(new LineSegment(new Point(_corners[2].X - minX, _corners[2].Y - minY), true));
+                figure.IsClosed = true;
                 clipGeometry.Figures.Add(figure);
                 PART_CroppedPreview.Clip = clipGeometry;
 
@@ -443,33 +444,52 @@ namespace ProjectionMapper.Views
                             Point[]? destQuad = null;
                             try
                             {
-                                if (HostRenderHost != null && HostRenderHost.CurrentFrame != null && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
-                                {
-                                    var scaleX = HostRenderHost.CurrentFrame.PixelWidth / PART_Canvas.ActualWidth;
-                                    var scaleY = HostRenderHost.CurrentFrame.PixelHeight / PART_Canvas.ActualHeight;
+                                // Try to map normalized output points to renderer pixel coordinates via RendererManager
+                                destQuad = RendererManager?.MapNormalizedToRendererPoints(_vm.OutputMeshPoints, _vm.Model?.TargetMonitorIndex);
+                            }
+                            catch (Exception exQuad) { Debug.WriteLine($"WriteBackMeshPoints: MapNormalizedToRendererPoints failed: {exQuad}"); destQuad = null; }
 
-                                    destQuad = new Point[4]
-                                    {
-                                        new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY), // TL
-                                        new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY), // TR
-                                        new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY), // BL
-                                        new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)  // BR
-                                    };
-                                }
-                                else
+                            // If mapping failed (no main host frame available), fall back to host-based mapping using HostRenderHost
+                            if (destQuad == null)
+                            {
+                                if (HostRenderHost != null)
                                 {
-                                    destQuad = new Point[4]
+                                    try
                                     {
-                                        new Point(_corners[0].X, _corners[0].Y), // TL
-                                        new Point(_corners[1].X, _corners[1].Y), // TR
-                                        new Point(_corners[2].X, _corners[2].Y), // BL
-                                        new Point(_corners[3].X, _corners[3].Y)  // BR
-                                    };
+                                        var cf = HostRenderHost.CurrentFrame;
+                                        if (cf != null && cf.PixelWidth > 0 && cf.PixelHeight > 0 && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
+                                        {
+                                            var scaleX = cf.PixelWidth / PART_Canvas.ActualWidth;
+                                            var scaleY = cf.PixelHeight / PART_Canvas.ActualHeight;
+                                            destQuad = new Point[4]
+                                            {
+                                                new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY),
+                                                new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY),
+                                                new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY),
+                                                new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)
+                                            };
+                                        }
+                                    }
+                                    catch { destQuad = null; }
                                 }
                             }
-                            catch (Exception exQuad) { Debug.WriteLine($"WriteBackMeshPoints: create destQuad failed: {exQuad}"); destQuad = null; }
 
                             var destRect = new Rect(_vm.X, _vm.Y, Math.Max(1, _vm.Width), Math.Max(1, _vm.Height));
+                            // clamp destQuad to renderer bounds if possible
+                            try
+                            {
+                                if (destQuad != null && RendererManager != null && RendererManager.OutputWidth > 0 && RendererManager.OutputHeight > 0)
+                                {
+                                    for (int i = 0; i < destQuad.Length; ++i)
+                                    {
+                                        var p = destQuad[i];
+                                        p.X = Math.Max(0, Math.Min(RendererManager.OutputWidth, p.X));
+                                        p.Y = Math.Max(0, Math.Min(RendererManager.OutputHeight, p.Y));
+                                        destQuad[i] = p;
+                                    }
+                                }
+                            }
+                            catch { }
                             try
                             {
                                 // Pass destQuad to RendererManager; it will pass through to the renderer which will warp if supported.

@@ -57,13 +57,11 @@
                     </Button.Content>
                 </Button>
 
-                <Button Content="Preview" Command="{Binding PreviewCommand}" />
-
                 <Separator />
                 <TextBlock Text="Input Zoom" VerticalAlignment="Center" Margin="8,0,4,0" />
-                <Slider Width="120" Minimum="0.1" Maximum="4" Value="{Binding InputZoom, Mode=TwoWay}" />
+                <Slider Width="120" Minimum="0.5" Maximum="4" Value="{Binding InputZoom, Mode=TwoWay}" />
                 <TextBlock Text="Output Zoom" VerticalAlignment="Center" Margin="8,0,4,0" />
-                <Slider Width="120" Minimum="0.1" Maximum="4" Value="{Binding OutputZoom, Mode=TwoWay}" />
+                <Slider Width="120" Minimum="0.5" Maximum="4" Value="{Binding OutputZoom, Mode=TwoWay}" />
             </ToolBar>
         </ToolBarTray>
 
@@ -133,6 +131,8 @@
                     <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
                         <TextBlock Text="Show Mesh Overlay (global):" VerticalAlignment="Center" Margin="0,0,6,0" />
                         <CheckBox x:Name="PART_GlobalShowMeshOverlayCheckbox" IsChecked="True" VerticalAlignment="Center" />
+                        <TextBlock Text="Show Coordinate Grid:" VerticalAlignment="Center" Margin="12,0,6,0" />
+                        <CheckBox x:Name="PART_ShowGridCheckbox" IsChecked="False" VerticalAlignment="Center" />
                     </StackPanel>
                     <!-- Simple inspector for selected mesh layer -->
                     <StackPanel DataContext="{Binding SelectedMeshLayer}" Margin="0,8,0,0">

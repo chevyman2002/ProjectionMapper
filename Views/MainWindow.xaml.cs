@@ -44,6 +44,61 @@ namespace ProjectionMapper
             public override string ToString() => Name;
         }
 
+        private void PART_MonitorCombo_DropDownOpened(object? sender, EventArgs e)
+        {
+            try
+            {
+                RefreshMonitors();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PART_MonitorCombo_DropDownOpened: failed to refresh monitors: {ex}");
+            }
+        }
+
+        private void RefreshMonitors()
+        {
+            try
+            {
+                // remember current selection so we can restore if possible
+                int prevSelected = -1;
+                try { prevSelected = PART_MonitorCombo != null ? PART_MonitorCombo.SelectedIndex : -1; } catch { prevSelected = -1; }
+
+                var newMonitors = EnumerateMonitors();
+
+                // update internal list
+                _monitors = newMonitors;
+
+                // rebuild ObservableCollection of items on UI thread
+                Dispatcher.Invoke(() =>
+                {
+                    _monitorItems.Clear();
+                    for (int i = 0; i < _monitors.Count; i++)
+                    {
+                        var m = _monitors[i];
+                        _monitorItems.Add(new MonitorItem { Index = i, Name = $"Display {i + 1} ({m.Width}x{m.Height})" });
+                    }
+
+                    // try to restore previous selection if still valid
+                    if (PART_MonitorCombo != null)
+                    {
+                        if (prevSelected >= 0 && prevSelected < _monitorItems.Count)
+                        {
+                            PART_MonitorCombo.SelectedIndex = prevSelected;
+                        }
+                        else
+                        {
+                            PART_MonitorCombo.SelectedIndex = -1;
+                        }
+                    }
+                }, DispatcherPriority.Normal);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RefreshMonitors: failed: {ex}");
+            }
+        }
+
         public MainWindow()
         {
             InitializeComponent();
@@ -117,6 +172,8 @@ namespace ProjectionMapper
                 {
                     PART_MonitorCombo.ItemsSource = _monitorItems;
                     PART_MonitorCombo.SelectionChanged += PART_MonitorCombo_SelectionChanged;
+                    // Re-scan displays each time the drop-down is opened so available monitors are up-to-date
+                    try { PART_MonitorCombo.DropDownOpened += PART_MonitorCombo_DropDownOpened; } catch { }
                 }
                 // We prefer a single monitor combo for selecting the output monitor for the selected source.
                 // Hide the per-mesh combo to avoid duplicate controls; the PART_MonitorCombo will be used to
@@ -141,6 +198,24 @@ namespace ProjectionMapper
                         PART_GlobalShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
                         PART_GlobalShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
                         PART_GlobalShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                    }
+                    // Show grid checkbox - call SetCoordinateGrid on output host when checked
+                    if (PART_ShowGridCheckbox != null)
+                    {
+                        PART_ShowGridCheckbox.Checked += (s, e) =>
+                        {
+                            try
+                            {
+                                // display grid every 100 renderer pixels by default
+                                PART_OutputHost?.SetCoordinateGrid(100);
+                            }
+                            catch { }
+                        };
+                        PART_ShowGridCheckbox.Unchecked += (s, e) =>
+                        {
+                            try { PART_OutputHost?.ClearGridOverlay(); } catch { }
+                        };
+                        PART_ShowGridCheckbox.IsChecked = false;
                     }
                 }
                 catch { }
