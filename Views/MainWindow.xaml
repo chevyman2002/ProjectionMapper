@@ -207,6 +207,7 @@
                                 <views:RenderHostControl x:Name="PART_InputHost" />
                                 <views:MeshEditorControl x:Name="PART_MeshEditor" VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
                                                          SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}"
+                                                         AllMeshLayers="{Binding SelectedImportedVideo.MeshLayers, Mode=OneWay}"
                                                          SelectedSourceId="{Binding SelectedImportedVideo.HostLayer.Id, Mode=OneWay}"
                                                          VideoService="{DynamicResource VideoService}"
                                                          RendererManager="{DynamicResource RendererManager}"
