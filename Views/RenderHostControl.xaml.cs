@@ -129,7 +129,7 @@ namespace ProjectionMapper.Views
         /// <summary>
         /// Set a bitmap frame produced by the renderer (BitmapSource must be frozen).
         /// This method is safe to call from the UI thread; calls from background threads will be dispatched.
-        /// </summary>
+        /// </summary)
         public void SetFrame(BitmapSource frame)
         {
             if (_disposed) return;
@@ -197,6 +197,7 @@ namespace ProjectionMapper.Views
         /// <summary>
         /// Draw a quad outline and optional points on the overlay canvas.
         /// Coordinates are in renderer pixel space and will be mapped to overlay size which matches control actual size.
+        /// This method clears existing mesh overlays and draws only this one - use AddMeshOverlay for multiple overlays.
         /// </summary>
         public void SetMeshOverlay(System.Windows.Point[]? quadPoints, bool showPoints)
         {
@@ -207,7 +208,26 @@ namespace ProjectionMapper.Views
                 return;
             }
 
-            PART_Overlay.Children.Clear();
+            // Clear only mesh overlays, preserve grid overlays
+            ClearMeshOverlay();
+            
+            if (quadPoints == null || quadPoints.Length < 4) return;
+
+            AddMeshOverlay(quadPoints, showPoints);
+        }
+
+        /// <summary>
+        /// Add a mesh overlay without clearing existing ones. Allows multiple quad outlines to be displayed simultaneously.
+        /// </summary>
+        public void AddMeshOverlay(System.Windows.Point[]? quadPoints, bool showPoints)
+        {
+            if (_disposed) return;
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.Invoke(() => AddMeshOverlay(quadPoints, showPoints));
+                return;
+            }
+
             if (quadPoints == null || quadPoints.Length < 4) return;
 
             try
@@ -269,6 +289,9 @@ namespace ProjectionMapper.Views
                         PART_Overlay.Children.Add(ellipse);
                     }
                 }
+
+                // Force redraw of the overlay canvas
+                PART_Overlay.InvalidateVisual();
             }
             catch { }
         }

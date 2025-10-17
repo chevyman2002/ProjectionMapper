@@ -244,7 +244,37 @@ namespace ProjectionMapper
             {
                 if (mesh != null && !string.IsNullOrEmpty(mesh.Id))
                 {
+                    try
+                    {
+                        // If the user has selected a monitor for the imported video, ensure the new mesh
+                        // inherits that target so overlays and compositor mapping apply to the same output host.
+                        var imported = _vm.SelectedImportedVideo;
+                        if (imported?.HostLayer != null)
+                        {
+                            mesh.TargetMonitorIndex = imported.HostLayer.TargetMonitorIndex;
+                        }
+                    }
+                    catch { }
+
                     await _videoService.RegisterMeshLayerAsync(mesh);
+
+                    // Also update all mesh overlays to include the new mesh layer
+                    UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
+
+                    // If this mesh targets a fullscreen monitor, push the current composed frame to that fullscreen host
+                    try
+                    {
+                        var target = mesh.TargetMonitorIndex;
+                        if (target >= 0)
+                        {
+                            var current = PART_OutputHost?.CurrentFrame;
+                            if (current != null)
+                            {
+                                _rendererManager.SetFullScreenHostFrame(target, current);
+                            }
+                        }
+                    }
+                    catch { }
                 }
             };
         }
@@ -459,6 +489,9 @@ namespace ProjectionMapper
                     // hide any existing fullscreen for this index
                     _rendererManager.HideFullScreenWindow(item.Index);
                 }
+
+                // Update all mesh overlays for the new monitor
+                UpdateAllMeshOverlaysForImportedVideo(imported);
             }
         }
 
@@ -566,6 +599,9 @@ namespace ProjectionMapper
                 {
                     PART_MeshMonitorCombo.SelectedIndex = layerVm.Model.TargetMonitorIndex >= 0 ? layerVm.Model.TargetMonitorIndex : -1;
                 }
+                
+                // Update all mesh overlays for the target monitor
+                UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
                 return;
             }
 
@@ -593,12 +629,54 @@ namespace ProjectionMapper
                 }
                 catch { }
 
+                // Update all mesh overlays for this imported video
+                UpdateAllMeshOverlaysForImportedVideo(imported);
                 return;
             }
 
             // Otherwise clear selections
             _vm.SelectedImportedVideo = null;
             _vm.SelectedMeshLayer = null;
+        }
+
+        private void UpdateAllMeshOverlaysForImportedVideo(ImportedVideoViewModel? imported)
+        {
+            if (imported == null) return;
+
+            try
+            {
+                var targetMonitor = imported.HostLayer?.TargetMonitorIndex ?? -1;
+                
+                // Update overlays for all mesh layers of this imported video
+                foreach (var meshVm in imported.MeshLayers)
+                {
+                    if (meshVm?.Model == null) continue;
+                    
+                    var layerId = meshVm.Model.Id;
+                    if (string.IsNullOrEmpty(layerId)) continue;
+                    
+                    var showOverlayPref = meshVm.Model.ShowOverlay;
+                    if (!showOverlayPref) continue;
+
+                    try
+                    {
+                        // Map normalized output mesh points to renderer coordinates
+                        Point[]? quadForRenderer = null;
+                        try
+                        {
+                            quadForRenderer = _rendererManager?.MapNormalizedToRendererPoints(meshVm.OutputMeshPoints, targetMonitor >= 0 ? targetMonitor : null);
+                        }
+                        catch { quadForRenderer = null; }
+
+                        if (quadForRenderer != null && quadForRenderer.Length >= 4)
+                        {
+                            _rendererManager?.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadForRenderer, true, layerId);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
         }
 
         // Ensure right-click selects the TreeViewItem under the mouse so context menu actions apply to it
@@ -885,26 +963,37 @@ namespace ProjectionMapper
 
         private static List<MonitorInfo> EnumerateMonitors()
         {
-            var list = new List<MonitorInfo>();
-
-            MonitorEnumDelegate del = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
+            try
             {
-                var mi = new MONITORINFOEX();
-                mi.cbSize = Marshal.SizeOf<MONITORINFOEX>();
-                if (GetMonitorInfo(hMonitor, ref mi))
+                var list = new List<MonitorInfo>();
+
+                MonitorEnumDelegate del = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
                 {
-                    var w = mi.rcMonitor.Right - mi.rcMonitor.Left;
-                    var h = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
-                    var l = mi.rcMonitor.Left;
-                    var t = mi.rcMonitor.Top;
-                    list.Add(new MonitorInfo(w, h, l, t));
-                }
-                return true;
-            };
+                    try
+                    {
+                        var mi = new MONITORINFOEX();
+                        mi.cbSize = Marshal.SizeOf<MONITORINFOEX>();
+                        if (GetMonitorInfo(hMonitor, ref mi))
+                        {
+                            var w = mi.rcMonitor.Right - mi.rcMonitor.Left;
+                            var h = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
+                            var l = mi.rcMonitor.Left;
+                            var t = mi.rcMonitor.Top;
+                            list.Add(new MonitorInfo(w, h, l, t));
+                        }
+                    }
+                    catch { }
+                    return true;
+                };
 
-            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, del, IntPtr.Zero);
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, del, IntPtr.Zero);
 
-            return list;
+                return list;
+            }
+            catch
+            {
+                return new List<MonitorInfo>();
+            }
         }
 
         private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);

@@ -196,9 +196,14 @@ namespace ProjectionMapper.Rendering
             }
         }
 
+        // Track multiple mesh overlays per monitor (or main host)
+        private readonly Dictionary<int, List<(Point[] QuadPoints, bool ShowPoints, string LayerId)>> _monitorMeshOverlays = new();
+        private readonly List<(Point[] QuadPoints, bool ShowPoints, string LayerId)> _mainHostMeshOverlays = new();
+
         /// <summary>
         /// Set mesh overlay (quad outline and optional points) on either the main attached host or a fullscreen host for a monitor.
         /// If monitorIndex is null, the main attached host will be used. If quadPoints is null the overlay will be cleared.
+        /// This method only sets a single overlay and clears others - use SetMultipleMeshOverlaysForMonitor for multiple overlays.
         /// </summary>
         public void SetMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints)
         {
@@ -230,12 +235,134 @@ namespace ProjectionMapper.Rendering
         }
 
         /// <summary>
+        /// Add a mesh overlay for a specific layer to a monitor. Multiple overlays can be added and all will be displayed.
+        /// </summary>
+        public void AddMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints, string layerId)
+        {
+            if (!ShowMeshOverlay || quadPoints == null || quadPoints.Length < 4) return;
+
+            try
+            {
+                if (monitorIndex.HasValue)
+                {
+                    if (!_monitorMeshOverlays.ContainsKey(monitorIndex.Value))
+                        _monitorMeshOverlays[monitorIndex.Value] = new List<(Point[], bool, string)>();
+
+                    // Remove any existing overlay for this layer
+                    _monitorMeshOverlays[monitorIndex.Value].RemoveAll(x => x.LayerId == layerId);
+                    
+                    // Add the new overlay
+                    _monitorMeshOverlays[monitorIndex.Value].Add((quadPoints, showPoints, layerId));
+
+                    // Update the display
+                    RefreshMeshOverlaysForMonitor(monitorIndex.Value);
+                }
+                else
+                {
+                    // Remove any existing overlay for this layer
+                    _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
+                    
+                    // Add the new overlay
+                    _mainHostMeshOverlays.Add((quadPoints, showPoints, layerId));
+
+                    // Update the display
+                    RefreshMeshOverlaysForMainHost();
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"AddMeshOverlayForMonitor failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Remove a mesh overlay for a specific layer from a monitor.
+        /// </summary>
+        public void RemoveMeshOverlayForMonitor(int? monitorIndex, string layerId)
+        {
+            try
+            {
+                if (monitorIndex.HasValue)
+                {
+                    if (_monitorMeshOverlays.TryGetValue(monitorIndex.Value, out var overlays))
+                    {
+                        overlays.RemoveAll(x => x.LayerId == layerId);
+                        RefreshMeshOverlaysForMonitor(monitorIndex.Value);
+                    }
+                }
+                else
+                {
+                    _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
+                    RefreshMeshOverlaysForMainHost();
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"RemoveMeshOverlayForMonitor failed: {ex}"); }
+        }
+
+        private void RefreshMeshOverlaysForMonitor(int monitorIndex)
+        {
+            try
+            {
+                if (_fullscreenWindows.TryGetValue(monitorIndex, out var win) && win != null)
+                {
+                    InvokeOnUi(() =>
+                    {
+                        try
+                        {
+                            // Clear existing mesh overlays first
+                            win.HostControl.ClearMeshOverlay();
+
+                            // Draw all overlays for this monitor using AddMeshOverlay to show multiple
+                            if (_monitorMeshOverlays.TryGetValue(monitorIndex, out var overlays))
+                            {
+                                foreach (var (quadPoints, showPoints, layerId) in overlays)
+                                {
+                                    win.HostControl.AddMeshOverlay(quadPoints, showPoints);
+                                }
+                            }
+                        }
+                        catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor inner failed: {ex}"); }
+                    });
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor failed: {ex}"); }
+        }
+
+        private void RefreshMeshOverlaysForMainHost()
+        {
+            try
+            {
+                if (_host != null)
+                {
+                    InvokeOnUi(() =>
+                    {
+                        try
+                        {
+                            // Clear existing mesh overlays first
+                            _host.ClearMeshOverlay();
+
+                            // Draw all overlays for main host using AddMeshOverlay to show multiple
+                            foreach (var (quadPoints, showPoints, layerId) in _mainHostMeshOverlays)
+                            {
+                                _host.AddMeshOverlay(quadPoints, showPoints);
+                            }
+                        }
+                        catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMainHost inner failed: {ex}"); }
+                    });
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMainHost failed: {ex}"); }
+        }
+
+        /// <summary>
         /// Clear overlays on all hosts (main and fullscreen).
         /// </summary>
         public void ClearAllOverlays()
         {
             try
             {
+                // Clear the tracking collections
+                _monitorMeshOverlays.Clear();
+                _mainHostMeshOverlays.Clear();
+
+                // Clear visual overlays on hosts
                 if (_host != null) InvokeOnUi(() => _host.ClearOverlay());
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
@@ -356,11 +483,23 @@ namespace ProjectionMapper.Rendering
         {
             if (_disposed) return;
             _disposed = true;
-
             _renderer.FrameReady -= OnFrameReady;
-            _ = StopAsync();
-            _renderLoop?.Dispose();
-            _renderer.Dispose();
+
+            try
+            {
+                // Stop the render loop synchronously to ensure no further RenderFrameAsync calls
+                // are made against the renderer while we are disposing it. Use GetAwaiter().GetResult()
+                // to synchronously wait for StopAsync to complete on dispose.
+                try { StopAsync().GetAwaiter().GetResult(); } catch (Exception exStop) { Debug.WriteLine($"RendererManager.Dispose: StopAsync failed: {exStop}"); }
+
+                // Dispose the render loop and renderer after stopping the loop.
+                try { _renderLoop?.Dispose(); } catch (Exception exLoop) { Debug.WriteLine($"RendererManager.Dispose: renderLoop.Dispose failed: {exLoop}"); }
+                try { _renderer.Dispose(); } catch (Exception exR) { Debug.WriteLine($"RendererManager.Dispose: renderer.Dispose failed: {exR}"); }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RendererManager.Dispose: unexpected error while stopping renderer: {ex}");
+            }
 
             foreach (var win in _fullscreenWindows.Values.ToList())
             {

@@ -37,36 +37,41 @@ namespace ProjectionMapper.Rendering
 
             _loopTask = Task.Run(async () =>
             {
-                var sw = new Stopwatch();
-                var minFrameTimeMs = _targetFps.HasValue && _targetFps > 0 ? 1000.0 / _targetFps.Value : 0.0;
-
-                while (!_cts.IsCancellationRequested)
+                try
                 {
-                    sw.Restart();
-                    try
-                    {
-                        await _renderCallback(_cts.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) { break; }
-                    catch (Exception)
-                    {
-                        // Renderer exceptions should be caught/logged at the renderCallback level; swallow here to keep the loop alive.
-                    }
+                    var sw = new Stopwatch();
+                    var minFrameTimeMs = _targetFps.HasValue && _targetFps > 0 ? 1000.0 / _targetFps.Value : 0.0;
 
-                    if (minFrameTimeMs > 0)
+                    while (!_cts.IsCancellationRequested)
                     {
-                        var elapsed = sw.Elapsed.TotalMilliseconds;
-                        var delay = minFrameTimeMs - elapsed;
-                        if (delay > 1)
+                        sw.Restart();
+                        try
                         {
-                            try
+                            await _renderCallback(_cts.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) { break; }
+                        catch (Exception)
+                        {
+                            // Renderer exceptions should be caught/logged at the renderCallback level; swallow here to keep the loop alive.
+                        }
+
+                        if (minFrameTimeMs > 0)
+                        {
+                            var elapsed = sw.Elapsed.TotalMilliseconds;
+                            var delay = minFrameTimeMs - elapsed;
+                            if (delay > 1)
                             {
-                                await Task.Delay(TimeSpan.FromMilliseconds(delay), _cts.Token).ConfigureAwait(false);
+                                try
+                                {
+                                    await Task.Delay(TimeSpan.FromMilliseconds(delay), _cts.Token).ConfigureAwait(false);
+                                }
+                                catch (OperationCanceledException) { break; }
                             }
-                            catch (OperationCanceledException) { break; }
                         }
                     }
                 }
+                catch (ObjectDisposedException) { }
+                catch (Exception) { }
             }, _cts.Token);
         }
 

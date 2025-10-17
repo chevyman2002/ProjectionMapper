@@ -79,8 +79,6 @@ namespace ProjectionMapper.Views
 
             Loaded += (_, __) => ApplyLayout();
             Unloaded += (_, __) => OnUnloaded();
-
-            Task.Run(() => BackgroundUpdateLoop(_cts.Token), _cts.Token);
         }
 
         private void OnUnloaded()
@@ -104,8 +102,7 @@ namespace ProjectionMapper.Views
         public VideoService? VideoService
         {
             get => (VideoService?)GetValue(VideoServiceProperty);
-            set => SetValue(VideoServiceProperty, value);
-        }
+            set => SetValue(VideoServiceProperty, value);        }
 
         private static void OnVideoServiceChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
@@ -262,6 +259,9 @@ namespace ProjectionMapper.Views
                 // fallback: show combined render host frame if available
                 SafeUpdateInputImageFromHost();
             }
+
+            // Update all external overlays when selection changes
+            UpdateAllExternalOverlays();
         }
 
         private void OnAllMeshLayersChanged(System.Collections.ObjectModel.ObservableCollection<LayerViewModel>? oldCollection, 
@@ -273,10 +273,21 @@ namespace ProjectionMapper.Views
             if (oldCollection != null)
             {
                 oldCollection.CollectionChanged -= AllMeshLayers_CollectionChanged;
-                // Unsubscribe from property changes of individual layers
+                // Unsubscribe from property changes of individual layers and remove their overlays
                 foreach (var layer in oldCollection)
                 {
                     try { layer.PropertyChanged -= AllMeshLayer_PropertyChanged; } catch { }
+                    
+                    // Remove overlay for this layer
+                    if (layer?.Model?.Id != null && _rendererManager != null)
+                    {
+                        var targetMonitor = layer.Model.TargetMonitorIndex;
+                        try 
+                        { 
+                            _rendererManager.RemoveMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, layer.Model.Id); 
+                        } 
+                        catch { }
+                    }
                 }
             }
 
@@ -291,13 +302,18 @@ namespace ProjectionMapper.Views
                 }
             }
 
-            // Refresh the display to show all mesh layer outlines
+            // Refresh the display to show all mesh layer outlines and external overlays
             RefreshAllMeshLayerOverlays();
+            UpdateAllExternalOverlays();
+
+            System.Diagnostics.Debug.WriteLine($"OnAllMeshLayersChanged: {newCollection?.Count ?? 0} layers");
         }
 
         private void AllMeshLayers_CollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
         {
             if (_isDisposed) return;
+
+            System.Diagnostics.Debug.WriteLine($"AllMeshLayers_CollectionChanged: Action={e.Action}");
 
             // Handle added items
             if (e.NewItems != null)
@@ -305,6 +321,10 @@ namespace ProjectionMapper.Views
                 foreach (LayerViewModel layer in e.NewItems)
                 {
                     try { layer.PropertyChanged += AllMeshLayer_PropertyChanged; } catch { }
+                    System.Diagnostics.Debug.WriteLine($"  Added layer: {layer.Name} (ID: {layer.Id})");
+                    
+                    // Add overlay for the new layer immediately
+                    UpdateExternalOverlayForLayer(layer);
                 }
             }
 
@@ -314,10 +334,22 @@ namespace ProjectionMapper.Views
                 foreach (LayerViewModel layer in e.OldItems)
                 {
                     try { layer.PropertyChanged -= AllMeshLayer_PropertyChanged; } catch { }
+                    System.Diagnostics.Debug.WriteLine($"  Removed layer: {layer.Name} (ID: {layer.Id})");
+                    
+                    // Remove overlay for this layer
+                    if (layer?.Model?.Id != null && _rendererManager != null)
+                    {
+                        var targetMonitor = layer.Model.TargetMonitorIndex;
+                        try 
+                        { 
+                            _rendererManager.RemoveMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, layer.Model.Id); 
+                        } 
+                        catch { }
+                    }
                 }
             }
 
-            // Refresh the display
+            // Refresh the display for UI overlays (this is separate from external overlays)
             RefreshAllMeshLayerOverlays();
         }
 
@@ -325,21 +357,34 @@ namespace ProjectionMapper.Views
         {
             if (_isDisposed || _suppressVmRebind) return;
 
-            // Only refresh if mesh points changed for any layer
-            if (e == null || e.PropertyName == nameof(LayerViewModel.MeshPoints) || string.IsNullOrEmpty(e.PropertyName))
+            // Only update external overlays for relevant property changes and only for the specific layer
+            if (e == null || string.IsNullOrEmpty(e.PropertyName) ||
+                e.PropertyName == nameof(LayerViewModel.MeshPoints) || 
+                e.PropertyName == nameof(LayerViewModel.OutputMeshPoints) ||
+                e.PropertyName == nameof(LayerViewModel.ShowOverlay) ||
+                e.PropertyName == nameof(LayerViewModel.Visible))
             {
-                try 
-                { 
-                    if (!Dispatcher.CheckAccess())
-                    {
-                        Dispatcher.BeginInvoke(() => RefreshAllMeshLayerOverlays());
-                    }
-                    else
-                    {
-                        RefreshAllMeshLayerOverlays();
-                    }
-                } 
-                catch { }
+                // Update only the specific layer that changed, not all layers
+                if (sender is LayerViewModel changedLayer)
+                {
+                    try 
+                    { 
+                        if (!Dispatcher.CheckAccess())
+                        {
+                            Dispatcher.BeginInvoke(() => 
+                            {
+                                RefreshAllMeshLayerOverlays(); // UI overlays still need full refresh
+                                UpdateExternalOverlayForLayer(changedLayer); // Only update this layer's external overlay
+                            });
+                        }
+                        else
+                        {
+                            RefreshAllMeshLayerOverlays(); // UI overlays still need full refresh
+                            UpdateExternalOverlayForLayer(changedLayer); // Only update this layer's external overlay
+                        }
+                    } 
+                    catch { }
+                }
             }
         }
 
@@ -388,18 +433,31 @@ namespace ProjectionMapper.Views
         {
             if (_isDisposed || _suppressVmRebind) return;
 
-            if (e == null || e.PropertyName == nameof(LayerViewModel.MeshPoints) || string.IsNullOrEmpty(e.PropertyName))
+            if (e == null || e.PropertyName == nameof(LayerViewModel.MeshPoints) || e.PropertyName == nameof(LayerViewModel.OutputMeshPoints) || string.IsNullOrEmpty(e.PropertyName))
             {
                 // use BeginInvoke to avoid potential cross-thread issues
                 try 
                 { 
                     if (!Dispatcher.CheckAccess())
                     {
-                        Dispatcher.BeginInvoke(() => MapSelectedLayerMeshToRects());
+                        Dispatcher.BeginInvoke(() => 
+                        {
+                            MapSelectedLayerMeshToRects();
+                            // Only update the selected layer's external overlay, not all layers
+                            if (SelectedLayer != null)
+                            {
+                                UpdateExternalOverlayForLayer(SelectedLayer);
+                            }
+                        });
                     }
                     else
                     {
                         MapSelectedLayerMeshToRects();
+                        // Only update the selected layer's external overlay, not all layers
+                        if (SelectedLayer != null)
+                        {
+                            UpdateExternalOverlayForLayer(SelectedLayer);
+                        }
                     }
                 } 
                 catch { }
@@ -866,10 +924,103 @@ namespace ProjectionMapper.Views
                 var bl = new Vector2((float)(_corners[2].X / cw), (float)(_corners[2].Y / ch));
                 var br = new Vector2((float)(_corners[3].X / cw), (float)(_corners[3].Y / ch));
 
+                // Update input mesh points (source cropping) - this is the primary purpose of input pane
                 vm.SetMeshPoint(0, tl);
                 vm.SetMeshPoint(1, tr);
                 vm.SetMeshPoint(2, bl);
                 vm.SetMeshPoint(3, br);
+
+                // Only update the selected layer's external overlay in real-time, not all layers
+                UpdateExternalOverlayForLayer(vm);
+            }
+            catch { }
+        }
+
+        private void UpdateExternalOverlayForLayer(LayerViewModel layer)
+        {
+            if (_isDisposed || layer?.Model == null || _rendererManager == null) return;
+
+            try
+            {
+                var layerId = layer.Model.Id;
+                if (string.IsNullOrEmpty(layerId)) return;
+
+                var targetMonitor = layer.Model.TargetMonitorIndex;
+
+                var showOverlayPref = layer.Model.ShowOverlay;
+                if (!showOverlayPref) 
+                {
+                    // Remove overlay if disabled
+                    try 
+                    { 
+                        _rendererManager.RemoveMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, layerId); 
+                    } 
+                    catch { }
+                    return;
+                }
+
+                // Choose which mesh points to use for external overlay:
+                // If OutputMeshPoints have been modified from defaults (not all corners at 0,0,1,1), use them
+                // Otherwise, use MeshPoints for the overlay
+                Vector2[]? meshPointsToUse = null;
+                var outputPts = layer.OutputMeshPoints;
+                var inputPts = layer.MeshPoints;
+
+                // Check if OutputMeshPoints are still at default positions (indicating they haven't been edited in output pane)
+                bool outputPtsAreDefault = (outputPts != null && outputPts.Length >= 4 &&
+                    IsPointApproximately(outputPts[0], new Vector2(0f, 0f)) &&
+                    IsPointApproximately(outputPts[1], new Vector2(1f, 0f)) &&
+                    IsPointApproximately(outputPts[2], new Vector2(0f, 1f)) &&
+                    IsPointApproximately(outputPts[3], new Vector2(1f, 1f)));
+
+                // If output points are at defaults, use input points; otherwise use output points
+                meshPointsToUse = outputPtsAreDefault ? inputPts : outputPts;
+
+                // Map chosen mesh points to renderer coordinates
+                Point[]? quadForRenderer = null;
+                try
+                {
+                    quadForRenderer = _rendererManager.MapNormalizedToRendererPoints(meshPointsToUse, targetMonitor >= 0 ? targetMonitor : null);
+                }
+                catch { quadForRenderer = null; }
+
+                if (quadForRenderer != null && quadForRenderer.Length >= 4)
+                {
+                    // Remove existing overlay for this layer first, then add the new one
+                    // This approach is much more efficient than clearing all overlays
+                    try 
+                    { 
+                        _rendererManager.RemoveMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, layerId); 
+                    } 
+                    catch { }
+                    
+                    _rendererManager.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadForRenderer, true, layerId);
+                }
+            }
+            catch (Exception ex) 
+            { 
+                System.Diagnostics.Debug.WriteLine($"UpdateExternalOverlayForLayer failed for {layer?.Name}: {ex.Message}");
+            }
+        }
+
+        private static bool IsPointApproximately(Vector2 point, Vector2 target, float tolerance = 0.01f)
+        {
+            return Math.Abs(point.X - target.X) < tolerance && Math.Abs(point.Y - target.Y) < tolerance;
+        }
+
+        private void UpdateAllExternalOverlays()
+        {
+            if (_isDisposed || _rendererManager == null || AllMeshLayers == null) return;
+
+            try
+            {
+                // Don't clear and recreate all overlays - just update each one individually
+                // This prevents exponential performance degradation with multiple mesh layers
+                foreach (var meshLayer in AllMeshLayers)
+                {
+                    if (meshLayer?.Model == null) continue;
+                    UpdateExternalOverlayForLayer(meshLayer);
+                }
             }
             catch { }
         }
@@ -982,3 +1133,5 @@ namespace ProjectionMapper.Views
         }
     }
 }
+
+

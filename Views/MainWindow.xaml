@@ -232,7 +232,11 @@
                                 <views:RenderHostControl x:Name="PART_OutputHost" />
 
                                 <!-- Output mesh editor binds to SelectedMeshLayer so output rect is adjustable -->
-                                <views:OutputMeshEditorControl SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}" VideoService="{DynamicResource VideoService}" HostRenderHost="{Binding ElementName=PART_OutputHost}" RendererManager="{DynamicResource RendererManager}" />
+                                <views:OutputMeshEditorControl SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}" 
+                                                               AllMeshLayers="{Binding SelectedImportedVideo.MeshLayers, Mode=OneWay}"
+                                                               VideoService="{DynamicResource VideoService}" 
+                                                               HostRenderHost="{Binding ElementName=PART_OutputHost}" 
+                                                               RendererManager="{DynamicResource RendererManager}" />
                             </Grid>
                         </ScrollViewer>
                     </DockPanel>
