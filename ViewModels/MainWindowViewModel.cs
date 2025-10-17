@@ -212,15 +212,11 @@ namespace ProjectionMapper.ViewModels
             // create a mesh layer linked to the host
             var host = SelectedImportedVideo.HostLayer;
 
-            // Default to a centered, smaller rect (50% of host) so multiple layers are easier to work with
-            int defaultW = 640, defaultH = 360, defaultX = 0, defaultY = 0;
-            if (host != null && host.Width > 0 && host.Height > 0)
-            {
-                defaultW = Math.Max(1, host.Width / 2);
-                defaultH = Math.Max(1, host.Height / 2);
-                defaultX = host.X + (host.Width - defaultW) / 2;
-                defaultY = host.Y + (host.Height - defaultH) / 2;
-            }
+            // Default to a centered, smaller rect (20% of host) so multiple layers are easier to work with
+            int defaultW = Math.Max(1, host.Width / 5);
+            int defaultH = Math.Max(1, host.Height / 5);
+            int defaultX = host.X + (host.Width - defaultW) / 2;
+            int defaultY = host.Y + (host.Height - defaultH) / 2;
 
             var layerModel = new LayerModel
             {

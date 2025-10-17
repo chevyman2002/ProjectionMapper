@@ -44,6 +44,61 @@ namespace ProjectionMapper
             public override string ToString() => Name;
         }
 
+        private void PART_MonitorCombo_DropDownOpened(object? sender, EventArgs e)
+        {
+            try
+            {
+                RefreshMonitors();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PART_MonitorCombo_DropDownOpened: failed to refresh monitors: {ex}");
+            }
+        }
+
+        private void RefreshMonitors()
+        {
+            try
+            {
+                // remember current selection so we can restore if possible
+                int prevSelected = -1;
+                try { prevSelected = PART_MonitorCombo != null ? PART_MonitorCombo.SelectedIndex : -1; } catch { prevSelected = -1; }
+
+                var newMonitors = EnumerateMonitors();
+
+                // update internal list
+                _monitors = newMonitors;
+
+                // rebuild ObservableCollection of items on UI thread
+                Dispatcher.Invoke(() =>
+                {
+                    _monitorItems.Clear();
+                    for (int i = 0; i < _monitors.Count; i++)
+                    {
+                        var m = _monitors[i];
+                        _monitorItems.Add(new MonitorItem { Index = i, Name = $"Display {i + 1} ({m.Width}x{m.Height})" });
+                    }
+
+                    // try to restore previous selection if still valid
+                    if (PART_MonitorCombo != null)
+                    {
+                        if (prevSelected >= 0 && prevSelected < _monitorItems.Count)
+                        {
+                            PART_MonitorCombo.SelectedIndex = prevSelected;
+                        }
+                        else
+                        {
+                            PART_MonitorCombo.SelectedIndex = -1;
+                        }
+                    }
+                }, DispatcherPriority.Normal);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RefreshMonitors: failed: {ex}");
+            }
+        }
+
         public MainWindow()
         {
             InitializeComponent();
@@ -117,6 +172,8 @@ namespace ProjectionMapper
                 {
                     PART_MonitorCombo.ItemsSource = _monitorItems;
                     PART_MonitorCombo.SelectionChanged += PART_MonitorCombo_SelectionChanged;
+                    // Re-scan displays each time the drop-down is opened so available monitors are up-to-date
+                    try { PART_MonitorCombo.DropDownOpened += PART_MonitorCombo_DropDownOpened; } catch { }
                 }
                 // We prefer a single monitor combo for selecting the output monitor for the selected source.
                 // Hide the per-mesh combo to avoid duplicate controls; the PART_MonitorCombo will be used to
@@ -125,6 +182,43 @@ namespace ProjectionMapper
 
                 // Wire up audio control event handlers
                 HookAudioControls();
+
+                // Wire mesh overlay checkbox
+                try
+                {
+                    if (PART_ShowMeshOverlayCheckbox != null)
+                    {
+                        PART_ShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
+                        PART_ShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
+                        // default checked
+                        PART_ShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                    }
+                    if (PART_GlobalShowMeshOverlayCheckbox != null)
+                    {
+                        PART_GlobalShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
+                        PART_GlobalShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
+                        PART_GlobalShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                    }
+                    // Show grid checkbox - call SetCoordinateGrid on output host when checked
+                    if (PART_ShowGridCheckbox != null)
+                    {
+                        PART_ShowGridCheckbox.Checked += (s, e) =>
+                        {
+                            try
+                            {
+                                // display grid every 100 renderer pixels by default
+                                PART_OutputHost?.SetCoordinateGrid(100);
+                            }
+                            catch { }
+                        };
+                        PART_ShowGridCheckbox.Unchecked += (s, e) =>
+                        {
+                            try { PART_OutputHost?.ClearGridOverlay(); } catch { }
+                        };
+                        PART_ShowGridCheckbox.IsChecked = false;
+                    }
+                }
+                catch { }
             };
 
             // Start renderer (use output host size; fallback to 1280x720)
@@ -150,7 +244,37 @@ namespace ProjectionMapper
             {
                 if (mesh != null && !string.IsNullOrEmpty(mesh.Id))
                 {
+                    try
+                    {
+                        // If the user has selected a monitor for the imported video, ensure the new mesh
+                        // inherits that target so overlays and compositor mapping apply to the same output host.
+                        var imported = _vm.SelectedImportedVideo;
+                        if (imported?.HostLayer != null)
+                        {
+                            mesh.TargetMonitorIndex = imported.HostLayer.TargetMonitorIndex;
+                        }
+                    }
+                    catch { }
+
                     await _videoService.RegisterMeshLayerAsync(mesh);
+
+                    // Also update all mesh overlays to include the new mesh layer
+                    UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
+
+                    // If this mesh targets a fullscreen monitor, push the current composed frame to that fullscreen host
+                    try
+                    {
+                        var target = mesh.TargetMonitorIndex;
+                        if (target >= 0)
+                        {
+                            var current = PART_OutputHost?.CurrentFrame;
+                            if (current != null)
+                            {
+                                _rendererManager.SetFullScreenHostFrame(target, current);
+                            }
+                        }
+                    }
+                    catch { }
                 }
             };
         }
@@ -365,6 +489,9 @@ namespace ProjectionMapper
                     // hide any existing fullscreen for this index
                     _rendererManager.HideFullScreenWindow(item.Index);
                 }
+
+                // Update all mesh overlays for the new monitor
+                UpdateAllMeshOverlaysForImportedVideo(imported);
             }
         }
 
@@ -472,6 +599,9 @@ namespace ProjectionMapper
                 {
                     PART_MeshMonitorCombo.SelectedIndex = layerVm.Model.TargetMonitorIndex >= 0 ? layerVm.Model.TargetMonitorIndex : -1;
                 }
+                
+                // Update all mesh overlays for the target monitor
+                UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
                 return;
             }
 
@@ -499,12 +629,54 @@ namespace ProjectionMapper
                 }
                 catch { }
 
+                // Update all mesh overlays for this imported video
+                UpdateAllMeshOverlaysForImportedVideo(imported);
                 return;
             }
 
             // Otherwise clear selections
             _vm.SelectedImportedVideo = null;
             _vm.SelectedMeshLayer = null;
+        }
+
+        private void UpdateAllMeshOverlaysForImportedVideo(ImportedVideoViewModel? imported)
+        {
+            if (imported == null) return;
+
+            try
+            {
+                var targetMonitor = imported.HostLayer?.TargetMonitorIndex ?? -1;
+                
+                // Update overlays for all mesh layers of this imported video
+                foreach (var meshVm in imported.MeshLayers)
+                {
+                    if (meshVm?.Model == null) continue;
+                    
+                    var layerId = meshVm.Model.Id;
+                    if (string.IsNullOrEmpty(layerId)) continue;
+                    
+                    var showOverlayPref = meshVm.Model.ShowOverlay;
+                    if (!showOverlayPref) continue;
+
+                    try
+                    {
+                        // Map normalized output mesh points to renderer coordinates
+                        Point[]? quadForRenderer = null;
+                        try
+                        {
+                            quadForRenderer = _rendererManager?.MapNormalizedToRendererPoints(meshVm.OutputMeshPoints, targetMonitor >= 0 ? targetMonitor : null);
+                        }
+                        catch { quadForRenderer = null; }
+
+                        if (quadForRenderer != null && quadForRenderer.Length >= 4)
+                        {
+                            _rendererManager?.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadForRenderer, true, layerId);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
         }
 
         // Ensure right-click selects the TreeViewItem under the mouse so context menu actions apply to it
@@ -791,26 +963,37 @@ namespace ProjectionMapper
 
         private static List<MonitorInfo> EnumerateMonitors()
         {
-            var list = new List<MonitorInfo>();
-
-            MonitorEnumDelegate del = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
+            try
             {
-                var mi = new MONITORINFOEX();
-                mi.cbSize = Marshal.SizeOf<MONITORINFOEX>();
-                if (GetMonitorInfo(hMonitor, ref mi))
+                var list = new List<MonitorInfo>();
+
+                MonitorEnumDelegate del = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
                 {
-                    var w = mi.rcMonitor.Right - mi.rcMonitor.Left;
-                    var h = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
-                    var l = mi.rcMonitor.Left;
-                    var t = mi.rcMonitor.Top;
-                    list.Add(new MonitorInfo(w, h, l, t));
-                }
-                return true;
-            };
+                    try
+                    {
+                        var mi = new MONITORINFOEX();
+                        mi.cbSize = Marshal.SizeOf<MONITORINFOEX>();
+                        if (GetMonitorInfo(hMonitor, ref mi))
+                        {
+                            var w = mi.rcMonitor.Right - mi.rcMonitor.Left;
+                            var h = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
+                            var l = mi.rcMonitor.Left;
+                            var t = mi.rcMonitor.Top;
+                            list.Add(new MonitorInfo(w, h, l, t));
+                        }
+                    }
+                    catch { }
+                    return true;
+                };
 
-            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, del, IntPtr.Zero);
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, del, IntPtr.Zero);
 
-            return list;
+                return list;
+            }
+            catch
+            {
+                return new List<MonitorInfo>();
+            }
         }
 
         private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);

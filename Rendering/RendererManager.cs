@@ -30,7 +30,24 @@ namespace ProjectionMapper.Rendering
         {
             _renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
             _renderer.FrameReady += OnFrameReady;
+            ShowMeshOverlay = true; // enabled by default
         }
+
+        public async Task ResizeAsync(int width, int height, CancellationToken token = default)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(RendererManager));
+            await _renderer.ResizeAsync(width, height, token).ConfigureAwait(false);
+            OutputWidth = width; OutputHeight = height;
+        }
+
+        // Current renderer output size in pixels (set when StartAsync is called)
+        public int OutputWidth { get; private set; }
+        public int OutputHeight { get; private set; }
+
+        /// <summary>
+        /// When true, mesh overlay (quad outline and points) will be shown on output hosts when provided.
+        /// </summary>
+        public bool ShowMeshOverlay { get; set; }
 
         /// <summary>
         /// Map normalized output coordinates (0..1) to renderer pixel coordinates using the attached host's current frame
@@ -44,22 +61,26 @@ namespace ProjectionMapper.Rendering
             {
                 BitmapSource? frame = null;
 
-                // If a specific monitor index is requested, prefer that fullscreen host's current frame
+                // If a specific monitor index is requested and a fullscreen host exists for it, prefer that host's current frame
+                // because the mapping should use the pixel space of the target display. Otherwise fall back to the main attached host.
                 if (monitorIndex.HasValue && _fullscreenWindows.TryGetValue(monitorIndex.Value, out var win) && win != null)
                 {
                     try { frame = win.HostControl?.CurrentFrame; }
                     catch (Exception ex) { Debug.WriteLine($"MapNormalizedToRendererPoints: failed reading fullscreen host frame: {ex}"); frame = null; }
                 }
 
-                // Fallback to main attached host
+                // Fallback to main attached host if fullscreen host not available
                 if (frame == null)
                 {
                     if (_host == null) return null;
                     frame = _host.CurrentFrame;
                 }
-                if (frame == null) return null;
-                double w = frame.PixelWidth;
-                double h = frame.PixelHeight;
+                // Prefer using the renderer's canonical output size when available so normalized coordinates
+                // map into renderer pixel space deterministically. Fall back to the host frame pixel size
+                // only if the renderer output size is not known.
+                double w = OutputWidth > 0 ? OutputWidth : (frame?.PixelWidth ?? 0);
+                double h = OutputHeight > 0 ? OutputHeight : (frame?.PixelHeight ?? 0);
+                if (w <= 0 || h <= 0) return null;
                 var pts = new Point[4];
                 for (int i = 0; i < 4; ++i)
                 {
@@ -154,89 +175,201 @@ namespace ProjectionMapper.Rendering
             {
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
-                    try { InvokeOnUi(() => win?.HostControl?.Clear()); } catch (Exception ex) { Debug.WriteLine($"OnFrameReady clear fullscreen failed: {ex}"); }
+                    try { InvokeOnUi(() => win?.HostControl?.Clear()); } catch { }
                 }
             }
             else
             {
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
-                try
+                    try
+                    {
+                        InvokeOnUi(() =>
+                        {
+                            if (win == null || win.HostControl == null) return;
+                            if (!win.IsVisible || win.WindowState == WindowState.Minimized) return;
+                            try { win.HostControl.SetFrame(bmp); } catch { }
+                        });
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        // Track multiple mesh overlays per monitor (or main host)
+        private readonly Dictionary<int, List<(Point[] QuadPoints, bool ShowPoints, string LayerId)>> _monitorMeshOverlays = new();
+        private readonly List<(Point[] QuadPoints, bool ShowPoints, string LayerId)> _mainHostMeshOverlays = new();
+
+        /// <summary>
+        /// Set mesh overlay (quad outline and optional points) on either the main attached host or a fullscreen host for a monitor.
+        /// If monitorIndex is null, the main attached host will be used. If quadPoints is null the overlay will be cleared.
+        /// This method only sets a single overlay and clears others - use SetMultipleMeshOverlaysForMonitor for multiple overlays.
+        /// </summary>
+        public void SetMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints)
+        {
+            if (!ShowMeshOverlay)
+            {
+                // If overlays disabled globally, ensure cleared
+                ClearAllOverlays();
+                return;
+            }
+
+            try
+            {
+                if (monitorIndex.HasValue)
                 {
-                    // All accesses to Window/Control properties must be done on UI thread.
+                    if (_fullscreenWindows.TryGetValue(monitorIndex.Value, out var win) && win != null)
+                    {
+                        InvokeOnUi(() => win.HostControl.SetMeshOverlay(quadPoints, showPoints));
+                        return;
+                    }
+                }
+
+                // fallback to main host
+                if (_host != null)
+                {
+                    InvokeOnUi(() => _host.SetMeshOverlay(quadPoints, showPoints));
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"SetMeshOverlayForMonitor failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Add a mesh overlay for a specific layer to a monitor. Multiple overlays can be added and all will be displayed.
+        /// </summary>
+        public void AddMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints, string layerId)
+        {
+            if (!ShowMeshOverlay || quadPoints == null || quadPoints.Length < 4) return;
+
+            try
+            {
+                if (monitorIndex.HasValue)
+                {
+                    if (!_monitorMeshOverlays.ContainsKey(monitorIndex.Value))
+                        _monitorMeshOverlays[monitorIndex.Value] = new List<(Point[], bool, string)>();
+
+                    // Remove any existing overlay for this layer
+                    _monitorMeshOverlays[monitorIndex.Value].RemoveAll(x => x.LayerId == layerId);
+                    
+                    // Add the new overlay
+                    _monitorMeshOverlays[monitorIndex.Value].Add((quadPoints, showPoints, layerId));
+
+                    // Update the display
+                    RefreshMeshOverlaysForMonitor(monitorIndex.Value);
+                }
+                else
+                {
+                    // Remove any existing overlay for this layer
+                    _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
+                    
+                    // Add the new overlay
+                    _mainHostMeshOverlays.Add((quadPoints, showPoints, layerId));
+
+                    // Update the display
+                    RefreshMeshOverlaysForMainHost();
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"AddMeshOverlayForMonitor failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Remove a mesh overlay for a specific layer from a monitor.
+        /// </summary>
+        public void RemoveMeshOverlayForMonitor(int? monitorIndex, string layerId)
+        {
+            try
+            {
+                if (monitorIndex.HasValue)
+                {
+                    if (_monitorMeshOverlays.TryGetValue(monitorIndex.Value, out var overlays))
+                    {
+                        overlays.RemoveAll(x => x.LayerId == layerId);
+                        RefreshMeshOverlaysForMonitor(monitorIndex.Value);
+                    }
+                }
+                else
+                {
+                    _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
+                    RefreshMeshOverlaysForMainHost();
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"RemoveMeshOverlayForMonitor failed: {ex}"); }
+        }
+
+        private void RefreshMeshOverlaysForMonitor(int monitorIndex)
+        {
+            try
+            {
+                if (_fullscreenWindows.TryGetValue(monitorIndex, out var win) && win != null)
+                {
                     InvokeOnUi(() =>
                     {
                         try
                         {
-                            if (win == null)
-                            {
-                                Debug.WriteLine("OnFrameReady: encountered null fullscreen window in collection (UI thread)");
-                                return;
-                            }
-                            if (win.HostControl == null)
-                            {
-                                Debug.WriteLine("OnFrameReady: fullscreen window has null HostControl (UI thread)");
-                                return;
-                            }
-                            try
-                            {
-                                Debug.WriteLine($"OnFrameReady: preparing to mirror frame to fullscreen host for window '{win.Title}' (UI thread). Visible={win.IsVisible}, State={win.WindowState}");
-                                if (!win.IsVisible || win.WindowState == WindowState.Minimized)
-                                {
-                                    Debug.WriteLine($"OnFrameReady: skipping SetFrame because window not visible or minimized for monitor host '{win.Title}'");
-                                    return;
-                                }
+                            // Clear existing mesh overlays first
+                            win.HostControl.ClearMeshOverlay();
 
-                                try
-                                {
-                                    win.HostControl.SetFrame(bmp);
-
-                                    // Log diagnostic about the host control's current frame
-                                    try
-                                    {
-                                        var cf = win.HostControl.CurrentFrame;
-                                        if (cf != null)
-                                        {
-                                            Debug.WriteLine($"OnFrameReady: SetFrame succeeded; HostControl.CurrentFrame size={cf.PixelWidth}x{cf.PixelHeight}");
-                                        }
-                                        else
-                                        {
-                                            Debug.WriteLine($"OnFrameReady: SetFrame completed but HostControl.CurrentFrame is null");
-                                        }
-                                    }
-                                    catch (Exception exInner2)
-                                    {
-                                        Debug.WriteLine($"OnFrameReady: failed to read HostControl.CurrentFrame (UI thread): {exInner2}");
-                                    }
-
-                                    try
-                                    {
-                                        Debug.WriteLine($"OnFrameReady: fullscreen window bounds L,T,W,H = {win.Left},{win.Top},{win.Width},{win.Height}");
-                                    }
-                                    catch { }
-                                }
-                                catch (Exception ex)
-                                {
-                                    Debug.WriteLine($"OnFrameReady set fullscreen failed (UI thread): {ex}");
-                                }
-                            }
-                            catch (Exception ex)
+                            // Draw all overlays for this monitor using AddMeshOverlay to show multiple
+                            if (_monitorMeshOverlays.TryGetValue(monitorIndex, out var overlays))
                             {
-                                Debug.WriteLine($"OnFrameReady inner UI action failed: {ex}");
+                                foreach (var (quadPoints, showPoints, layerId) in overlays)
+                                {
+                                    win.HostControl.AddMeshOverlay(quadPoints, showPoints);
+                                }
                             }
                         }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"OnFrameReady inner UI action failed: {ex}");
-                        }
+                        catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor inner failed: {ex}"); }
                     });
                 }
-                catch (Exception ex)
+            }
+            catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor failed: {ex}"); }
+        }
+
+        private void RefreshMeshOverlaysForMainHost()
+        {
+            try
+            {
+                if (_host != null)
                 {
-                    Debug.WriteLine($"OnFrameReady: exception while scheduling mirror to fullscreen window: {ex}");
-                }
+                    InvokeOnUi(() =>
+                    {
+                        try
+                        {
+                            // Clear existing mesh overlays first
+                            _host.ClearMeshOverlay();
+
+                            // Draw all overlays for main host using AddMeshOverlay to show multiple
+                            foreach (var (quadPoints, showPoints, layerId) in _mainHostMeshOverlays)
+                            {
+                                _host.AddMeshOverlay(quadPoints, showPoints);
+                            }
+                        }
+                        catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMainHost inner failed: {ex}"); }
+                    });
                 }
             }
+            catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMainHost failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Clear overlays on all hosts (main and fullscreen).
+        /// </summary>
+        public void ClearAllOverlays()
+        {
+            try
+            {
+                // Clear the tracking collections
+                _monitorMeshOverlays.Clear();
+                _mainHostMeshOverlays.Clear();
+
+                // Clear visual overlays on hosts
+                if (_host != null) InvokeOnUi(() => _host.ClearOverlay());
+                foreach (var win in _fullscreenWindows.Values.ToList())
+                {
+                    if (win?.HostControl != null) InvokeOnUi(() => win.HostControl.ClearOverlay());
+                }
+            }
+            catch { }
         }
 
         /// <summary>
@@ -350,11 +483,23 @@ namespace ProjectionMapper.Rendering
         {
             if (_disposed) return;
             _disposed = true;
-
             _renderer.FrameReady -= OnFrameReady;
-            _ = StopAsync();
-            _renderLoop?.Dispose();
-            _renderer.Dispose();
+
+            try
+            {
+                // Stop the render loop synchronously to ensure no further RenderFrameAsync calls
+                // are made against the renderer while we are disposing it. Use GetAwaiter().GetResult()
+                // to synchronously wait for StopAsync to complete on dispose.
+                try { StopAsync().GetAwaiter().GetResult(); } catch (Exception exStop) { Debug.WriteLine($"RendererManager.Dispose: StopAsync failed: {exStop}"); }
+
+                // Dispose the render loop and renderer after stopping the loop.
+                try { _renderLoop?.Dispose(); } catch (Exception exLoop) { Debug.WriteLine($"RendererManager.Dispose: renderLoop.Dispose failed: {exLoop}"); }
+                try { _renderer.Dispose(); } catch (Exception exR) { Debug.WriteLine($"RendererManager.Dispose: renderer.Dispose failed: {exR}"); }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RendererManager.Dispose: unexpected error while stopping renderer: {ex}");
+            }
 
             foreach (var win in _fullscreenWindows.Values.ToList())
             {

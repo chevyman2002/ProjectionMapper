@@ -57,13 +57,11 @@
                     </Button.Content>
                 </Button>
 
-                <Button Content="Preview" Command="{Binding PreviewCommand}" />
-
                 <Separator />
                 <TextBlock Text="Input Zoom" VerticalAlignment="Center" Margin="8,0,4,0" />
-                <Slider Width="120" Minimum="0.1" Maximum="4" Value="{Binding InputZoom, Mode=TwoWay}" />
+                <Slider Width="120" Minimum="0.5" Maximum="4" Value="{Binding InputZoom, Mode=TwoWay}" />
                 <TextBlock Text="Output Zoom" VerticalAlignment="Center" Margin="8,0,4,0" />
-                <Slider Width="120" Minimum="0.1" Maximum="4" Value="{Binding OutputZoom, Mode=TwoWay}" />
+                <Slider Width="120" Minimum="0.5" Maximum="4" Value="{Binding OutputZoom, Mode=TwoWay}" />
             </ToolBar>
         </ToolBarTray>
 
@@ -130,6 +128,12 @@
                     <Separator Margin="0,8,0,8" />
 
                     <TextBlock FontWeight="Bold" Text="Properties" Margin="0,0,0,8"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                        <TextBlock Text="Show Mesh Overlay (global):" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <CheckBox x:Name="PART_GlobalShowMeshOverlayCheckbox" IsChecked="True" VerticalAlignment="Center" />
+                        <TextBlock Text="Show Coordinate Grid:" VerticalAlignment="Center" Margin="12,0,6,0" />
+                        <CheckBox x:Name="PART_ShowGridCheckbox" IsChecked="False" VerticalAlignment="Center" />
+                    </StackPanel>
                     <!-- Simple inspector for selected mesh layer -->
                     <StackPanel DataContext="{Binding SelectedMeshLayer}" Margin="0,8,0,0">
                         <TextBlock Text="Selected:" FontWeight="Bold" />
@@ -151,6 +155,10 @@
                             <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                 <TextBlock Text="Output Display:" VerticalAlignment="Center" Margin="0,0,6,0" />
                                 <ComboBox x:Name="PART_MeshMonitorCombo" Width="150" SelectedIndex="-1" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0" VerticalAlignment="Center">
+                                <TextBlock Text="Show Mesh Overlay on Output:" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                <CheckBox x:Name="PART_ShowMeshOverlayCheckbox" IsChecked="True" VerticalAlignment="Center" />
                             </StackPanel>
                         </StackPanel>
                     </StackPanel>
@@ -199,6 +207,7 @@
                                 <views:RenderHostControl x:Name="PART_InputHost" />
                                 <views:MeshEditorControl x:Name="PART_MeshEditor" VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
                                                          SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}"
+                                                         AllMeshLayers="{Binding SelectedImportedVideo.MeshLayers, Mode=OneWay}"
                                                          SelectedSourceId="{Binding SelectedImportedVideo.HostLayer.Id, Mode=OneWay}"
                                                          VideoService="{DynamicResource VideoService}"
                                                          RendererManager="{DynamicResource RendererManager}"
@@ -223,7 +232,11 @@
                                 <views:RenderHostControl x:Name="PART_OutputHost" />
 
                                 <!-- Output mesh editor binds to SelectedMeshLayer so output rect is adjustable -->
-                                <views:OutputMeshEditorControl SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}" VideoService="{DynamicResource VideoService}" HostRenderHost="{Binding ElementName=PART_OutputHost}" RendererManager="{DynamicResource RendererManager}" />
+                                <views:OutputMeshEditorControl SelectedLayer="{Binding SelectedMeshLayer, Mode=TwoWay}" 
+                                                               AllMeshLayers="{Binding SelectedImportedVideo.MeshLayers, Mode=OneWay}"
+                                                               VideoService="{DynamicResource VideoService}" 
+                                                               HostRenderHost="{Binding ElementName=PART_OutputHost}" 
+                                                               RendererManager="{DynamicResource RendererManager}" />
                             </Grid>
                         </ScrollViewer>
                     </DockPanel>

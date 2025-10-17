@@ -155,5 +155,16 @@ namespace ProjectionMapper.ViewModels
                 RaisePropertyChanged();
             }
         }
+
+        public bool ShowOverlay
+        {
+            get => _model.ShowOverlay;
+            set
+            {
+                if (_model.ShowOverlay == value) return;
+                _model.ShowOverlay = value;
+                RaisePropertyChanged();
+            }
+        }
     }
 }
