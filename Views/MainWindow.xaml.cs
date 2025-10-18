@@ -258,23 +258,8 @@ namespace ProjectionMapper
 
                     await _videoService.RegisterMeshLayerAsync(mesh);
 
-                    // Also update all mesh overlays to include the new mesh layer
+                    // Also update all mesh overlays for the imported video
                     UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
-
-                    // If this mesh targets a fullscreen monitor, push the current composed frame to that fullscreen host
-                    try
-                    {
-                        var target = mesh.TargetMonitorIndex;
-                        if (target >= 0)
-                        {
-                            var current = PART_OutputHost?.CurrentFrame;
-                            if (current != null)
-                            {
-                                _rendererManager.SetFullScreenHostFrame(target, current);
-                            }
-                        }
-                    }
-                    catch { }
                 }
             };
         }

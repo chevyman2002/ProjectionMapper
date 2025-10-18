@@ -195,7 +195,7 @@ namespace ProjectionMapper.Services
                 try
                 {
                     // No destQuad available here (this is a simple per-layer rect submission).
-                    _rendererManager.SubmitLayerFrame(layer.Id ?? Guid.NewGuid().ToString("N"), bmpToSubmit, destRect, null, layer.Opacity);
+                    _rendererManager.SubmitLayerFrameForMonitor(layer.Id, bmpToSubmit, destRect, null, layer.Opacity, -1);
                 }
                 catch (Exception ex) { Debug.WriteLine($"VideoService: SubmitLayerFrame failed: {ex}"); }
             }
@@ -292,7 +292,7 @@ namespace ProjectionMapper.Services
                         }
                         catch (Exception exQuad) { Debug.WriteLine($"VideoService: build destQuad failed: {exQuad}"); destQuad = null; }
 
-                        _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity);
+                        _rendererManager.SubmitLayerFrameForMonitor(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity, mesh.TargetMonitorIndex);
                     }
                     catch (Exception ex) { Debug.WriteLine($"VideoService: SubmitLayerFrame for mesh failed: {ex}"); }
 
@@ -319,6 +319,10 @@ namespace ProjectionMapper.Services
             if (mesh == null) throw new ArgumentNullException(nameof(mesh));
             if (string.IsNullOrEmpty(mesh.Id)) mesh.Id = Guid.NewGuid().ToString("N");
             _meshLayers[mesh.Id] = mesh;
+
+            // Set mesh dimensions to renderer output size for proper full-screen mapping
+            mesh.Width = _rendererManager.OutputWidth;
+            mesh.Height = _rendererManager.OutputHeight;
 
             try
             {

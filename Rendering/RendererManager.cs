@@ -26,6 +26,9 @@ namespace ProjectionMapper.Rendering
         // full-screen hosts per monitor index
         private readonly Dictionary<int, FullScreenOutputWindow> _fullscreenWindows = new();
 
+        // Per-monitor renderers for separate composition
+        private readonly Dictionary<int, IRenderer> _monitorRenderers = new();
+
         public RendererManager(IRenderer renderer)
         {
             _renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
@@ -61,15 +64,33 @@ namespace ProjectionMapper.Rendering
             {
                 BitmapSource? frame = null;
 
-                // If a specific monitor index is requested and a fullscreen host exists for it, prefer that host's current frame
+                // If a specific monitor index is requested and a fullscreen host exists for that monitor, prefer that host's current frame
                 // because the mapping should use the pixel space of the target display. Otherwise fall back to the main attached host.
                 if (monitorIndex.HasValue && _fullscreenWindows.TryGetValue(monitorIndex.Value, out var win) && win != null)
                 {
                     try { frame = win.HostControl?.CurrentFrame; }
                     catch (Exception ex) { Debug.WriteLine($"MapNormalizedToRendererPoints: failed reading fullscreen host frame: {ex}"); frame = null; }
+
+                    if (frame == null)
+                    {
+                        // Use the canonical output size for the monitor renderer
+                        double w = OutputWidth > 0 ? OutputWidth : 0;
+                        double h = OutputHeight > 0 ? OutputHeight : 0;
+                        if (w > 0 && h > 0)
+                        {
+                            var pts = new Point[4];
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                var p = normalized[i];
+                                pts[i] = new Point(p.X * w, p.Y * h);
+                            }
+                            return pts;
+                        }
+                        return null;
+                    }
                 }
 
-                // Fallback to main attached host if fullscreen host not available
+                // Fallback to main attached host if fullscreen host not available or no monitor specified
                 if (frame == null)
                 {
                     if (_host == null) return null;
@@ -78,16 +99,16 @@ namespace ProjectionMapper.Rendering
                 // Prefer using the renderer's canonical output size when available so normalized coordinates
                 // map into renderer pixel space deterministically. Fall back to the host frame pixel size
                 // only if the renderer output size is not known.
-                double w = OutputWidth > 0 ? OutputWidth : (frame?.PixelWidth ?? 0);
-                double h = OutputHeight > 0 ? OutputHeight : (frame?.PixelHeight ?? 0);
-                if (w <= 0 || h <= 0) return null;
-                var pts = new Point[4];
+                double w2 = OutputWidth > 0 ? OutputWidth : (frame?.PixelWidth ?? 0);
+                double h2 = OutputHeight > 0 ? OutputHeight : (frame?.PixelHeight ?? 0);
+                if (w2 <= 0 || h2 <= 0) return null;
+                var pts2 = new Point[4];
                 for (int i = 0; i < 4; ++i)
                 {
                     var p = normalized[i];
-                    pts[i] = new Point(p.X * w, p.Y * h);
+                    pts2[i] = new Point(p.X * w2, p.Y * h2);
                 }
-                return pts;
+                return pts2;
             }
             catch (Exception ex)
             {
@@ -170,28 +191,20 @@ namespace ProjectionMapper.Rendering
                 }
             }
 
-            // Mirror the composed frame to any fullscreen windows so users see the same composed output
-            if (bmp == null)
+            // Fullscreen windows now have their own renderers, so no mirroring needed
+        }
+
+        private void OnMonitorFrameReady(int monitorIndex, BitmapSource? bmp)
+        {
+            if (_fullscreenWindows.TryGetValue(monitorIndex, out var win) && win != null)
             {
-                foreach (var win in _fullscreenWindows.Values.ToList())
+                if (bmp == null)
                 {
-                    try { InvokeOnUi(() => win?.HostControl?.Clear()); } catch { }
+                    InvokeOnUi(() => win.HostControl?.Clear());
                 }
-            }
-            else
-            {
-                foreach (var win in _fullscreenWindows.Values.ToList())
+                else
                 {
-                    try
-                    {
-                        InvokeOnUi(() =>
-                        {
-                            if (win == null || win.HostControl == null) return;
-                            if (!win.IsVisible || win.WindowState == WindowState.Minimized) return;
-                            try { win.HostControl.SetFrame(bmp); } catch { }
-                        });
-                    }
-                    catch { }
+                    InvokeOnUi(() => win.HostControl?.SetFrame(bmp));
                 }
             }
         }
@@ -396,6 +409,29 @@ namespace ProjectionMapper.Rendering
         }
 
         /// <summary>
+        /// Submit a per-layer frame to the appropriate renderer for composition based on target monitor.
+        /// destRect is in renderer output coordinates (pixels).
+        /// destQuad: optional quad in renderer coordinates (TopLeft, TopRight, BottomLeft, BottomRight).
+        /// </summary>
+        public void SubmitLayerFrameForMonitor(string layerId, BitmapSource? frame, Rect destRect, Point[]? destQuad, double opacity, int targetMonitorIndex)
+        {
+            try
+            {
+                IRenderer renderer;
+                if (targetMonitorIndex == -1 || !_monitorRenderers.TryGetValue(targetMonitorIndex, out renderer))
+                {
+                    renderer = _renderer;
+                }
+                renderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RendererManager.SubmitLayerFrameForMonitor failed: {ex}");
+                // swallow - renderer may not support layering (no-op)
+            }
+        }
+
+        /// <summary>
         /// Set a frame directly to a specific fullscreen host (used by VideoService to mirror frames to displays).
         /// </summary>
         public void SetFullScreenHostFrame(int monitorIndex, BitmapSource? frame)
@@ -443,6 +479,18 @@ namespace ProjectionMapper.Rendering
         {
             try
             {
+                // Dispose old renderer and close old window if exists
+                if (_monitorRenderers.TryGetValue(monitorIndex, out var oldRenderer))
+                {
+                    oldRenderer.Dispose();
+                    _monitorRenderers.Remove(monitorIndex);
+                }
+                if (_fullscreenWindows.TryGetValue(monitorIndex, out var oldWin))
+                {
+                    try { InvokeOnUi(() => oldWin.Close()); } catch { }
+                    _fullscreenWindows.Remove(monitorIndex);
+                }
+
                 // Show and activate on UI thread, then register the window
                 InvokeOnUi(() =>
                 {
@@ -459,6 +507,24 @@ namespace ProjectionMapper.Rendering
                         try { window.UpdateLayout(); } catch { }
 
                         _fullscreenWindows[monitorIndex] = window;
+
+                        // Create a dedicated renderer for this monitor
+                        var monitorRenderer = new SoftwareRenderer();
+                        int renderW = OutputWidth > 0 ? OutputWidth : 1920;
+                        int renderH = OutputHeight > 0 ? OutputHeight : 1080;
+                        monitorRenderer.InitializeAsync(renderW, renderH).ConfigureAwait(false).GetAwaiter().GetResult();
+                        monitorRenderer.FrameReady += (bmp) => OnMonitorFrameReady(monitorIndex, bmp);
+                        _monitorRenderers[monitorIndex] = monitorRenderer;
+
+                        // Start render loop for this monitor
+                        var monitorRenderLoop = new RenderLoop(async ct =>
+                        {
+                            await monitorRenderer.RenderFrameAsync(ct).ConfigureAwait(false);
+                        }, targetFps: 30.0);
+                        monitorRenderLoop.Start();
+
+                        // Note: We need to track render loops per monitor, but for simplicity, we'll dispose in HideFullScreenWindow
+
                         try
                         {
                             var hasHost = window.HostControl != null;
@@ -477,6 +543,13 @@ namespace ProjectionMapper.Rendering
             if (!_fullscreenWindows.TryGetValue(monitorIndex, out var win)) return;
             try { InvokeOnUi(() => win.Close()); } catch (Exception ex) { Debug.WriteLine($"HideFullScreenWindow failed: {ex}"); }
             _fullscreenWindows.Remove(monitorIndex);
+
+            // Dispose the monitor renderer and render loop
+            if (_monitorRenderers.TryGetValue(monitorIndex, out var renderer))
+            {
+                try { renderer.Dispose(); } catch { }
+                _monitorRenderers.Remove(monitorIndex);
+            }
         }
 
         public void Dispose()
@@ -506,6 +579,13 @@ namespace ProjectionMapper.Rendering
                 try { InvokeOnUi(() => win.Close()); } catch (Exception ex) { Debug.WriteLine($"Dispose closing fullscreen window failed: {ex}"); }
             }
             _fullscreenWindows.Clear();
+
+            // Dispose monitor renderers
+            foreach (var renderer in _monitorRenderers.Values)
+            {
+                try { renderer.Dispose(); } catch { }
+            }
+            _monitorRenderers.Clear();
         }
     }
 }
