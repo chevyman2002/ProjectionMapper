@@ -132,6 +132,7 @@ namespace ProjectionMapper
             {
                 try
                 {
+                    // Toggle playback: after VM toggles IsPlaying, run the desired state
                     if (_vm.IsPlaying)
                     {
                         await _videoService.ResumeAllAsync();
@@ -302,15 +303,11 @@ namespace ProjectionMapper
 
                 if (playAudio)
                 {
-                    // Start audio for host layer by re-registering with audio enabled
-                    _ = Task.Run(async () =>
+                    // Start audio for host layer without re-registering the decoder (prevents duplicate decoders)
+                    if (!string.IsNullOrEmpty(imported.HostLayer.Id))
                     {
-                        try
-                        {
-                            await _videoService.RegisterLayerAsync(imported.HostLayer, playAudio: true);
-                        }
-                        catch { }
-                    });
+                        _videoService.StartAudioForLayer(imported.HostLayer.Id);
+                    }
                 }
                 else
                 {
