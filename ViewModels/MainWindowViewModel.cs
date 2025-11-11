@@ -30,8 +30,9 @@ namespace ProjectionMapper.ViewModels
             ImportCommand = new RelayCommand(ExecuteImportCommand);
             PreviewCommand = new RelayCommand(ExecutePreviewCommand);
 
-            PlayPauseCommand = new RelayCommand(ExecutePlayPauseCommand);
-            RestartCommand = new RelayCommand(ExecuteRestartCommand);
+            // Use AsyncRelayCommand for playback operations since they're async
+            PlayPauseCommand = new AsyncRelayCommand(ExecutePlayPauseCommandAsync);
+            RestartCommand = new AsyncRelayCommand(ExecuteRestartCommandAsync);
 
             CreateMeshCommand = new RelayCommand(ExecuteCreateMeshCommand, _ => SelectedImportedVideo != null);
             DeleteMeshCommand = new RelayCommand(ExecuteDeleteMeshCommand, _ => SelectedMeshLayer != null);
@@ -98,7 +99,7 @@ namespace ProjectionMapper.ViewModels
         public ICommand ImportCommand { get; }
         public ICommand PreviewCommand { get; }
 
-        // Playback
+        // Playback - now using AsyncRelayCommand
         public ICommand PlayPauseCommand { get; }
         public ICommand RestartCommand { get; }
 
@@ -114,8 +115,8 @@ namespace ProjectionMapper.ViewModels
         // Events surfaced to the host window so it can perform file dialogs / services
         public event Action? ImportRequested;
         public event Action? PreviewRequested;
-        public event Action? PlayPauseRequested;
-        public event Action? RestartRequested;
+        public event Func<System.Threading.Tasks.Task>? PlayPauseRequestedAsync;
+        public event Func<System.Threading.Tasks.Task>? RestartRequestedAsync;
 
         // Event requested when an imported video should be deleted (UI may show confirmation)
         public event Action<ImportedVideoViewModel?>? DeleteImportedRequested;
@@ -171,19 +172,29 @@ namespace ProjectionMapper.ViewModels
         }
 
         private bool _isPlaying = true;
-        private void ExecutePlayPauseCommand(object? _)
+        private async System.Threading.Tasks.Task ExecutePlayPauseCommandAsync()
         {
             _isPlaying = !_isPlaying;
-            PlayPauseRequested?.Invoke();
+
+            // Notify host to handle the async operation
+            if (PlayPauseRequestedAsync != null)
+            {
+                await PlayPauseRequestedAsync.Invoke();
+            }
+
             // Raise UI updates if you bind icon state
             RaisePropertyChanged(nameof(IsPlaying));
         }
 
         public bool IsPlaying => _isPlaying;
 
-        private void ExecuteRestartCommand(object? _)
+        private async System.Threading.Tasks.Task ExecuteRestartCommandAsync()
         {
-            RestartRequested?.Invoke();
+            // Notify host to handle the async operation
+            if (RestartRequestedAsync != null)
+            {
+                await RestartRequestedAsync.Invoke();
+            }
         }
 
         private LayerModel? _copiedMesh;

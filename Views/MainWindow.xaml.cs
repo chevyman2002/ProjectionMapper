@@ -128,30 +128,42 @@ namespace ProjectionMapper
             _vm.DeleteImportedRequested += async imported => await HandleDeleteImportedAsync(imported);
 
             // Wire playback controls to VideoService
-            _vm.PlayPauseRequested += async () =>
-            {
+            _vm.PlayPauseRequestedAsync += async () =>
+                  {
                 try
-                {
-                    // Toggle playback: after VM toggles IsPlaying, run the desired state
+            {
+                 // Toggle playback: after VM toggles IsPlaying, run the desired state
                     if (_vm.IsPlaying)
-                    {
-                        await _videoService.ResumeAllAsync();
-                    }
-                    else
-                    {
-                        await _videoService.PauseAllAsync();
-                    }
+       {
+       Debug.WriteLine("VideoService: Resuming all layers");
+            await _videoService.ResumeAllAsync();
+ Debug.WriteLine("VideoService: Resume completed");
+      }
+ else
+             {
+       Debug.WriteLine("VideoService: Pausing all layers");
+     await _videoService.PauseAllAsync();
+              Debug.WriteLine("VideoService: Pause completed");
+     }
+     }
+          catch (Exception ex)
+{
+  Debug.WriteLine($"VideoService: PlayPause operation failed: {ex}");
                 }
-                catch { }
-            };
+          };
 
-            _vm.RestartRequested += async () =>
-            {
-                try
-                {
-                    await _videoService.RestartAllAsync();
-                }
-                catch { }
+     _vm.RestartRequestedAsync += async () =>
+     {
+    try
+  {
+  Debug.WriteLine("VideoService: Restarting all layers");
+   await _videoService.RestartAllAsync();
+  Debug.WriteLine("VideoService: Restart completed");
+ }
+        catch (Exception ex)
+             {
+          Debug.WriteLine($"VideoService: Restart operation failed: {ex}");
+   }
             };
 
             // populate monitor list for UI using Win32 EnumDisplayMonitors and store monitor info
@@ -276,79 +288,40 @@ namespace ProjectionMapper
                     PART_PlayAudioCheckbox.Unchecked += PlayAudioCheckbox_CheckedChanged;
                 }
 
-                // Wire volume slider
-                if (PART_VolumeSlider != null)
-                {
-                    PART_VolumeSlider.ValueChanged += VolumeSlider_ValueChanged;
-                }
-
-                // Wire mute checkbox
-                if (PART_MuteCheckbox != null)
-                {
-                    PART_MuteCheckbox.Checked += MuteCheckbox_CheckedChanged;
-                    PART_MuteCheckbox.Unchecked += MuteCheckbox_CheckedChanged;
-                }
+                // Volume slider removed - volume is now fixed at 100%
+      // Mute checkbox removed - audio is off by default until "Play Audio" is checked
             }
-            catch { }
+     catch { }
         }
 
         private void PlayAudioCheckbox_CheckedChanged(object sender, RoutedEventArgs e)
         {
-            try
-            {
-                var imported = _vm.SelectedImportedVideo;
-                if (imported?.HostLayer == null) return;
+try
+{
+          var imported = _vm.SelectedImportedVideo;
+  if (imported?.HostLayer == null) return;
 
-                var playAudio = imported.PlayAudio; // This reads from the bound property
+        var playAudio = imported.PlayAudio; // This reads from the bound property
 
-                if (playAudio)
-                {
-                    // Start audio for host layer without re-registering the decoder (prevents duplicate decoders)
-                    if (!string.IsNullOrEmpty(imported.HostLayer.Id))
-                    {
-                        _videoService.StartAudioForLayer(imported.HostLayer.Id);
-                    }
-                }
-                else
-                {
-                    // Stop audio for host layer
-                    if (!string.IsNullOrEmpty(imported.HostLayer.Id))
-                    {
-                        _videoService.StopAudioForLayer(imported.HostLayer.Id);
-                    }
-                }
-            }
-            catch { }
+       if (playAudio)
+     {
+        // Start audio for host layer without re-registering the decoder (prevents duplicate decoders)
+         if (!string.IsNullOrEmpty(imported.HostLayer.Id))
+       {
+      _videoService.StartAudioForLayer(imported.HostLayer.Id);
+         }
+     }
+    else
+      {
+       // Stop audio for host layer
+      if (!string.IsNullOrEmpty(imported.HostLayer.Id))
+     {
+     _videoService.StopAudioForLayer(imported.HostLayer.Id);
+           }
         }
-
-        private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
-        {
-            try
-            {
-                var imported = _vm.SelectedImportedVideo;
-                if (imported?.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
-                {
-                    // The binding will update the model property, but also update the audio service
-                    _videoService.SetLayerVolume(imported.HostLayer.Id, (float)e.NewValue);
-                }
-            }
-            catch { }
-        }
-
-        private void MuteCheckbox_CheckedChanged(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var imported = _vm.SelectedImportedVideo;
-                if (imported?.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
-                {
-                    // The binding will update the model property, but also update the audio service
-                    var muted = imported.Muted; // This reads from the bound property
-                    _videoService.SetLayerMute(imported.HostLayer.Id, muted);
-                }
-            }
-            catch { }
-        }
+  }
+      catch { }
+  }
 
         private void PART_MeshMonitorCombo_SelectionChanged(object? sender, SelectionChangedEventArgs e)
         {
@@ -464,6 +437,7 @@ namespace ProjectionMapper
                 // Create or show fullscreen window on the selected monitor
                 if (item.Index >= 0 && item.Index < _monitors.Count)
                 {
+                    _rendererManager.HideFullScreenWindow(item.Index);
                     CreateOrShowFullScreenForMonitor(item.Index);
                 }
                 else

@@ -174,14 +174,6 @@
                             <TextBlock Text="Play Audio:" VerticalAlignment="Center" Margin="0,0,6,0" />
                             <CheckBox x:Name="PART_PlayAudioCheckbox" IsChecked="{Binding PlayAudio, Mode=TwoWay}" VerticalAlignment="Center" />
                         </StackPanel>
-                        <StackPanel Margin="0,6,0,0">
-                            <TextBlock Text="Volume:" FontWeight="Bold" />
-                            <Slider x:Name="PART_VolumeSlider" Minimum="0.0" Maximum="1.0" Value="{Binding Volume, Mode=TwoWay}" Width="150" HorizontalAlignment="Left" />
-                        </StackPanel>
-                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                            <TextBlock Text="Mute:" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <CheckBox x:Name="PART_MuteCheckbox" IsChecked="{Binding Muted, Mode=TwoWay}" VerticalAlignment="Center" />
-                        </StackPanel>
                     </StackPanel>
 
                 </StackPanel>
