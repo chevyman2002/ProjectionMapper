@@ -37,25 +37,11 @@ namespace ProjectionMapper.ViewModels
 
         public double Volume
         {
-            get => HostLayer?.Volume ?? 1.0;
+            get => 1.0; // Volume is now fixed at 100%
             set
             {
-                if (HostLayer == null) return;
-                if (Math.Abs(HostLayer.Volume - value) < 1e-6) return;
-                HostLayer.Volume = value;
-                RaisePropertyChanged();
-            }
-        }
-
-        public bool Muted
-        {
-            get => HostLayer?.Muted ?? false;
-            set
-            {
-                if (HostLayer == null) return;
-                if (HostLayer.Muted == value) return;
-                HostLayer.Muted = value;
-                RaisePropertyChanged();
+                // Volume setting is ignored - volume is fixed at 100%
+                // The setter is kept for compatibility with existing bindings
             }
         }
 
@@ -64,7 +50,6 @@ namespace ProjectionMapper.ViewModels
         {
             RaisePropertyChanged(nameof(PlayAudio));
             RaisePropertyChanged(nameof(Volume));
-            RaisePropertyChanged(nameof(Muted));
         }
     }
 }
