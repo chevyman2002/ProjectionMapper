@@ -37,4 +37,8 @@
     <Folder Include="ToDo\" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include=".github\workflows\ci.yml" />
+  </ItemGroup>
+
 </Project>
