@@ -512,16 +512,33 @@ namespace ProjectionMapper.Rendering
                         var monitorRenderer = new SoftwareRenderer();
                         int renderW = OutputWidth > 0 ? OutputWidth : 1920;
                         int renderH = OutputHeight > 0 ? OutputHeight : 1080;
-                        monitorRenderer.InitializeAsync(renderW, renderH).ConfigureAwait(false).GetAwaiter().GetResult();
-                        monitorRenderer.FrameReady += (bmp) => OnMonitorFrameReady(monitorIndex, bmp);
+
+                        // Initialize and start the monitor renderer asynchronously to avoid blocking the UI thread
                         _monitorRenderers[monitorIndex] = monitorRenderer;
 
-                        // Start render loop for this monitor
-                        var monitorRenderLoop = new RenderLoop(async ct =>
+                        // Initialize and start render loop on background task
+                        Task.Run(async () =>
                         {
-                            await monitorRenderer.RenderFrameAsync(ct).ConfigureAwait(false);
-                        }, targetFps: 30.0);
-                        monitorRenderLoop.Start();
+                            try
+                            {
+                                await monitorRenderer.InitializeAsync(renderW, renderH).ConfigureAwait(false);
+                                monitorRenderer.FrameReady += (bmp) => OnMonitorFrameReady(monitorIndex, bmp);
+
+                                // Start render loop for this monitor on a dedicated STA thread
+                                var monitorRenderLoop = new RenderLoop(async ct =>
+                                {
+                                    await monitorRenderer.RenderFrameAsync(ct).ConfigureAwait(false);
+                                }, targetFps: 30.0);
+
+                                monitorRenderLoop.Start();
+
+                                // Note: we do not keep a strong reference to the monitorRenderLoop here; it will run until Dispose/HideFullScreenWindow
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"ShowFullScreenWindow: failed to initialize monitor renderer for monitor {monitorIndex}: {ex}");
+                            }
+                        });
 
                         // Note: We need to track render loops per monitor, but for simplicity, we'll dispose in HideFullScreenWindow
 
@@ -563,7 +580,14 @@ namespace ProjectionMapper.Rendering
                 // Stop the render loop synchronously to ensure no further RenderFrameAsync calls
                 // are made against the renderer while we are disposing it. Use GetAwaiter().GetResult()
                 // to synchronously wait for StopAsync to complete on dispose.
-                try { StopAsync().GetAwaiter().GetResult(); } catch (Exception exStop) { Debug.WriteLine($"RendererManager.Dispose: StopAsync failed: {exStop}"); }
+                try 
+                { 
+                    if (_renderLoop != null)
+                    {
+                        _renderLoop.StopAsync().GetAwaiter().GetResult(); 
+                    }
+                } 
+                catch (Exception exStop) { Debug.WriteLine($"RendererManager.Dispose: StopAsync failed: {exStop}"); }
 
                 // Dispose the render loop and renderer after stopping the loop.
                 try { _renderLoop?.Dispose(); } catch (Exception exLoop) { Debug.WriteLine($"RendererManager.Dispose: renderLoop.Dispose failed: {exLoop}"); }

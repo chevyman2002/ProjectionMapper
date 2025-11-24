@@ -54,7 +54,72 @@ namespace ProjectionMapper.Rendering
         public void SubmitLayerFrame(string layerId, BitmapSource? frame, Rect destRect, Point[]? destQuad, double opacity)
         {
             if (string.IsNullOrEmpty(layerId)) return;
-            _layers[layerId] = (frame, destRect, destQuad, opacity);
+
+            // CRITICAL: Ensure BitmapSource is frozen to allow cross-thread access
+            BitmapSource? safeFrame = null;
+            if (frame != null)
+            {
+                try
+                {
+                    if (frame.IsFrozen)
+                    {
+                        safeFrame = frame;
+                    }
+                    else
+                    {
+                        // Cloning/Freezing must be done on the thread that owns the source object.
+                        // If an application dispatcher is available, perform the clone on the UI thread to avoid cross-thread access.
+                        var app = System.Windows.Application.Current;
+                        if (app != null && app.Dispatcher != null && !app.Dispatcher.HasShutdownStarted && !app.Dispatcher.HasShutdownFinished)
+                        {
+                            try
+                            {
+                                app.Dispatcher.Invoke(() =>
+                                {
+                                    try
+                                    {
+                                        var clone = frame.Clone();
+                                        clone.Freeze();
+                                        safeFrame = clone;
+                                    }
+                                    catch (Exception exInner)
+                                    {
+                                        Debug.WriteLine($"SoftwareRenderer.SubmitLayerFrame: UI-thread clone failed: {exInner}");
+                                        safeFrame = null;
+                                    }
+                                });
+                            }
+                            catch (Exception exDisp)
+                            {
+                                Debug.WriteLine($"SoftwareRenderer.SubmitLayerFrame: Dispatcher.Invoke failed: {exDisp}");
+                                safeFrame = null;
+                            }
+                        }
+                        else
+                        {
+                            // No dispatcher available; try best-effort clone on current thread (may fail)
+                            try
+                            {
+                                var clone = frame.Clone();
+                                clone.Freeze();
+                                safeFrame = clone;
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"SoftwareRenderer.SubmitLayerFrame: Failed to freeze frame on current thread: {ex}");
+                                safeFrame = null; // Skip this frame if we can't make it thread-safe
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"SoftwareRenderer.SubmitLayerFrame: Failed while preparing frame: {ex}");
+                    safeFrame = null; // Skip this frame on failure
+                }
+            }
+
+            _layers[layerId] = (safeFrame, destRect, destQuad, opacity);
         }
 
         public Task RenderFrameAsync(CancellationToken token = default)
@@ -70,48 +135,75 @@ namespace ProjectionMapper.Rendering
                     dc.DrawRectangle(Brushes.Black, null, new Rect(0, 0, _width, _height));
 
                     // Compose layers by key order for determinism
-                    foreach (var kv in _layers.OrderBy(k => k.Key))
+                    // Take a snapshot of the layers to avoid concurrent modification issues
+                    var layerSnapshot = _layers.ToArray();
+                    
+                    foreach (var kv in layerSnapshot.OrderBy(k => k.Key))
                     {
                         var entry = kv.Value;
                         if (entry.Frame == null) continue;
                         var frame = entry.Frame;
 
-                        if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
+                        // CRITICAL: Verify frame is frozen before accessing from render thread
+                        if (!frame.IsFrozen)
                         {
-                            try
+                            Debug.WriteLine($"SoftwareRenderer: Skipping non-frozen frame for layer {kv.Key}");
+                            continue;
+                        }
+
+                        try
+                        {
+                            if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
                             {
-                                // Warp into bounding box and draw
-                                var quad = entry.DestQuad;
-                                // compute integer bounding box
-                                int minX = (int)Math.Floor(Math.Max(0.0, Math.Min(Math.Min(quad[0].X, quad[1].X), Math.Min(quad[2].X, quad[3].X))));
-                                int minY = (int)Math.Floor(Math.Max(0.0, Math.Min(Math.Min(quad[0].Y, quad[1].Y), Math.Min(quad[2].Y, quad[3].Y))));
-                                int maxX = (int)Math.Ceiling(Math.Min(_width, Math.Max(Math.Max(quad[0].X, quad[1].X), Math.Max(quad[2].X, quad[3].X))));
-                                int maxY = (int)Math.Ceiling(Math.Min(_height, Math.Max(Math.Max(quad[0].Y, quad[1].Y), Math.Max(quad[2].Y, quad[3].Y))));
-
-                                int w = Math.Max(1, maxX - minX);
-                                int h = Math.Max(1, maxY - minY);
-
-                                var warped = WarpBitmapToQuad(frame, quad, minX, minY, w, h);
-                                if (warped != null)
+                                try
                                 {
-                                    var dest = new Rect(minX, minY, w, h);
-                                    // apply opacity
+                                    // Warp into bounding box and draw
+                                    var quad = entry.DestQuad;
+                                    // compute integer bounding box
+                                    int minX = (int)Math.Floor(Math.Max(0.0, Math.Min(Math.Min(quad[0].X, quad[1].X), Math.Min(quad[2].X, quad[3].X))));
+                                    int minY = (int)Math.Floor(Math.Max(0.0, Math.Min(Math.Min(quad[0].Y, quad[1].Y), Math.Min(quad[2].Y, quad[3].Y))));
+                                    int maxX = (int)Math.Ceiling(Math.Min(_width, Math.Max(Math.Max(quad[0].X, quad[1].X), Math.Max(quad[2].X, quad[3].X))));
+                                    int maxY = (int)Math.Ceiling(Math.Min(_height, Math.Max(Math.Max(quad[0].Y, quad[1].Y), Math.Max(quad[2].Y, quad[3].Y))));
+
+                                    int w = Math.Max(1, maxX - minX);
+                                    int h = Math.Max(1, maxY - minY);
+
+                                    var warped = WarpBitmapToQuad(frame, quad, minX, minY, w, h);
+                                    if (warped != null)
+                                    {
+                                        var dest = new Rect(minX, minY, w, h);
+                                        // apply opacity
+                                        if (entry.Opacity < 0.999)
+                                        {
+                                            dc.PushOpacity(entry.Opacity);
+                                            dc.DrawImage(warped, dest);
+                                            dc.Pop();
+                                        }
+                                        else
+                                        {
+                                            dc.DrawImage(warped, dest);
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine($"SoftwareRenderer: warp draw failed for layer {kv.Key}: {ex}");
+                                    // fallback to rect drawing below
                                     if (entry.Opacity < 0.999)
                                     {
                                         dc.PushOpacity(entry.Opacity);
-                                        dc.DrawImage(warped, dest);
+                                        dc.DrawImage(frame, entry.DestRect);
                                         dc.Pop();
                                     }
                                     else
                                     {
-                                        dc.DrawImage(warped, dest);
+                                        dc.DrawImage(frame, entry.DestRect);
                                     }
                                 }
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                Debug.WriteLine($"SoftwareRenderer: warp draw failed for layer {kv.Key}: {ex}");
-                                // fallback to rect drawing below
+                                // default path: draw as rectangle
                                 if (entry.Opacity < 0.999)
                                 {
                                     dc.PushOpacity(entry.Opacity);
@@ -124,19 +216,16 @@ namespace ProjectionMapper.Rendering
                                 }
                             }
                         }
-                        else
+                        catch (InvalidOperationException ex) when (ex.Message.Contains("different thread"))
                         {
-                            // default path: draw as rectangle
-                            if (entry.Opacity < 0.999)
-                            {
-                                dc.PushOpacity(entry.Opacity);
-                                dc.DrawImage(frame, entry.DestRect);
-                                dc.Pop();
-                            }
-                            else
-                            {
-                                dc.DrawImage(frame, entry.DestRect);
-                            }
+                            Debug.WriteLine($"SoftwareRenderer: Cross-thread access detected for layer {kv.Key}, skipping frame");
+                            // Skip this frame to avoid crash
+                            continue;
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"SoftwareRenderer: Unexpected error rendering layer {kv.Key}: {ex}");
+                            continue;
                         }
                     }
                 }
@@ -145,7 +234,34 @@ namespace ProjectionMapper.Rendering
                 var rtb = new RenderTargetBitmap(_width, _height, 96, 96, PixelFormats.Pbgra32);
                 rtb.Render(dv);
                 try { rtb.Freeze(); } catch { }
-                FrameReady?.Invoke(rtb);
+                
+                // CRITICAL: Marshal FrameReady event to UI thread to prevent cross-thread access
+                try
+                {
+                    var app = Application.Current;
+                    if (app?.Dispatcher != null && !app.Dispatcher.HasShutdownStarted && !app.Dispatcher.HasShutdownFinished)
+                    {
+                        app.Dispatcher.BeginInvoke(() =>
+                        {
+                            try
+                            {
+                                FrameReady?.Invoke(rtb);
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"SoftwareRenderer.FrameReady event failed: {ex}");
+                            }
+                        });
+                    }
+                    else
+                    {
+                        FrameReady?.Invoke(rtb);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"SoftwareRenderer: Failed to invoke FrameReady: {ex}");
+                }
             }
             catch (Exception ex)
             {

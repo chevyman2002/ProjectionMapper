@@ -11,24 +11,37 @@
         <conv:NullToVisibilityConverter x:Key="NullToVisibilityConverter" />
     </Window.Resources>
 
+    <Window.InputBindings>
+        <KeyBinding Key="N" Modifiers="Control" Command="{Binding NewProjectCommand}" />
+        <KeyBinding Key="Z" Modifiers="Control" Command="{Binding UndoCommand}" />
+        <KeyBinding Key="Y" Modifiers="Control" Command="{Binding RedoCommand}" />
+        <KeyBinding Key="O" Modifiers="Control" Command="{Binding LoadProjectCommand}" />
+        <KeyBinding Key="S" Modifiers="Control" Command="{Binding SaveProjectCommand}" />
+        <KeyBinding Key="S" Modifiers="Control+Shift" Command="{Binding SaveAsProjectCommand}" />
+        <KeyBinding Key="F5" Command="{Binding PreviewCommand}" />
+    </Window.InputBindings>
+
     <DockPanel>
         <!-- Menu -->
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="_File">
-                <MenuItem Header="_Open..." />
-                <MenuItem Header="_Save" />
+                <MenuItem Header="_New" Command="{Binding NewProjectCommand}" InputGestureText="Ctrl+N" />
                 <Separator />
-                <MenuItem Header="E_xit" />
+                <MenuItem Header="_Open..." Command="{Binding LoadProjectCommand}" InputGestureText="Ctrl+O" />
+                <MenuItem Header="_Save" Command="{Binding SaveProjectCommand}" InputGestureText="Ctrl+S" />
+                <MenuItem Header="Save _As..." Command="{Binding SaveAsProjectCommand}" InputGestureText="Ctrl+Shift+S" />
+                <Separator />
+                <MenuItem Header="E_xit" Click="ExitMenuItem_Click" />
             </MenuItem>
             <MenuItem Header="_Edit">
-                <MenuItem Header="_Undo" />
-                <MenuItem Header="_Redo" />
+                <MenuItem Header="_Undo" Command="{Binding UndoCommand}" InputGestureText="Ctrl+Z" />
+                <MenuItem Header="_Redo" Command="{Binding RedoCommand}" InputGestureText="Ctrl+Y" />
             </MenuItem>
             <MenuItem Header="_View">
-                <MenuItem Header="_Preview" />
+                <MenuItem Header="_Preview" Command="{Binding PreviewCommand}" InputGestureText="F5" />
             </MenuItem>
             <MenuItem Header="_Help">
-                <MenuItem Header="_About" />
+                <MenuItem Header="_About" Click="AboutMenuItem_Click" />
             </MenuItem>
         </Menu>
 
@@ -205,6 +218,7 @@
                                                          RendererManager="{DynamicResource RendererManager}"
                                                          InputHost="{Binding ElementName=PART_InputHost}"
                                                          ParentScrollViewer="{Binding ElementName=PART_InputScroll}"
+                                                         UndoRedoService="{Binding UndoRedoService}"
                                                          Zoom="{Binding InputZoom, Mode=TwoWay}" />
                             </Grid>
                         </ScrollViewer>
@@ -228,7 +242,8 @@
                                                                AllMeshLayers="{Binding SelectedImportedVideo.MeshLayers, Mode=OneWay}"
                                                                VideoService="{DynamicResource VideoService}" 
                                                                HostRenderHost="{Binding ElementName=PART_OutputHost}" 
-                                                               RendererManager="{DynamicResource RendererManager}" />
+                                                               RendererManager="{DynamicResource RendererManager}"
+                                                               UndoRedoService="{Binding UndoRedoService}" />
                             </Grid>
                         </ScrollViewer>
                     </DockPanel>

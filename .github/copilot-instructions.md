@@ -25,3 +25,8 @@ Your responses should be broken down in pieces to avoid truncation. If your resp
 All code that runs on the main thread must avoid using timers, which can cause the UI to be sluggish or unresponsive.
 To avoid hitting a token limitation, write up a document (\*.md format) containing a broken down list of what you're planning to do. Reference that file throughout your response, so that you don't have to keep it all loaded in memory.
 Functions must contain try-catch block with proper error handling in place. Catch blocks cannot be empty and must have something in them, either for logging output or otherwise.
+
+DO NOT disable or circumvent any other features to try and make this work. All desired features must be fully operational at all times.
+
+DO NOT simulate or otherwise fake/falsify data or operations when trying to resolve a problem. This is not acceptable.
+

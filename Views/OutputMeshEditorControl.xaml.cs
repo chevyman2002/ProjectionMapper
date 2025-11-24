@@ -36,11 +36,25 @@ namespace ProjectionMapper.Views
 
         private bool _suppressVmRebind = false;
 
+        // Track output mesh point values at the start of a drag operation for undo/redo
+        private System.Collections.Generic.Dictionary<int, Vector2> _outputMeshPointsBeforeDrag = new();
+        private bool _isDragging = false;
+
         public OutputMeshEditorControl()
         {
             InitializeComponent();
 
             // corner handles -> move corners independently
+            PART_Handle_TL.DragStarted += OutputHandle_DragStarted;
+            PART_Handle_TR.DragStarted += OutputHandle_DragStarted;
+            PART_Handle_BL.DragStarted += OutputHandle_DragStarted;
+            PART_Handle_BR.DragStarted += OutputHandle_DragStarted;
+
+            PART_Handle_TL.DragCompleted += OutputHandle_DragCompleted;
+            PART_Handle_TR.DragCompleted += OutputHandle_DragCompleted;
+            PART_Handle_BL.DragCompleted += OutputHandle_DragCompleted;
+            PART_Handle_BR.DragCompleted += OutputHandle_DragCompleted;
+
             PART_Handle_TL.DragDelta += (s, e) => MoveCorner(0, e.HorizontalChange, e.VerticalChange);
             PART_Handle_TR.DragDelta += (s, e) => MoveCorner(1, e.HorizontalChange, e.VerticalChange);
             PART_Handle_BL.DragDelta += (s, e) => MoveCorner(2, e.HorizontalChange, e.VerticalChange);
@@ -56,6 +70,70 @@ namespace ProjectionMapper.Views
             if (_videoService != null)
             {
                 try { _videoService.FrameDecoded -= VideoService_FrameDecoded; } catch { }
+            }
+        }
+
+        private void OutputHandle_DragStarted(object sender, DragStartedEventArgs e)
+        {
+            try
+            {
+                _isDragging = true;
+                _outputMeshPointsBeforeDrag.Clear();
+                
+                var vm = _vm;
+                if (vm == null) return;
+
+                // Store current output mesh point values before drag
+                var pts = vm.OutputMeshPoints;
+                if (pts != null && pts.Length >= 4)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        _outputMeshPointsBeforeDrag[i] = pts[i];
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"OutputHandle_DragStarted failed: {ex}");
+            }
+        }
+
+        private void OutputHandle_DragCompleted(object sender, DragCompletedEventArgs e)
+        {
+            try
+            {
+                _isDragging = false;
+
+                var vm = _vm;
+                if (vm == null || UndoRedoService == null) return;
+
+                // Record undo action for each changed output mesh point
+                var pts = vm.OutputMeshPoints;
+                if (pts != null && pts.Length >= 4)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (_outputMeshPointsBeforeDrag.ContainsKey(i))
+                        {
+                            var oldValue = _outputMeshPointsBeforeDrag[i];
+                            var newValue = pts[i];
+
+                            // Only record if the value actually changed
+                            if (Math.Abs(oldValue.X - newValue.X) > 0.001f || Math.Abs(oldValue.Y - newValue.Y) > 0.001f)
+                            {
+                                var action = new MeshPointChangeAction(vm, i, oldValue, newValue, isOutputMesh: true);
+                                UndoRedoService.RecordAction(action);
+                            }
+                        }
+                    }
+                }
+
+                _outputMeshPointsBeforeDrag.Clear();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"OutputHandle_DragCompleted failed: {ex}");
             }
         }
 
@@ -192,6 +270,15 @@ namespace ProjectionMapper.Views
         {
             get => (System.Collections.ObjectModel.ObservableCollection<LayerViewModel>?)GetValue(AllMeshLayersProperty);
             set => SetValue(AllMeshLayersProperty, value);
+        }
+
+        public static readonly DependencyProperty UndoRedoServiceProperty = DependencyProperty.Register(
+            nameof(UndoRedoService), typeof(UndoRedoService), typeof(OutputMeshEditorControl), new PropertyMetadata(null));
+
+        public UndoRedoService? UndoRedoService
+        {
+            get => (UndoRedoService?)GetValue(UndoRedoServiceProperty);
+            set => SetValue(UndoRedoServiceProperty, value);
         }
 
         private static void OnAllMeshLayersChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)

@@ -9,12 +9,18 @@ namespace ProjectionMapper.Rendering
     /// RenderLoop drives periodic render invocations on a dedicated background thread.
     /// It provides a simple, testable abstraction: consumers can register an async callback to produce a frame.
     /// The loop supports fixed target FPS or unlimited (as-fast-as-possible).
+    ///
+    /// IMPORTANT: WPF rendering classes (DrawingVisual, RenderTargetBitmap, etc.) require an STA thread
+    /// with a Dispatcher. To allow renderers that use WPF APIs to run off the main UI thread safely,
+    /// this loop runs on a dedicated STA thread.
     /// </summary>
     public sealed class RenderLoop : IDisposable
     {
         private readonly Func<CancellationToken, Task> _renderCallback;
         private readonly CancellationTokenSource _cts = new();
         private Task? _loopTask;
+        private Thread? _loopThread;
+        private TaskCompletionSource<object?>? _tcs;
         private readonly double? _targetFps;
 
         /// <summary>
@@ -29,13 +35,14 @@ namespace ProjectionMapper.Rendering
         }
 
         /// <summary>
-        /// Start the background render loop.
+        /// Start the background render loop on a dedicated STA thread.
         /// </summary>
         public void Start()
         {
-            if (_loopTask != null) throw new InvalidOperationException("Render loop already started.");
+            if (_loopThread != null) throw new InvalidOperationException("Render loop already started.");
+            _tcs = new TaskCompletionSource<object?>();
 
-            _loopTask = Task.Run(async () =>
+            _loopThread = new Thread(() =>
             {
                 try
                 {
@@ -47,7 +54,8 @@ namespace ProjectionMapper.Rendering
                         sw.Restart();
                         try
                         {
-                            await _renderCallback(_cts.Token).ConfigureAwait(false);
+                            // Execute the async callback synchronously on this STA thread
+                            _renderCallback(_cts.Token).GetAwaiter().GetResult();
                         }
                         catch (OperationCanceledException) { break; }
                         catch (Exception)
@@ -63,16 +71,29 @@ namespace ProjectionMapper.Rendering
                             {
                                 try
                                 {
-                                    await Task.Delay(TimeSpan.FromMilliseconds(delay), _cts.Token).ConfigureAwait(false);
+                                    Thread.Sleep((int)delay);
                                 }
-                                catch (OperationCanceledException) { break; }
+                                catch (ThreadInterruptedException) { break; }
                             }
                         }
                     }
                 }
+                catch (ThreadAbortException) { }
                 catch (ObjectDisposedException) { }
                 catch (Exception) { }
-            }, _cts.Token);
+                finally
+                {
+                    try { _tcs?.TrySetResult(null); } catch { }
+                }
+            })
+            {
+                IsBackground = true
+            };
+
+            // WPF and many imaging APIs require STA
+            try { _loopThread.SetApartmentState(ApartmentState.STA); } catch { }
+            _loopThread.Start();
+            _loopTask = _tcs!.Task; // non-null after creation
         }
 
         /// <summary>
@@ -80,22 +101,39 @@ namespace ProjectionMapper.Rendering
         /// </summary>
         public async Task StopAsync()
         {
-            _cts.Cancel();
-            if (_loopTask != null)
+            if (_loopThread == null) return;
+
+            try
             {
-                try
+                _cts.Cancel();
+
+                // Wait for the thread to finish via the TaskCompletionSource
+                if (_loopTask != null)
                 {
                     await _loopTask.ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) { }
+
+                // Explicitly join the thread to be certain it has exited
+                if (_loopThread.IsAlive)
+                {
+                    _loopThread.Join();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RenderLoop.StopAsync failed: {ex}");
+            }
+            finally
+            {
                 _loopTask = null;
+                _loopThread = null;
             }
         }
 
         public void Dispose()
         {
             _cts.Cancel();
-            _cts.Dispose();
+            try { _cts.Dispose(); } catch { }
         }
     }
 }

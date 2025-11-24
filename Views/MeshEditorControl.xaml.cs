@@ -58,6 +58,10 @@ namespace ProjectionMapper.Views
         private readonly List<System.Windows.Shapes.Polygon> _allMeshPolygons = new();
         private readonly List<(Thumb TL, Thumb TR, Thumb BL, Thumb BR, LayerViewModel Layer)> _allMeshHandles = new();
 
+        // Track mesh point values at the start of a drag operation for undo/redo
+        private Dictionary<int, Vector2> _meshPointsBeforeDrag = new();
+        private bool _isDragging = false;
+
         public MeshEditorControl()
         {
             InitializeComponent();
@@ -69,6 +73,16 @@ namespace ProjectionMapper.Views
             // enable touch manipulation for pinch-to-zoom
             PART_Canvas.IsManipulationEnabled = true;
             PART_Canvas.ManipulationDelta += PART_Canvas_ManipulationDelta;
+
+            PART_InputHandle_TL.DragStarted += InputHandle_DragStarted;
+            PART_InputHandle_TR.DragStarted += InputHandle_DragStarted;
+            PART_InputHandle_BL.DragStarted += InputHandle_DragStarted;
+            PART_InputHandle_BR.DragStarted += InputHandle_DragStarted;
+
+            PART_InputHandle_TL.DragCompleted += InputHandle_DragCompleted;
+            PART_InputHandle_TR.DragCompleted += InputHandle_DragCompleted;
+            PART_InputHandle_BL.DragCompleted += InputHandle_DragCompleted;
+            PART_InputHandle_BR.DragCompleted += InputHandle_DragCompleted;
 
             PART_InputHandle_TL.DragDelta += InputHandle_TL_DragDelta;
             PART_InputHandle_TR.DragDelta += InputHandle_TR_DragDelta;
@@ -169,6 +183,15 @@ namespace ProjectionMapper.Views
         {
             get => (ScrollViewer?)GetValue(ParentScrollViewerProperty);
             set => SetValue(ParentScrollViewerProperty, value);
+        }
+
+        public static readonly DependencyProperty UndoRedoServiceProperty = DependencyProperty.Register(
+            nameof(UndoRedoService), typeof(UndoRedoService), typeof(MeshEditorControl), new PropertyMetadata(null));
+
+        public UndoRedoService? UndoRedoService
+        {
+            get => (UndoRedoService?)GetValue(UndoRedoServiceProperty);
+            set => SetValue(UndoRedoServiceProperty, value);
         }
         #endregion
 
@@ -851,6 +874,70 @@ namespace ProjectionMapper.Views
                 ApplyLayout();
             }
             finally { _suppressVmRebind = false; }
+        }
+
+        private void InputHandle_DragStarted(object sender, DragStartedEventArgs e)
+        {
+            try
+            {
+                _isDragging = true;
+                _meshPointsBeforeDrag.Clear();
+                
+                var vm = SelectedLayer;
+                if (vm == null) return;
+
+                // Store current mesh point values before drag
+                var pts = vm.MeshPoints;
+                if (pts != null && pts.Length >= 4)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        _meshPointsBeforeDrag[i] = pts[i];
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"InputHandle_DragStarted failed: {ex}");
+            }
+        }
+
+        private void InputHandle_DragCompleted(object sender, DragCompletedEventArgs e)
+        {
+            try
+            {
+                _isDragging = false;
+
+                var vm = SelectedLayer;
+                if (vm == null || UndoRedoService == null) return;
+
+                // Record undo action for each changed mesh point
+                var pts = vm.MeshPoints;
+                if (pts != null && pts.Length >= 4)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (_meshPointsBeforeDrag.ContainsKey(i))
+                        {
+                            var oldValue = _meshPointsBeforeDrag[i];
+                            var newValue = pts[i];
+
+                            // Only record if the value actually changed
+                            if (Math.Abs(oldValue.X - newValue.X) > 0.001f || Math.Abs(oldValue.Y - newValue.Y) > 0.001f)
+                            {
+                                var action = new MeshPointChangeAction(vm, i, oldValue, newValue, isOutputMesh: false);
+                                UndoRedoService.RecordAction(action);
+                            }
+                        }
+                    }
+                }
+
+                _meshPointsBeforeDrag.Clear();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"InputHandle_DragCompleted failed: {ex}");
+            }
         }
 
         private void InputHandle_TL_DragDelta(object sender, DragDeltaEventArgs e) => MoveCorner(0, e.HorizontalChange, e.VerticalChange);
