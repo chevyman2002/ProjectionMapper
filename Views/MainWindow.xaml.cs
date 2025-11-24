@@ -34,6 +34,7 @@ namespace ProjectionMapper
         private readonly VideoService _videoService;
         private readonly FileDialogService _fileDialog;
         private readonly ProjectService _projectService;
+        private readonly PlaylistService _playlistService;
 
         // Monitor list for UI
         private readonly ObservableCollection<MonitorItem> _monitorItems = new();
@@ -127,6 +128,11 @@ namespace ProjectionMapper
             _videoService = new VideoService(_rendererManager, ffmpegPath: null);
             _fileDialog = new FileDialogService();
             _projectService = new ProjectService();
+            
+            // Create PlaylistService for group-based playback
+            _playlistService = new PlaylistService(_videoService);
+            _playlistService.GroupChanged += OnPlaylistGroupChanged;
+            _playlistService.PlaylistCompleted += OnPlaylistCompleted;
 
             // Expose VideoService so MeshEditorControl can subscribe for isolated previews
             this.Resources["VideoService"] = _videoService;
@@ -151,41 +157,76 @@ namespace ProjectionMapper
 
             // Wire playback controls to VideoService
             _vm.PlayPauseRequestedAsync += async () =>
-                  {
-                try
             {
-                 // Toggle playback: after VM toggles IsPlaying, run the desired state
-                    if (_vm.IsPlaying)
-       {
-       Debug.WriteLine("VideoService: Resuming all layers");
-            await _videoService.ResumeAllAsync();
- Debug.WriteLine("VideoService: Resume completed");
-      }
- else
-             {
-       Debug.WriteLine("VideoService: Pausing all layers");
-     await _videoService.PauseAllAsync();
-              Debug.WriteLine("VideoService: Pause completed");
-     }
-     }
-          catch (Exception ex)
-{
-  Debug.WriteLine($"VideoService: PlayPause operation failed: {ex}");
+                try
+                {
+                    // Check if in playlist mode
+                    if (_vm.IsPlaylistMode && _vm.PlaylistGroups.Count > 0)
+                    {
+                        // Playlist mode: use PlaylistService for group-based playback
+                        if (_vm.IsPlaying)
+                        {
+                            if (_playlistService.IsPaused)
+                            {
+                                Debug.WriteLine("PlaylistService: Resuming current group");
+                                await _playlistService.ResumeCurrentGroupAsync();
+                            }
+                            else
+                            {
+                                Debug.WriteLine("PlaylistService: Starting playlist");
+                                var groups = _vm.BuildPlaylistGroupModels();
+                                await _playlistService.StartPlaylistAsync(groups);
+                            }
+                        }
+                        else
+                        {
+                            Debug.WriteLine("PlaylistService: Pausing current group");
+                            await _playlistService.PauseCurrentGroupAsync();
+                        }
+                    }
+                    else
+                    {
+                        // Legacy mode: use VideoService for independent playback
+                        if (_vm.IsPlaying)
+                        {
+                            Debug.WriteLine("VideoService: Resuming all layers");
+                            await _videoService.ResumeAllAsync();
+                            Debug.WriteLine("VideoService: Resume completed");
+                        }
+                        else
+                        {
+                            Debug.WriteLine("VideoService: Pausing all layers");
+                            await _videoService.PauseAllAsync();
+                            Debug.WriteLine("VideoService: Pause completed");
+                        }
+                    }
                 }
-          };
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlayPause operation failed: {ex}");
+                }
+            };
 
-     _vm.RestartRequestedAsync += async () =>
-     {
-    try
-  {
-  Debug.WriteLine("VideoService: Restarting all layers");
-   await _videoService.RestartAllAsync();
-  Debug.WriteLine("VideoService: Restart completed");
- }
-        catch (Exception ex)
-             {
-          Debug.WriteLine($"VideoService: Restart operation failed: {ex}");
-   }
+            _vm.RestartRequestedAsync += async () =>
+            {
+                try
+                {
+                    if (_vm.IsPlaylistMode && _vm.PlaylistGroups.Count > 0)
+                    {
+                        Debug.WriteLine("PlaylistService: Restarting playlist");
+                        await _playlistService.RestartPlaylistAsync();
+                    }
+                    else
+                    {
+                        Debug.WriteLine("VideoService: Restarting all layers");
+                        await _videoService.RestartAllAsync();
+                        Debug.WriteLine("VideoService: Restart completed");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Restart operation failed: {ex}");
+                }
             };
 
             // populate monitor list for UI using Win32 EnumDisplayMonitors and store monitor info
@@ -1558,6 +1599,10 @@ try
                     }
                 }
 
+                // Save playlist groups
+                project.PlaylistGroups = _vm.BuildPlaylistGroupModels();
+                project.PlaylistMode = _vm.IsPlaylistMode;
+
                 return project;
             }
             catch (Exception ex)
@@ -1593,7 +1638,23 @@ try
                     _vm.ImportedVideos.Clear();
                     _vm.SelectedImportedVideo = null;
                     _vm.SelectedMeshLayer = null;
+                    
+                    // Clear playlist groups
+                    _vm.PlaylistGroups.Clear();
+                    _vm.SelectedPlaylistGroup = null;
+                    _vm.CurrentPlaylistGroup = null;
+                    _vm.IsPlaylistMode = false;
                 }, DispatcherPriority.Normal);
+
+                // Stop playlist service if running
+                try
+                {
+                    await _playlistService.StopPlaylistAsync();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"ClearCurrentProjectAsync: Failed to stop playlist: {ex}");
+                }
 
                 // Hide all fullscreen windows
                 foreach (var monitorIndex in _previewMonitorStates.Keys.ToList())
@@ -1734,6 +1795,23 @@ try
                         Debug.WriteLine($"ApplyLoadedProjectAsync: Failed to load imported video {importedData.Name}: {ex}");
                     }
                 }
+
+                // Load playlist groups
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        _vm.LoadPlaylistGroups(project.PlaylistGroups);
+                        _vm.IsPlaylistMode = project.PlaylistMode;
+                        
+                        // Populate video references in groups
+                        _vm.UpdatePlaylistGroupVideos();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ApplyLoadedProjectAsync: Failed to load playlist groups: {ex}");
+                    }
+                }, DispatcherPriority.Normal);
             }
             catch (Exception ex)
             {
@@ -1815,5 +1893,71 @@ try
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
             public string szDevice;
         }
+
+        #region Playlist Event Handlers
+
+        private void OnPlaylistGroupChanged(int newGroupIndex)
+        {
+            try
+            {
+                Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        // Update IsActive flag on all groups
+                        foreach (var group in _vm.PlaylistGroups)
+                        {
+                            group.IsActive = group.Order == newGroupIndex;
+                        }
+
+                        // Update CurrentPlaylistGroup
+                        if (newGroupIndex >= 0 && newGroupIndex < _vm.PlaylistGroups.Count)
+                        {
+                            _vm.CurrentPlaylistGroup = _vm.PlaylistGroups.FirstOrDefault(g => g.Order == newGroupIndex);
+                        }
+                        else
+                        {
+                            _vm.CurrentPlaylistGroup = null;
+                        }
+
+                        _vm.StatusText = $"Playing Group {newGroupIndex + 1}: {_vm.CurrentPlaylistGroup?.Name ?? "Unknown"}";
+                        Debug.WriteLine($"PlaylistGroupChanged: Now playing group {newGroupIndex}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"OnPlaylistGroupChanged: Error updating UI: {ex}");
+                    }
+                }, DispatcherPriority.Normal);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"OnPlaylistGroupChanged: Error: {ex}");
+            }
+        }
+
+        private void OnPlaylistCompleted()
+        {
+            try
+            {
+                Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        _vm.StatusText = "Playlist completed - looping back to start";
+                        Debug.WriteLine("PlaylistCompleted: Playlist cycle completed");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"OnPlaylistCompleted: Error updating UI: {ex}");
+                    }
+                }, DispatcherPriority.Normal);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"OnPlaylistCompleted: Error: {ex}");
+            }
+        }
+
+        #endregion
     }
 }

@@ -49,6 +49,12 @@ namespace ProjectionMapper.Services
         /// </summary>
         public event Action<string, BitmapSource?>? FrameDecoded;
 
+        /// <summary>
+        /// Event raised when a video reaches its end. Parameter is the layerId.
+        /// Used by PlaylistService to track group completion.
+        /// </summary>
+        public event Action<string>? VideoCompleted;
+
         private void InvokeOnUi(Action action)
         {
             try
@@ -893,6 +899,210 @@ namespace ProjectionMapper.Services
             //         await UnregisterLayerAsync(kv.Key);
             //     }
             // }
+        }
+
+        /// <summary>
+        /// Checks if a video has reached its end (completed playback).
+        /// </summary>
+        /// <param name="layerId">The layer ID to check.</param>
+        /// <returns>True if the video has completed, false otherwise.</returns>
+        public bool IsVideoAtEnd(string layerId)
+        {
+            if (string.IsNullOrEmpty(layerId)) return false;
+            
+            try
+            {
+                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
+                {
+                    return tup.decoder.IsAtEnd;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.IsVideoAtEnd: Error checking video end state for {layerId}: {ex}");
+            }
+            
+            return false;
+        }
+
+        /// <summary>
+        /// Starts playback for a group of videos simultaneously.
+        /// </summary>
+        /// <param name="layerIds">List of layer IDs in the group.</param>
+        /// <returns>A task representing the async operation.</returns>
+        public async Task StartGroupVideosAsync(System.Collections.Generic.List<string> layerIds)
+        {
+            if (layerIds == null || layerIds.Count == 0)
+            {
+                Debug.WriteLine("VideoService.StartGroupVideosAsync: No layer IDs provided");
+                return;
+            }
+
+            try
+            {
+                Debug.WriteLine($"VideoService.StartGroupVideosAsync: Starting {layerIds.Count} videos");
+
+                var startTasks = new System.Collections.Generic.List<Task>();
+                
+                foreach (var layerId in layerIds)
+                {
+                    if (string.IsNullOrEmpty(layerId)) continue;
+
+                    // If the layer is registered but paused, resume it
+                    if (_decoders.TryGetValue(layerId, out var tup))
+                    {
+                        if (tup.isPaused)
+                        {
+                            startTasks.Add(ResumeLayerAsync(layerId));
+                        }
+                        else if (tup.decoder != null)
+                        {
+                            // Already playing, ensure it's visible
+                            if (tup.model != null)
+                            {
+                                tup.model.Visible = true;
+                            }
+                        }
+                        else if (tup.model != null)
+                        {
+                            // Decoder was disposed, re-register
+                            startTasks.Add(RegisterLayerAsync(tup.model, tup.model.PlayAudio));
+                        }
+                    }
+                }
+
+                if (startTasks.Count > 0)
+                {
+                    await Task.WhenAll(startTasks).ConfigureAwait(false);
+                }
+
+                Debug.WriteLine("VideoService.StartGroupVideosAsync: Group videos started");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.StartGroupVideosAsync: Error starting group: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Stops playback for a group of videos.
+        /// </summary>
+        /// <param name="layerIds">List of layer IDs in the group.</param>
+        /// <returns>A task representing the async operation.</returns>
+        public async Task StopGroupVideosAsync(System.Collections.Generic.List<string> layerIds)
+        {
+            if (layerIds == null || layerIds.Count == 0)
+            {
+                Debug.WriteLine("VideoService.StopGroupVideosAsync: No layer IDs provided");
+                return;
+            }
+
+            try
+            {
+                Debug.WriteLine($"VideoService.StopGroupVideosAsync: Stopping {layerIds.Count} videos");
+
+                var stopTasks = layerIds
+                    .Where(id => !string.IsNullOrEmpty(id))
+                    .Select(id => PauseLayerAsync(id));
+
+                await Task.WhenAll(stopTasks).ConfigureAwait(false);
+
+                // Also hide the videos
+                foreach (var layerId in layerIds)
+                {
+                    if (string.IsNullOrEmpty(layerId)) continue;
+
+                    if (_decoders.TryGetValue(layerId, out var tup) && tup.model != null)
+                    {
+                        tup.model.Visible = false;
+                    }
+
+                    // Hide associated meshes
+                    await HideSourceOutputAndMeshesAsync(layerId).ConfigureAwait(false);
+                }
+
+                Debug.WriteLine("VideoService.StopGroupVideosAsync: Group videos stopped");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.StopGroupVideosAsync: Error stopping group: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Hides all videos except those in the specified group.
+        /// </summary>
+        /// <param name="layerIds">List of layer IDs to keep visible.</param>
+        /// <returns>A task representing the async operation.</returns>
+        public async Task HideAllExceptGroupAsync(System.Collections.Generic.List<string> layerIds)
+        {
+            if (layerIds == null)
+            {
+                layerIds = new System.Collections.Generic.List<string>();
+            }
+
+            try
+            {
+                Debug.WriteLine($"VideoService.HideAllExceptGroupAsync: Keeping {layerIds.Count} videos visible");
+
+                var hashSet = new System.Collections.Generic.HashSet<string>(layerIds);
+                var hideTasks = new System.Collections.Generic.List<Task>();
+
+                foreach (var kv in _decoders.ToArray())
+                {
+                    var layerId = kv.Key;
+                    var tup = kv.Value;
+
+                    if (hashSet.Contains(layerId))
+                    {
+                        // This layer should be visible
+                        if (tup.model != null)
+                        {
+                            tup.model.Visible = true;
+                        }
+                    }
+                    else
+                    {
+                        // This layer should be hidden (pause and hide)
+                        if (tup.model != null)
+                        {
+                            tup.model.Visible = false;
+                        }
+                        hideTasks.Add(PauseLayerAsync(layerId));
+                        hideTasks.Add(HideSourceOutputAndMeshesAsync(layerId));
+                    }
+                }
+
+                if (hideTasks.Count > 0)
+                {
+                    await Task.WhenAll(hideTasks).ConfigureAwait(false);
+                }
+
+                Debug.WriteLine("VideoService.HideAllExceptGroupAsync: Non-group videos hidden");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.HideAllExceptGroupAsync: Error hiding videos: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Fires the VideoCompleted event for the specified layer.
+        /// Called internally when a video reaches its end.
+        /// </summary>
+        /// <param name="layerId">The layer ID that completed.</param>
+        internal void OnVideoCompleted(string layerId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(layerId)) return;
+                Debug.WriteLine($"VideoService.OnVideoCompleted: Video '{layerId}' completed");
+                VideoCompleted?.Invoke(layerId);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.OnVideoCompleted: Error invoking event: {ex}");
+            }
         }
     }
 }

@@ -46,10 +46,24 @@ namespace ProjectionMapper.Services
         // Video duration for loop-aware position tracking
         private TimeSpan _videoDuration = TimeSpan.Zero;
 
+        // Flag indicating if the video has reached its end
+        private volatile bool _isAtEnd = false;
+
         /// <summary>
         /// When true, the decoder will automatically restart when EOF is reached.
       /// </summary>
       public bool Loop { get; set; }
+
+        /// <summary>
+        /// Gets whether the video has reached its end (EOF).
+        /// This is reset when the video restarts (loop) or is restarted manually.
+        /// </summary>
+        public bool IsAtEnd => _isAtEnd;
+
+        /// <summary>
+        /// Gets the total duration of the video, if known.
+        /// </summary>
+        public TimeSpan Duration => _videoDuration;
 
         /// <summary>
         /// When true, audio will be decoded and played. When false, audio is muted but still decoded for sync.
@@ -194,7 +208,14 @@ namespace ProjectionMapper.Services
    {
        if (_cts.IsCancellationRequested) break;
 
+        // Reset the IsAtEnd flag when starting a new session
+        _isAtEnd = false;
+
         await StartSingleDecodingSession();
+
+        // Mark video as completed when the session ends (EOF reached)
+        _isAtEnd = true;
+        Debug.WriteLine("FFmpegUnifiedDecoder: Video reached end of file");
 
    // If not looping, exit
      if (!Loop) break;
