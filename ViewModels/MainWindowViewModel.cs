@@ -57,6 +57,14 @@ namespace ProjectionMapper.ViewModels
                 HasUnsavedChanges = true;
             };
 
+            // Initialize playlist groups collection
+            PlaylistGroups = new ObservableCollection<PlaylistGroupViewModel>();
+            PlaylistGroups.CollectionChanged += (s, e) =>
+            {
+                HasUnsavedChanges = true;
+                RaisePropertyChanged(nameof(PlaylistGroupCount));
+            };
+
             AddSurfaceCommand = new RelayCommand(ExecuteAddSurface, CanExecuteAddSurface);
             RemoveSurfaceCommand = new RelayCommand(ExecuteRemoveSurface, CanExecuteRemoveSurface);
 
@@ -102,6 +110,15 @@ namespace ProjectionMapper.ViewModels
             });
             PreviewCommand = new RelayCommand(_ => PreviewRequested?.Invoke());
 
+            // Playlist commands
+            CreateGroupCommand = new RelayCommand(ExecuteCreateGroupCommand);
+            DeleteGroupCommand = new RelayCommand(ExecuteDeleteGroupCommand, _ => SelectedPlaylistGroup != null);
+            AddVideoToGroupCommand = new RelayCommand(ExecuteAddVideoToGroupCommand, _ => SelectedPlaylistGroup != null && SelectedImportedVideo != null);
+            RemoveVideoFromGroupCommand = new RelayCommand(ExecuteRemoveVideoFromGroupCommand, _ => SelectedPlaylistGroup != null && SelectedImportedVideo != null);
+            TogglePlaylistModeCommand = new RelayCommand(ExecuteTogglePlaylistModeCommand);
+            MoveGroupUpCommand = new RelayCommand(ExecuteMoveGroupUpCommand, _ => SelectedPlaylistGroup != null && SelectedPlaylistGroup.Order > 0);
+            MoveGroupDownCommand = new RelayCommand(ExecuteMoveGroupDownCommand, _ => SelectedPlaylistGroup != null && SelectedPlaylistGroup.Order < PlaylistGroups.Count - 1);
+
             // sensible defaults for zoom
             InputZoom = 1.0;
             OutputZoom = 1.0;
@@ -128,12 +145,81 @@ namespace ProjectionMapper.ViewModels
         // Imported videos shown as tree parents
         public ObservableCollection<ImportedVideoViewModel> ImportedVideos { get; }
 
+        // Playlist groups for group-based playback
+        public ObservableCollection<PlaylistGroupViewModel> PlaylistGroups { get; }
+
         private ImportedVideoViewModel? _selectedImportedVideo;
         public ImportedVideoViewModel? SelectedImportedVideo
         {
             get => _selectedImportedVideo;
-            set => SetProperty(ref _selectedImportedVideo, value);
+            set
+            {
+                if (SetProperty(ref _selectedImportedVideo, value))
+                {
+                    // Update command states when selection changes
+                    (AddVideoToGroupCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (RemoveVideoFromGroupCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
         }
+
+        private PlaylistGroupViewModel? _selectedPlaylistGroup;
+        /// <summary>
+        /// Gets or sets the currently selected playlist group.
+        /// </summary>
+        public PlaylistGroupViewModel? SelectedPlaylistGroup
+        {
+            get => _selectedPlaylistGroup;
+            set
+            {
+                if (SetProperty(ref _selectedPlaylistGroup, value))
+                {
+                    // Update command states when selection changes
+                    (DeleteGroupCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (AddVideoToGroupCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (RemoveVideoFromGroupCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (MoveGroupUpCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (MoveGroupDownCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        private PlaylistGroupViewModel? _currentPlaylistGroup;
+        /// <summary>
+        /// Gets or sets the currently playing playlist group (active during playback).
+        /// </summary>
+        public PlaylistGroupViewModel? CurrentPlaylistGroup
+        {
+            get => _currentPlaylistGroup;
+            set => SetProperty(ref _currentPlaylistGroup, value);
+        }
+
+        private bool _isPlaylistMode;
+        /// <summary>
+        /// Gets or sets whether the project is in playlist mode (group-based sequential playback).
+        /// </summary>
+        public bool IsPlaylistMode
+        {
+            get => _isPlaylistMode;
+            set
+            {
+                if (SetProperty(ref _isPlaylistMode, value))
+                {
+                    HasUnsavedChanges = true;
+                    RaisePropertyChanged(nameof(PlaylistModeText));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets text describing the current playlist mode state.
+        /// </summary>
+        public string PlaylistModeText => IsPlaylistMode ? "Playlist Mode" : "Legacy Mode";
+
+        /// <summary>
+        /// Gets the number of playlist groups.
+        /// </summary>
+        public int PlaylistGroupCount => PlaylistGroups.Count;
 
         private LayerViewModel? _selectedMeshLayer;
         public LayerViewModel? SelectedMeshLayer
@@ -183,6 +269,15 @@ namespace ProjectionMapper.ViewModels
         public ICommand SaveAsProjectCommand { get; }
         public ICommand LoadProjectCommand { get; }
         public ICommand NewProjectCommand { get; }
+
+        // Playlist commands
+        public ICommand CreateGroupCommand { get; }
+        public ICommand DeleteGroupCommand { get; }
+        public ICommand AddVideoToGroupCommand { get; }
+        public ICommand RemoveVideoFromGroupCommand { get; }
+        public ICommand TogglePlaylistModeCommand { get; }
+        public ICommand MoveGroupUpCommand { get; }
+        public ICommand MoveGroupDownCommand { get; }
 
         // Events surfaced to the host window so it can perform file dialogs / services
         public event Action? ImportRequested;
@@ -525,5 +620,306 @@ namespace ProjectionMapper.ViewModels
             // Raise the load project event
             LoadProjectRequested?.Invoke();
         }
+
+        #region Playlist Commands
+
+        private int _nextGroupNumber = 1;
+
+        private void ExecuteCreateGroupCommand(object? _)
+        {
+            try
+            {
+                var model = new PlaylistGroupModel
+                {
+                    Id = Guid.NewGuid().ToString("N"),
+                    Name = $"Group {_nextGroupNumber++}",
+                    Order = PlaylistGroups.Count
+                };
+
+                var vm = new PlaylistGroupViewModel(model);
+                PlaylistGroups.Add(vm);
+                SelectedPlaylistGroup = vm;
+
+                // If playlist mode is not enabled, enable it when first group is created
+                if (!IsPlaylistMode && PlaylistGroups.Count == 1)
+                {
+                    IsPlaylistMode = true;
+                }
+
+                HasUnsavedChanges = true;
+                System.Diagnostics.Debug.WriteLine($"Created playlist group: {model.Name}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteCreateGroupCommand failed: {ex}");
+            }
+        }
+
+        private void ExecuteDeleteGroupCommand(object? _)
+        {
+            if (SelectedPlaylistGroup == null) return;
+
+            try
+            {
+                var groupToDelete = SelectedPlaylistGroup;
+                var index = PlaylistGroups.IndexOf(groupToDelete);
+                
+                PlaylistGroups.Remove(groupToDelete);
+
+                // Reorder remaining groups
+                for (int i = 0; i < PlaylistGroups.Count; i++)
+                {
+                    PlaylistGroups[i].Order = i;
+                }
+
+                // Select adjacent group if available
+                if (PlaylistGroups.Count > 0)
+                {
+                    SelectedPlaylistGroup = PlaylistGroups[Math.Max(0, Math.Min(index, PlaylistGroups.Count - 1))];
+                }
+                else
+                {
+                    SelectedPlaylistGroup = null;
+                }
+
+                HasUnsavedChanges = true;
+                System.Diagnostics.Debug.WriteLine($"Deleted playlist group: {groupToDelete.Name}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteDeleteGroupCommand failed: {ex}");
+            }
+        }
+
+        private void ExecuteAddVideoToGroupCommand(object? _)
+        {
+            if (SelectedPlaylistGroup == null || SelectedImportedVideo == null) return;
+
+            try
+            {
+                var sourceId = SelectedImportedVideo.Id;
+                
+                // Check if the video is already in this group
+                if (SelectedPlaylistGroup.Model.SourceIds.Contains(sourceId))
+                {
+                    System.Diagnostics.Debug.WriteLine($"Video {SelectedImportedVideo.Name} already in group {SelectedPlaylistGroup.Name}");
+                    return;
+                }
+
+                // Add to model's source IDs
+                SelectedPlaylistGroup.Model.SourceIds.Add(sourceId);
+                
+                // Add to view model's Videos collection
+                SelectedPlaylistGroup.Videos.Add(SelectedImportedVideo);
+                SelectedPlaylistGroup.RefreshVideoCount();
+
+                HasUnsavedChanges = true;
+                System.Diagnostics.Debug.WriteLine($"Added video {SelectedImportedVideo.Name} to group {SelectedPlaylistGroup.Name}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteAddVideoToGroupCommand failed: {ex}");
+            }
+        }
+
+        private void ExecuteRemoveVideoFromGroupCommand(object? _)
+        {
+            if (SelectedPlaylistGroup == null || SelectedImportedVideo == null) return;
+
+            try
+            {
+                var sourceId = SelectedImportedVideo.Id;
+                
+                // Remove from model's source IDs
+                SelectedPlaylistGroup.Model.SourceIds.Remove(sourceId);
+                
+                // Remove from view model's Videos collection
+                var videoToRemove = SelectedPlaylistGroup.Videos.FirstOrDefault(v => v.Id == sourceId);
+                if (videoToRemove != null)
+                {
+                    SelectedPlaylistGroup.Videos.Remove(videoToRemove);
+                }
+                SelectedPlaylistGroup.RefreshVideoCount();
+
+                HasUnsavedChanges = true;
+                System.Diagnostics.Debug.WriteLine($"Removed video {SelectedImportedVideo.Name} from group {SelectedPlaylistGroup.Name}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteRemoveVideoFromGroupCommand failed: {ex}");
+            }
+        }
+
+        private void ExecuteTogglePlaylistModeCommand(object? _)
+        {
+            try
+            {
+                IsPlaylistMode = !IsPlaylistMode;
+                System.Diagnostics.Debug.WriteLine($"Playlist mode toggled: {IsPlaylistMode}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteTogglePlaylistModeCommand failed: {ex}");
+            }
+        }
+
+        private void ExecuteMoveGroupUpCommand(object? _)
+        {
+            if (SelectedPlaylistGroup == null || SelectedPlaylistGroup.Order <= 0) return;
+
+            try
+            {
+                var currentIndex = SelectedPlaylistGroup.Order;
+                var targetIndex = currentIndex - 1;
+
+                // Swap with the group above
+                var otherGroup = PlaylistGroups.FirstOrDefault(g => g.Order == targetIndex);
+                if (otherGroup != null)
+                {
+                    otherGroup.Order = currentIndex;
+                }
+                SelectedPlaylistGroup.Order = targetIndex;
+
+                // Re-sort the collection
+                var sorted = PlaylistGroups.OrderBy(g => g.Order).ToList();
+                PlaylistGroups.Clear();
+                foreach (var g in sorted)
+                {
+                    PlaylistGroups.Add(g);
+                }
+
+                // Update command states
+                (MoveGroupUpCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (MoveGroupDownCommand as RelayCommand)?.RaiseCanExecuteChanged();
+
+                HasUnsavedChanges = true;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteMoveGroupUpCommand failed: {ex}");
+            }
+        }
+
+        private void ExecuteMoveGroupDownCommand(object? _)
+        {
+            if (SelectedPlaylistGroup == null || SelectedPlaylistGroup.Order >= PlaylistGroups.Count - 1) return;
+
+            try
+            {
+                var currentIndex = SelectedPlaylistGroup.Order;
+                var targetIndex = currentIndex + 1;
+
+                // Swap with the group below
+                var otherGroup = PlaylistGroups.FirstOrDefault(g => g.Order == targetIndex);
+                if (otherGroup != null)
+                {
+                    otherGroup.Order = currentIndex;
+                }
+                SelectedPlaylistGroup.Order = targetIndex;
+
+                // Re-sort the collection
+                var sorted = PlaylistGroups.OrderBy(g => g.Order).ToList();
+                PlaylistGroups.Clear();
+                foreach (var g in sorted)
+                {
+                    PlaylistGroups.Add(g);
+                }
+
+                // Update command states
+                (MoveGroupUpCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (MoveGroupDownCommand as RelayCommand)?.RaiseCanExecuteChanged();
+
+                HasUnsavedChanges = true;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteMoveGroupDownCommand failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Populates PlaylistGroups from the specified list of group models.
+        /// Used when loading a project.
+        /// </summary>
+        /// <param name="groups">The list of playlist group models to load.</param>
+        public void LoadPlaylistGroups(System.Collections.Generic.List<PlaylistGroupModel> groups)
+        {
+            try
+            {
+                PlaylistGroups.Clear();
+                _nextGroupNumber = 1;
+
+                if (groups == null || groups.Count == 0) return;
+
+                var sortedGroups = groups.OrderBy(g => g.Order).ToList();
+                
+                foreach (var model in sortedGroups)
+                {
+                    var vm = new PlaylistGroupViewModel(model);
+                    PlaylistGroups.Add(vm);
+
+                    // Update next group number
+                    if (model.Name.StartsWith("Group ") && 
+                        int.TryParse(model.Name.Substring(6).Trim(), out var num))
+                    {
+                        _nextGroupNumber = Math.Max(_nextGroupNumber, num + 1);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"LoadPlaylistGroups failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Builds a list of PlaylistGroupModel objects from the current PlaylistGroups.
+        /// Used when saving a project.
+        /// </summary>
+        /// <returns>A list of playlist group models.</returns>
+        public System.Collections.Generic.List<PlaylistGroupModel> BuildPlaylistGroupModels()
+        {
+            try
+            {
+                return PlaylistGroups.Select(vm => vm.Model).ToList();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"BuildPlaylistGroupModels failed: {ex}");
+                return new System.Collections.Generic.List<PlaylistGroupModel>();
+            }
+        }
+
+        /// <summary>
+        /// Updates the Videos collection in each PlaylistGroupViewModel based on the ImportedVideos collection.
+        /// Call this after loading a project to populate the Videos collections.
+        /// </summary>
+        public void UpdatePlaylistGroupVideos()
+        {
+            try
+            {
+                foreach (var group in PlaylistGroups)
+                {
+                    group.Videos.Clear();
+                    
+                    foreach (var sourceId in group.Model.SourceIds)
+                    {
+                        var video = ImportedVideos.FirstOrDefault(v => v.Id == sourceId);
+                        if (video != null)
+                        {
+                            group.Videos.Add(video);
+                        }
+                    }
+                    
+                    group.RefreshVideoCount();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"UpdatePlaylistGroupVideos failed: {ex}");
+            }
+        }
+
+        #endregion
     }
 }

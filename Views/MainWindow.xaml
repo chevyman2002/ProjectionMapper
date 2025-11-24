@@ -9,6 +9,7 @@
 
     <Window.Resources>
         <conv:NullToVisibilityConverter x:Key="NullToVisibilityConverter" />
+        <conv:BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
     </Window.Resources>
 
     <Window.InputBindings>
@@ -137,6 +138,63 @@
                         </TreeView.ItemTemplate>
 
                     </TreeView>
+
+                    <!-- Playlist Groups Panel -->
+                    <Expander x:Name="PART_PlaylistExpander" Header="Playlist Groups" IsExpanded="False" Margin="0,8,0,0">
+                        <StackPanel>
+                            <!-- Playlist Mode Toggle -->
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,4">
+                                <TextBlock Text="Mode:" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                <ToggleButton x:Name="PART_PlaylistModeToggle" 
+                                              IsChecked="{Binding IsPlaylistMode, Mode=TwoWay}" 
+                                              Content="{Binding PlaylistModeText}"
+                                              ToolTip="Toggle between Legacy mode (all videos play independently) and Playlist mode (groups play sequentially)"
+                                              Padding="8,2" />
+                            </StackPanel>
+                            
+                            <!-- Group List -->
+                            <ListBox x:Name="PART_PlaylistGroupList" 
+                                     ItemsSource="{Binding PlaylistGroups}" 
+                                     SelectedItem="{Binding SelectedPlaylistGroup, Mode=TwoWay}"
+                                     Height="100" 
+                                     Margin="0,4,0,4">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="●" Foreground="Green" Visibility="{Binding IsActive, Converter={StaticResource BooleanToVisibilityConverter}}" Margin="0,0,4,0" />
+                                            <TextBlock Text="{Binding Name}" />
+                                            <TextBlock Text=" (" />
+                                            <TextBlock Text="{Binding VideoCount}" />
+                                            <TextBlock Text=" videos)" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            
+                            <!-- Group Actions -->
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,4">
+                                <Button Content="+" Command="{Binding CreateGroupCommand}" ToolTip="Create Group" Width="24" Margin="0,0,4,0" />
+                                <Button Content="-" Command="{Binding DeleteGroupCommand}" ToolTip="Delete Group" Width="24" Margin="0,0,4,0" />
+                                <Button Content="↑" Command="{Binding MoveGroupUpCommand}" ToolTip="Move Up" Width="24" Margin="0,0,4,0" />
+                                <Button Content="↓" Command="{Binding MoveGroupDownCommand}" ToolTip="Move Down" Width="24" Margin="0,0,4,0" />
+                            </StackPanel>
+                            
+                            <!-- Video Assignment -->
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                <Button Content="Add Video" Command="{Binding AddVideoToGroupCommand}" ToolTip="Add selected video to selected group" Padding="4,2" Margin="0,0,4,0" />
+                                <Button Content="Remove" Command="{Binding RemoveVideoFromGroupCommand}" ToolTip="Remove selected video from selected group" Padding="4,2" />
+                            </StackPanel>
+                            
+                            <!-- Current Group Info -->
+                            <TextBlock Margin="0,8,0,0" FontStyle="Italic">
+                                <TextBlock.Text>
+                                    <MultiBinding StringFormat="Active: {0}">
+                                        <Binding Path="CurrentPlaylistGroup.Name" FallbackValue="None" />
+                                    </MultiBinding>
+                                </TextBlock.Text>
+                            </TextBlock>
+                        </StackPanel>
+                    </Expander>
 
                     <Separator Margin="0,8,0,8" />
 

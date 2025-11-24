@@ -7,6 +7,7 @@ namespace ProjectionMapper.Models
     /// <summary>
     /// Represents a top-level project containing surfaces and resources.
     /// Enhanced to include imported videos with their mesh layers and settings.
+    /// Supports playlist groups for sequential group-based playback.
     /// </summary>
     public class ProjectModel
     {
@@ -14,11 +15,28 @@ namespace ProjectionMapper.Models
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime LastModified { get; set; } = DateTime.UtcNow;
 
+        /// <summary>
+        /// Project version for format compatibility. Version 1 = legacy (no groups), Version 2 = with playlist groups.
+        /// </summary>
+        public int ProjectVersion { get; set; } = 2;
+
         // Make surfaces observable for UI binding
         public ObservableCollection<SurfaceModel> Surfaces { get; } = new ObservableCollection<SurfaceModel>();
 
         // Imported videos collection for project persistence
         public List<ImportedVideoData> ImportedVideos { get; set; } = new List<ImportedVideoData>();
+
+        /// <summary>
+        /// Playlist groups for group-based playback. Each group contains source IDs that play simultaneously.
+        /// Groups play sequentially and loop back to the first group after the last completes.
+        /// </summary>
+        public List<PlaylistGroupModel> PlaylistGroups { get; set; } = new List<PlaylistGroupModel>();
+
+        /// <summary>
+        /// When true, the project uses playlist mode with group-based sequential playback.
+        /// When false, all videos play in legacy mode (simultaneously, looping independently).
+        /// </summary>
+        public bool PlaylistMode { get; set; } = false;
 
         // Global project settings
         public bool ShowMeshOverlay { get; set; } = true;
