@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using ProjectionMapper.Views;
 using System.Windows.Interop;
 using System.Windows.Media.Imaging;
+using System.Numerics;
 
 namespace ProjectionMapper
 {
@@ -32,10 +33,17 @@ namespace ProjectionMapper
         // Services
         private readonly VideoService _videoService;
         private readonly FileDialogService _fileDialog;
+        private readonly ProjectService _projectService;
 
         // Monitor list for UI
         private readonly ObservableCollection<MonitorItem> _monitorItems = new();
         private List<MonitorInfo> _monitors = new();
+
+        // Track current project file path
+        private string? _currentProjectPath;
+
+        // Track fullscreen windows for preview restore
+        private readonly Dictionary<int, bool> _previewMonitorStates = new();
 
         private class MonitorItem
         {
@@ -118,14 +126,28 @@ namespace ProjectionMapper
             // Create VideoService (ffmpeg path empty -> expects ffmpeg on PATH)
             _videoService = new VideoService(_rendererManager, ffmpegPath: null);
             _fileDialog = new FileDialogService();
+            _projectService = new ProjectService();
 
             // Expose VideoService so MeshEditorControl can subscribe for isolated previews
             this.Resources["VideoService"] = _videoService;
 
             // Wire ViewModel events
             _vm.ImportRequested += async () => await HandleImportAsync();
-            _vm.PreviewRequested += () => { _vm.StatusText = "Preview requested"; };
+            _vm.PreviewRequested += () => HandlePreview();
             _vm.DeleteImportedRequested += async imported => await HandleDeleteImportedAsync(imported);
+            _vm.SaveProjectRequested += async () => await HandleSaveProjectAsync();
+            _vm.SaveAsProjectRequested += async () => await HandleSaveAsProjectAsync();
+            _vm.LoadProjectRequested += async () => await HandleLoadProjectAsync();
+            _vm.NewProjectRequested += async () => await HandleNewProjectAsync();
+
+            // Update window title when HasUnsavedChanges property changes
+            _vm.PropertyChanged += (sender, e) =>
+            {
+                if (e.PropertyName == nameof(MainWindowViewModel.HasUnsavedChanges))
+                {
+                    UpdateWindowTitle();
+                }
+            };
 
             // Wire playback controls to VideoService
             _vm.PlayPauseRequestedAsync += async () =>
@@ -244,13 +266,8 @@ namespace ProjectionMapper
                 await _rendererManager.StartAsync(w, h);
             };
 
-            Closing += async (_, __) =>
-            {
-                // Unregister/cleanup services
-                try { await _videoService.UnregisterLayerAsync(""); } catch { }
-                _videoService.Dispose();
-                _rendererManager.Dispose();
-            };
+            // Handle window closing properly without blocking the UI thread
+            Closing += MainWindow_Closing;
 
             // Hook mesh layer created event so we can register with VideoService
             _vm.MeshLayerCreated += async mesh =>
@@ -358,12 +375,11 @@ try
                 Topmost = true
             };
 
-            // Convert monitor pixel bounds to WPF device-independent units
+            // Convert monitor pixel boundaries to WPF DIPs
             var source = PresentationSource.FromVisual(this);
             double dpiX = 1.0, dpiY = 1.0;
             if (source != null && source.CompositionTarget != null)
             {
-                // TransformFromDevice is a Matrix, but CompositionTarget has TransformFromDevice
                 dpiX = source.CompositionTarget.TransformFromDevice.M11;
                 dpiY = source.CompositionTarget.TransformFromDevice.M22;
             }
@@ -505,7 +521,10 @@ try
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Failed to import video: {ex.Message}", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    MessageBox.Show($"Failed to import video: {ex.Message}", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                });
             }
         }
 
@@ -727,8 +746,8 @@ try
                                 imported.HostLayer.Visible = false;
                             }, DispatcherPriority.Normal);
 
-                            // pause decoding and hide via service
-                            await _videoService.HideSourceOutputAndMeshesAsync(imported.HostLayer.Id);
+                            // pause decoding to hide output
+                            await _videoService.PauseLayerAsync(imported.HostLayer.Id);
 
                             // hide any fullscreen assigned to host
                             if (imported.HostLayer.TargetMonitorIndex >= 0)
@@ -747,8 +766,8 @@ try
                         }
                         else
                         {
-                            // show: resume decoding via service first
-                            await _videoService.ShowSourceOutputAndMeshesAsync(imported.HostLayer.Id);
+                            // show: resume decoding first
+                            await _videoService.ResumeLayerAsync(imported.HostLayer.Id);
 
                             // update UI on UI thread
                             await Dispatcher.InvokeAsync(() =>
@@ -915,8 +934,814 @@ try
             return null;
         }
 
-        private record MonitorInfo(int Width, int Height, int Left, int Top);
+        private void AboutMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var aboutWindow = new Views.AboutWindow
+                {
+                    Owner = this
+                };
+                aboutWindow.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"AboutMenuItem_Click failed: {ex}");
+                MessageBox.Show(
+                    $"Failed to open About dialog: {ex.Message}",
+                    "Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
 
+        private void ExitMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                Close();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ExitMenuItem_Click failed: {ex}");
+            }
+        }
+
+        private void UpdateWindowTitle()
+        {
+            try
+            {
+                var baseTitle = "Projection Mapper";
+                
+                if (!string.IsNullOrEmpty(_currentProjectPath))
+                {
+                    baseTitle += $" - {Path.GetFileName(_currentProjectPath)}";
+                }
+                
+                if (_vm.HasUnsavedChanges)
+                {
+                    baseTitle += " *";
+                }
+                
+                Title = baseTitle;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"UpdateWindowTitle failed: {ex}");
+            }
+        }
+
+        private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+        {
+            // Check if there are unsaved changes
+            if (_vm.HasUnsavedChanges)
+            {
+                var result = MessageBox.Show(
+                    "You have unsaved changes. Do you want to save your project before closing?",
+                    "Unsaved Changes",
+                    MessageBoxButton.YesNoCancel,
+                    MessageBoxImage.Question);
+
+                if (result == MessageBoxResult.Yes)
+                {
+                    // User wants to save - cancel closing and try to save
+                    e.Cancel = true;
+                    
+                    // Attempt to save the project
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await HandleSaveProjectAsync();
+                            
+                            // If save was successful (no more unsaved changes), close the window
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                if (!_vm.HasUnsavedChanges)
+                                {
+                                    // Temporarily remove the Closing handler to prevent recursion
+                                    Closing -= MainWindow_Closing;
+                                    Close();
+                                }
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Save before close failed: {ex}");
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                MessageBox.Show(
+                                    "Failed to save project. Your changes will be lost if you close without saving.", 
+                                    "Save Error", 
+                                    MessageBoxButton.OK, 
+                                    MessageBoxImage.Error);
+                            });
+                        }
+                    });
+                    return; // Cancel the close for now
+                }
+                else if (result == MessageBoxResult.Cancel)
+                {
+                    // User cancelled - don't close
+                    e.Cancel = true;
+                    return;
+                }
+                // If result is No, continue with closing (don't save)
+            }
+
+            // Don't block the closing - let the window close immediately
+            // Start async cleanup on background thread
+            Task.Run(async () =>
+            {
+                try
+                {
+                    Debug.WriteLine("MainWindow_Closing: Starting async cleanup");
+                    
+                    // Stop all video services first
+                    try 
+                    { 
+                        await _videoService.StopAllAsync().ConfigureAwait(false); 
+                        Debug.WriteLine("MainWindow_Closing: VideoService stopped");
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        Debug.WriteLine($"MainWindow_Closing: VideoService stop failed: {ex}"); 
+                    }
+
+                    // Stop renderer manager
+                    try 
+                    { 
+                        await _rendererManager.StopAsync().ConfigureAwait(false);
+                        Debug.WriteLine("MainWindow_Closing: RendererManager stopped"); 
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        Debug.WriteLine($"MainWindow_Closing: RendererManager stop failed: {ex}"); 
+                    }
+
+                    // Dispose services
+                    try 
+                    { 
+                        _videoService.Dispose(); 
+                        Debug.WriteLine("MainWindow_Closing: VideoService disposed");
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        Debug.WriteLine($"MainWindow_Closing: VideoService dispose failed: {ex}"); 
+                    }
+
+                    try 
+                    { 
+                        _rendererManager.Dispose(); 
+                        Debug.WriteLine("MainWindow_Closing: RendererManager disposed");
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        Debug.WriteLine($"MainWindow_Closing: RendererManager dispose failed: {ex}"); 
+                    }
+
+                    Debug.WriteLine("MainWindow_Closing: Async cleanup completed");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"MainWindow_Closing: Cleanup failed: {ex}");
+                }
+            });
+        }
+
+        private void HandlePreview()
+        {
+            try
+            {
+                var imported = _vm.SelectedImportedVideo;
+                if (imported?.HostLayer == null) 
+                {
+                    MessageBox.Show("Please select a video source first.", "Preview", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                var targetMonitor = imported.HostLayer.TargetMonitorIndex;
+                if (targetMonitor < 0 || targetMonitor >= _monitors.Count)
+                {
+                    MessageBox.Show("Please assign an output display to the selected source first.", "Preview", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                // Toggle preview: if fullscreen is already shown, hide it; otherwise show it
+                if (_previewMonitorStates.ContainsKey(targetMonitor) && _previewMonitorStates[targetMonitor])
+                {
+                    // Hide/restore
+                    _rendererManager.HideFullScreenWindow(targetMonitor);
+                    _previewMonitorStates[targetMonitor] = false;
+                    _vm.StatusText = $"Preview closed for Display {targetMonitor + 1}";
+                }
+                else
+                {
+                    // Show fullscreen
+                    _rendererManager.HideFullScreenWindow(targetMonitor); // Hide any existing first
+                    CreateOrShowFullScreenForMonitor(targetMonitor);
+                    _previewMonitorStates[targetMonitor] = true;
+                    _vm.StatusText = $"Preview showing on Display {targetMonitor + 1} (press Escape to close)";
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"HandlePreview failed: {ex}");
+                MessageBox.Show($"Preview failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task HandleSaveProjectAsync()
+        {
+            try
+            {
+                string? path = _currentProjectPath;
+                
+                // If no current path, show save dialog (this MUST be on UI thread)
+                if (string.IsNullOrEmpty(path))
+                {
+                    // Ensure we're on UI thread when showing file dialog
+                    await Dispatcher.InvokeAsync(async () =>
+                    {
+                        path = await _fileDialog.ShowSaveFileDialogAsync(
+                            "Save Project",
+                            "Untitled.pmproj",
+                            "Projection Mapper Project (*.pmproj)|*.pmproj|All files|*.*");
+                    });
+                    
+                    if (string.IsNullOrEmpty(path)) return; // User cancelled
+                }
+
+                // Build project model from current state - MUST be done on UI thread
+                ProjectModel? project = null;
+                try
+                {
+                    // Ensure we're on UI thread when building project model
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        project = BuildProjectModel();
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"HandleSaveProjectAsync: BuildProjectModel failed: {ex}");
+                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
+                
+                if (project == null)
+                {
+                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
+                
+                // Save project on background thread to avoid blocking UI
+                bool success = false;
+                try
+                {
+                    success = await Task.Run(async () =>
+                    {
+                        return await _projectService.SaveAsync(project, path);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"HandleSaveProjectAsync: Save operation failed: {ex}");
+                    success = false;
+                }
+                
+                // Update UI based on result (ensure on UI thread)
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (success)
+                    {
+                        _currentProjectPath = path;
+                        _vm.StatusText = $"Project saved to {Path.GetFileName(path)}";
+                        
+                        // Mark project as clean after successful save
+                        _vm.MarkProjectClean();
+                        UpdateWindowTitle();
+                    }
+                    else
+                    {
+                        MessageBox.Show("Failed to save project. Check the logs for details.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"HandleSaveProjectAsync failed: {ex}");
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    MessageBox.Show($"Failed to save project: {ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                });
+            }
+        }
+
+        private async Task HandleSaveAsProjectAsync()
+        {
+            try
+            {
+                string? path = null;
+                
+                // Always show save dialog for Save As (this MUST be on UI thread)
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    path = await _fileDialog.ShowSaveFileDialogAsync(
+                        "Save Project As",
+                        string.IsNullOrEmpty(_currentProjectPath) ? "Untitled.pmproj" : Path.GetFileName(_currentProjectPath),
+                        "Projection Mapper Project (*.pmproj)|*.pmproj|All files|*.*");
+                });
+                
+                if (string.IsNullOrEmpty(path)) return; // User cancelled
+
+                // Build project model from current state - MUST be done on UI thread
+                ProjectModel? project = null;
+                try
+                {
+                    // Ensure we're on UI thread when building project model
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        project = BuildProjectModel();
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"HandleSaveAsProjectAsync: BuildProjectModel failed: {ex}");
+                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
+                
+                if (project == null)
+                {
+                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
+                
+                // Save project on background thread to avoid blocking UI
+                bool success = false;
+                try
+                {
+                    success = await Task.Run(async () =>
+                    {
+                        return await _projectService.SaveAsync(project, path);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"HandleSaveAsProjectAsync: Save operation failed: {ex}");
+                    success = false;
+                }
+                
+                // Update UI based on result
+                if (success)
+                {
+                    _currentProjectPath = path;
+                    _vm.StatusText = $"Project saved to {Path.GetFileName(path)}";
+                    
+                    // Mark project as clean after successful save
+                    _vm.MarkProjectClean();
+                    UpdateWindowTitle();
+                }
+                else
+                {
+                    MessageBox.Show("Failed to save project. Check the logs for details.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"HandleSaveAsProjectAsync failed: {ex}");
+                MessageBox.Show($"Failed to save project: {ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task HandleLoadProjectAsync()
+        {
+            try
+            {
+                string? path = null;
+                
+                // Show open file dialog (this MUST be on UI thread)
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    path = await _fileDialog.ShowOpenFileDialogAsync(
+                        "Open Project",
+                        "Projection Mapper Project (*.pmproj)|*.pmproj|All files|*.*");
+                });
+                
+                if (string.IsNullOrEmpty(path)) return; // User cancelled
+
+                // Load project
+                var project = await _projectService.LoadAsync(path);
+                
+                if (project == null)
+                {
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        MessageBox.Show("Failed to load project. The file may be corrupt or in an incompatible format.", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    });
+                    return;
+                }
+
+                // Clear current project state
+                await ClearCurrentProjectAsync();
+
+                // Apply loaded project
+                await ApplyLoadedProjectAsync(project);
+
+                // Update UI state (ensure on UI thread)
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    _currentProjectPath = path;
+                    _vm.StatusText = $"Project loaded from {Path.GetFileName(path)}";
+                    
+                    // Mark project as clean after successful load
+                    _vm.MarkProjectClean();
+                    
+                    // Update window title
+                    UpdateWindowTitle();
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"HandleLoadProjectAsync failed: {ex}");
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    MessageBox.Show($"Failed to load project: {ex.Message}", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                });
+            }
+        }
+
+        private async Task HandleNewProjectAsync()
+        {
+            try
+            {
+                // Check if there are unsaved changes and prompt user
+                if (_vm.HasUnsavedChanges)
+                {
+                    var result = MessageBox.Show(
+                        "You have unsaved changes. Do you want to save your project before creating a new one?",
+                        "Unsaved Changes",
+                        MessageBoxButton.YesNoCancel,
+                        MessageBoxImage.Question);
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        // User wants to save first
+                        await HandleSaveProjectAsync();
+                        
+                        // If save failed or was cancelled, don't proceed with new project
+                        if (_vm.HasUnsavedChanges)
+                        {
+                            return; // Save failed or was cancelled
+                        }
+                    }
+                    else if (result == MessageBoxResult.Cancel)
+                    {
+                        // User cancelled - don't create new project
+                        return;
+                    }
+                    // If result is No, continue with creating new project (discard changes)
+                }
+
+                // Clear current project state
+                await ClearCurrentProjectAsync();
+
+                // Reset to a clean project state
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    // Clear the current project path
+                    _currentProjectPath = null;
+                    
+                    // Reset view model to clean state
+                    _vm.ImportedVideos.Clear();
+                    _vm.SelectedImportedVideo = null;
+                    _vm.SelectedMeshLayer = null;
+                    
+                    // Reset global settings to defaults
+                    _rendererManager.ShowMeshOverlay = true;
+                    _vm.InputZoom = 1.0;
+                    _vm.OutputZoom = 1.0;
+                    
+                    // Reset UI checkboxes to defaults
+                    if (PART_ShowGridCheckbox != null) PART_ShowGridCheckbox.IsChecked = false;
+                    if (PART_GlobalShowMeshOverlayCheckbox != null) PART_GlobalShowMeshOverlayCheckbox.IsChecked = true;
+                    if (PART_ShowMeshOverlayCheckbox != null) PART_ShowMeshOverlayCheckbox.IsChecked = true;
+                    
+                    // Clear any monitor selections
+                    if (PART_MonitorCombo != null) PART_MonitorCombo.SelectedIndex = -1;
+                    
+                    // Mark as clean and update UI
+                    _vm.MarkProjectClean();
+                    _vm.StatusText = "New project created";
+                    UpdateWindowTitle();
+                    
+                }, DispatcherPriority.Normal);
+
+                // Hide all fullscreen windows
+                foreach (var monitorIndex in _previewMonitorStates.Keys.ToList())
+                {
+                    try
+                    {
+                        _rendererManager.HideFullScreenWindow(monitorIndex);
+                        _previewMonitorStates[monitorIndex] = false;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"HandleNewProjectAsync: Failed to hide fullscreen: {ex}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"HandleNewProjectAsync failed: {ex}");
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    MessageBox.Show($"Failed to create new project: {ex.Message}", "New Project Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                });
+            }
+        }
+
+        private ProjectModel BuildProjectModel()
+        {
+            try
+            {
+                var project = new ProjectModel
+                {
+                    Name = _vm.ActiveProject?.Name ?? "Untitled Project",
+                    CreatedAt = _vm.ActiveProject?.CreatedAt ?? DateTime.UtcNow,
+                    ShowMeshOverlay = _rendererManager.ShowMeshOverlay,
+                    ShowCoordinateGrid = PART_ShowGridCheckbox?.IsChecked ?? false,
+                    InputZoom = _vm.InputZoom,
+                    OutputZoom = _vm.OutputZoom
+                };
+
+                // Convert imported videos to serializable format
+                // We need to copy all data on the UI thread to avoid cross-thread access violations
+                foreach (var imported in _vm.ImportedVideos)
+                {
+                    try
+                    {
+                        if (imported?.HostLayer == null) continue;
+
+                        var importedData = new ImportedVideoData
+                        {
+                            Id = imported.HostLayer.Id ?? Guid.NewGuid().ToString("N"),
+                            Name = imported.Name ?? string.Empty,
+                            SourcePath = imported.SourcePath ?? string.Empty,
+                            TargetMonitorIndex = imported.HostLayer.TargetMonitorIndex,
+                            PlayAudio = imported.PlayAudio,
+                            Visible = imported.HostLayer.Visible
+                        };
+
+                        // Convert mesh layers
+                        foreach (var meshVm in imported.MeshLayers)
+                        {
+                            try
+                            {
+                                if (meshVm?.Model == null) continue;
+
+                                var meshData = new MeshLayerData
+                                {
+                                    Id = meshVm.Model.Id ?? Guid.NewGuid().ToString("N"),
+                                    Name = meshVm.Name ?? string.Empty,
+                                    SourceId = meshVm.Model.SourceId ?? string.Empty,
+                                    X = meshVm.X,
+                                    Y = meshVm.Y,
+                                    Width = meshVm.Width,
+                                    Height = meshVm.Height,
+                                    Opacity = meshVm.Opacity,
+                                    Visible = meshVm.Visible,
+                                    RotationDegrees = meshVm.RotationDegrees,
+                                    TargetMonitorIndex = meshVm.Model.TargetMonitorIndex,
+                                    ShowOverlay = meshVm.Model.ShowOverlay
+                                };
+
+                                // Convert mesh points to flat array - read from the model arrays directly
+                                var meshPts = meshVm.Model.MeshPoints;
+                                if (meshPts != null && meshPts.Length >= 4)
+                                {
+                                    meshData.MeshPoints = new float[]
+                                    {
+                                        meshPts[0].X, meshPts[0].Y,
+                                        meshPts[1].X, meshPts[1].Y,
+                                        meshPts[2].X, meshPts[2].Y,
+                                        meshPts[3].X, meshPts[3].Y
+                                    };
+                                }
+
+                                var outputPts = meshVm.Model.OutputMeshPoints;
+                                if (outputPts != null && outputPts.Length >= 4)
+                                {
+                                    meshData.OutputMeshPoints = new float[]
+                                    {
+                                        outputPts[0].X, outputPts[0].Y,
+                                        outputPts[1].X, outputPts[1].Y,
+                                        outputPts[2].X, outputPts[2].Y,
+                                        outputPts[3].X, outputPts[3].Y
+                                    };
+                                }
+
+                                importedData.MeshLayers.Add(meshData);
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"BuildProjectModel: Failed to convert mesh layer: {ex}");
+                            }
+                        }
+
+                        project.ImportedVideos.Add(importedData);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"BuildProjectModel: Failed to convert imported video: {ex}");
+                    }
+                }
+
+                return project;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"BuildProjectModel failed: {ex}");
+                throw;
+            }
+        }
+
+        private async Task ClearCurrentProjectAsync()
+        {
+            try
+            {
+                // Stop and unregister all video layers
+                foreach (var imported in _vm.ImportedVideos.ToList())
+                {
+                    try
+                    {
+                        if (imported.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
+                        {
+                            await _videoService.UnregisterLayerAsync(imported.HostLayer.Id);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ClearCurrentProjectAsync: Failed to unregister layer: {ex}");
+                    }
+                }
+
+                // Clear UI collections
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    _vm.ImportedVideos.Clear();
+                    _vm.SelectedImportedVideo = null;
+                    _vm.SelectedMeshLayer = null;
+                }, DispatcherPriority.Normal);
+
+                // Hide all fullscreen windows
+                foreach (var monitorIndex in _previewMonitorStates.Keys.ToList())
+                {
+                    try
+                    {
+                        _rendererManager.HideFullScreenWindow(monitorIndex);
+                        _previewMonitorStates[monitorIndex] = false;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ClearCurrentProjectAsync: Failed to hide fullscreen: {ex}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ClearCurrentProjectAsync failed: {ex}");
+            }
+        }
+
+        private async Task ApplyLoadedProjectAsync(ProjectModel project)
+        {
+            try
+            {
+                // Restore global settings
+                _rendererManager.ShowMeshOverlay = project.ShowMeshOverlay;
+                _vm.InputZoom = project.InputZoom;
+                _vm.OutputZoom = project.OutputZoom;
+                
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (PART_ShowGridCheckbox != null) PART_ShowGridCheckbox.IsChecked = project.ShowCoordinateGrid;
+                    if (PART_GlobalShowMeshOverlayCheckbox != null) PART_GlobalShowMeshOverlayCheckbox.IsChecked = project.ShowMeshOverlay;
+                }, DispatcherPriority.Normal);
+
+                // Restore imported videos
+                foreach (var importedData in project.ImportedVideos)
+                {
+                    try
+                    {
+                        // Check if source file exists
+                        if (!File.Exists(importedData.SourcePath))
+                        {
+                            Debug.WriteLine($"ApplyLoadedProjectAsync: Source file not found: {importedData.SourcePath}");
+                            MessageBox.Show($"Source file not found: {importedData.SourcePath}\n\nThis video will be skipped.", "Missing File", MessageBoxButton.OK, MessageBoxImage.Warning);
+                            continue;
+                        }
+
+                        // Create ImportedVideoViewModel
+                        var importedVm = new ImportedVideoViewModel(importedData.Id, importedData.Name, importedData.SourcePath);
+
+                        // Create host layer
+                        var hostLayer = new LayerModel
+                        {
+                            Id = importedData.Id,
+                            Name = importedData.Name,
+                            SourcePath = importedData.SourcePath,
+                            TargetMonitorIndex = importedData.TargetMonitorIndex,
+                            PlayAudio = importedData.PlayAudio,
+                            Visible = importedData.Visible,
+                            PreviewOnly = importedData.MeshLayers.Count > 0 // Preview only if meshes exist
+                        };
+
+                        // Determine decode size
+                        var hostForLayer = PART_InputHost ?? PART_OutputHost;
+                        var w = (int)Math.Max(1, hostForLayer.ActualWidth);
+                        var h = (int)Math.Max(1, hostForLayer.ActualHeight);
+                        if (w == 0 || h == 0) { w = 1280; h = 720; }
+                        hostLayer.X = 0; hostLayer.Y = 0; hostLayer.Width = w; hostLayer.Height = h;
+
+                        // Register decoder
+                        await _videoService.RegisterLayerAsync(hostLayer);
+                        importedVm.HostLayer = hostLayer;
+                        importedVm.NotifyHostLayerChanged();
+
+                        // Restore mesh layers
+                        foreach (var meshData in importedData.MeshLayers)
+                        {
+                            var layerModel = new LayerModel
+                            {
+                                Id = meshData.Id,
+                                Name = meshData.Name,
+                                SourceId = meshData.SourceId,
+                                X = meshData.X,
+                                Y = meshData.Y,
+                                Width = meshData.Width,
+                                Height = meshData.Height,
+                                Opacity = meshData.Opacity,
+                                Visible = meshData.Visible,
+                                RotationDegrees = meshData.RotationDegrees,
+                                TargetMonitorIndex = meshData.TargetMonitorIndex,
+                                ShowOverlay = meshData.ShowOverlay
+                            };
+
+                            // Restore mesh points from flat array
+                            if (meshData.MeshPoints != null && meshData.MeshPoints.Length >= 8)
+                            {
+                                layerModel.MeshPoints[0] = new Vector2(meshData.MeshPoints[0], meshData.MeshPoints[1]);
+                                layerModel.MeshPoints[1] = new Vector2(meshData.MeshPoints[2], meshData.MeshPoints[3]);
+                                layerModel.MeshPoints[2] = new Vector2(meshData.MeshPoints[4], meshData.MeshPoints[5]);
+                                layerModel.MeshPoints[3] = new Vector2(meshData.MeshPoints[6], meshData.MeshPoints[7]);
+                            }
+
+                            if (meshData.OutputMeshPoints != null && meshData.OutputMeshPoints.Length >= 8)
+                            {
+                                layerModel.OutputMeshPoints[0] = new Vector2(meshData.OutputMeshPoints[0], meshData.OutputMeshPoints[1]);
+                                layerModel.OutputMeshPoints[1] = new Vector2(meshData.OutputMeshPoints[2], meshData.OutputMeshPoints[3]);
+                                layerModel.OutputMeshPoints[2] = new Vector2(meshData.OutputMeshPoints[4], meshData.OutputMeshPoints[5]);
+                                layerModel.OutputMeshPoints[3] = new Vector2(meshData.OutputMeshPoints[6], meshData.OutputMeshPoints[7]);
+                            }
+
+                            var meshVm = new LayerViewModel(layerModel);
+                            importedVm.MeshLayers.Add(meshVm);
+
+                            // Register mesh layer with video service
+                            await _videoService.RegisterMeshLayerAsync(layerModel);
+                        }
+
+                        // Add to UI
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            _vm.ImportedVideos.Add(importedVm);
+                            
+                            // Update monitor combo if this is the first imported video
+                            if (_vm.ImportedVideos.Count == 1)
+                            {
+                                _vm.SelectedImportedVideo = importedVm;
+                                if (PART_MonitorCombo != null && importedVm.HostLayer != null)
+                                {
+                                    PART_MonitorCombo.SelectedIndex = importedVm.HostLayer.TargetMonitorIndex >= 0 ? importedVm.HostLayer.TargetMonitorIndex : -1;
+                                }
+                            }
+                        }, DispatcherPriority.Normal);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ApplyLoadedProjectAsync: Failed to load imported video {importedData.Name}: {ex}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ApplyLoadedProjectAsync failed: {ex}");
+            }
+        }
+
+        private record MonitorInfo(int Width, int Height, int Left, int Top);
         private static List<MonitorInfo> EnumerateMonitors()
         {
             try

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Windows.Input;
 using ProjectionMapper.Models;
 using System.Numerics;
+using ProjectionMapper.Services;
 
 namespace ProjectionMapper.ViewModels
 {
@@ -14,15 +15,47 @@ namespace ProjectionMapper.ViewModels
     public class MainWindowViewModel : BaseViewModel
     {
         private ProjectModel? _project;
+        private readonly UndoRedoService _undoRedoService;
+
+        // Track whether the project has unsaved changes
+        private bool _hasUnsavedChanges;
+        public bool HasUnsavedChanges
+        {
+            get => _hasUnsavedChanges;
+            set => SetProperty(ref _hasUnsavedChanges, value);
+        }
 
         public MainWindowViewModel()
         {
+            // Initialize undo/redo service
+            _undoRedoService = new UndoRedoService();
+            _undoRedoService.CanUndoChanged += (s, e) => 
+            {
+                (UndoCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            };
+            _undoRedoService.CanRedoChanged += (s, e) => 
+            {
+                (RedoCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            };
+            
+            // Track changes via undo/redo service - if there are actions, the project is dirty
+            _undoRedoService.ActionRecorded += (s, e) => 
+            {
+                HasUnsavedChanges = true;
+            };
+            
             // Start with an empty project
             _project = new ProjectModel { Name = "Untitled Project" };
             Projects = new ObservableCollection<ProjectModel> { _project };
 
             // Collection of imported videos (parent nodes)
             ImportedVideos = new ObservableCollection<ImportedVideoViewModel>();
+            
+            // Track changes when imported videos collection changes
+            ImportedVideos.CollectionChanged += (s, e) => 
+            {
+                HasUnsavedChanges = true;
+            };
 
             AddSurfaceCommand = new RelayCommand(ExecuteAddSurface, CanExecuteAddSurface);
             RemoveSurfaceCommand = new RelayCommand(ExecuteRemoveSurface, CanExecuteRemoveSurface);
@@ -42,10 +75,39 @@ namespace ProjectionMapper.ViewModels
             // Add imported deletion command
             DeleteImportedCommand = new RelayCommand(ExecuteDeleteImportedCommand, p => p is ImportedVideoViewModel);
 
+            // Undo/Redo commands
+            UndoCommand = new RelayCommand(_ => _undoRedoService.Undo(), _ => _undoRedoService.CanUndo);
+            RedoCommand = new RelayCommand(_ => _undoRedoService.Redo(), _ => _undoRedoService.CanRedo);
+
+            // File operation commands  
+            SaveProjectCommand = new AsyncRelayCommand(async _ =>
+            {
+                if (SaveProjectRequested != null)
+                    await SaveProjectRequested.Invoke();
+            }, _ => true); // Always allow save
+            SaveAsProjectCommand = new AsyncRelayCommand(async _ =>
+            {
+                if (SaveAsProjectRequested != null)
+                    await SaveAsProjectRequested.Invoke();
+            }, _ => true); // Always allow save as
+            LoadProjectCommand = new AsyncRelayCommand(async _ =>
+            {
+                if (LoadProjectRequested != null)
+                    await LoadProjectRequested.Invoke();
+            });
+            NewProjectCommand = new AsyncRelayCommand(async _ =>
+            {
+                if (NewProjectRequested != null)
+                    await NewProjectRequested.Invoke();
+            });
+            PreviewCommand = new RelayCommand(_ => PreviewRequested?.Invoke());
+
             // sensible defaults for zoom
             InputZoom = 1.0;
             OutputZoom = 1.0;
         }
+
+        public UndoRedoService UndoRedoService => _undoRedoService;
 
         public ObservableCollection<ProjectModel> Projects { get; }
 
@@ -112,6 +174,16 @@ namespace ProjectionMapper.ViewModels
         // Delete imported video command
         public ICommand DeleteImportedCommand { get; }
 
+        // Undo/Redo commands
+        public ICommand UndoCommand { get; }
+        public ICommand RedoCommand { get; }
+
+        // File operations
+        public ICommand SaveProjectCommand { get; }
+        public ICommand SaveAsProjectCommand { get; }
+        public ICommand LoadProjectCommand { get; }
+        public ICommand NewProjectCommand { get; }
+
         // Events surfaced to the host window so it can perform file dialogs / services
         public event Action? ImportRequested;
         public event Action? PreviewRequested;
@@ -123,6 +195,28 @@ namespace ProjectionMapper.ViewModels
 
         // New event: notify host to register mesh layer with services when created
         public event Action<LayerModel?>? MeshLayerCreated;
+
+        // New events for file operations
+        public event Func<System.Threading.Tasks.Task>? SaveProjectRequested;
+        public event Func<System.Threading.Tasks.Task>? SaveAsProjectRequested;
+        public event Func<System.Threading.Tasks.Task>? LoadProjectRequested;
+        public event Func<System.Threading.Tasks.Task>? NewProjectRequested;
+
+        /// <summary>
+        /// Mark the project as clean (no unsaved changes). Call this after successful save or load operations.
+        /// </summary>
+        public void MarkProjectClean()
+        {
+            HasUnsavedChanges = false;
+        }
+
+        /// <summary>
+        /// Mark the project as dirty (has unsaved changes). Call this when project is modified.
+        /// </summary>
+        public void MarkProjectDirty()
+        {
+            HasUnsavedChanges = true;
+        }
 
         // Zoom properties bound to the UI sliders
         private double _inputZoom;
@@ -164,6 +258,7 @@ namespace ProjectionMapper.ViewModels
         private void ExecuteImportCommand(object? _)
         {
             ImportRequested?.Invoke();
+            // Importing will trigger collection changed which automatically marks dirty
         }
 
         private void ExecutePreviewCommand(object? _)
@@ -277,6 +372,18 @@ namespace ProjectionMapper.ViewModels
             catch { }
 
             var vm = new LayerViewModel(layerModel);
+            
+            // Record undo action for mesh creation
+            try
+            {
+                var action = new CreateMeshAction(SelectedImportedVideo, vm, MeshLayerCreated);
+                _undoRedoService.RecordAction(action);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Failed to record create mesh action: {ex}");
+            }
+
             SelectedImportedVideo.MeshLayers.Add(vm);
             SelectedMeshLayer = vm;
 
@@ -299,6 +406,18 @@ namespace ProjectionMapper.ViewModels
             if (SelectedImportedVideo == null || SelectedMeshLayer == null) return;
 
             var removed = SelectedMeshLayer;
+            
+            // Record undo action for mesh deletion
+            try
+            {
+                var action = new DeleteMeshAction(SelectedImportedVideo, removed, MeshLayerCreated);
+                _undoRedoService.RecordAction(action);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Failed to record delete mesh action: {ex}");
+            }
+
             SelectedImportedVideo.MeshLayers.Remove(SelectedMeshLayer);
 
             // if no remaining meshes reference the host, restore host preview behavior
@@ -393,6 +512,18 @@ namespace ProjectionMapper.ViewModels
         {
             var imported = param as ImportedVideoViewModel;
             DeleteImportedRequested?.Invoke(imported);
+        }
+
+        private void ExecuteSaveProjectCommand(object? _)
+        {
+            // Raise the save project event
+            SaveProjectRequested?.Invoke();
+        }
+
+        private void ExecuteLoadProjectCommand(object? _)
+        {
+            // Raise the load project event
+            LoadProjectRequested?.Invoke();
         }
     }
 }
