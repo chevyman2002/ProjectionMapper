@@ -32,6 +32,12 @@ namespace ProjectionMapper.Services
         // Video events
         public event Action<BitmapSource>? FrameDecoded;
         public event Action<BitmapSource, TimeSpan>? FrameDecodedWithTimestamp;
+        
+        /// <summary>
+        /// Event raised when the video reaches EOF (end of file).
+        /// This event is fired once per playback cycle (before looping, if enabled).
+        /// </summary>
+        public event Action? VideoEnded;
 
         // Audio control properties
         private bool _audioEnabled = false;
@@ -216,6 +222,16 @@ namespace ProjectionMapper.Services
         // Mark video as completed when the session ends (EOF reached)
         _isAtEnd = true;
         Debug.WriteLine("FFmpegUnifiedDecoder: Video reached end of file");
+
+        // Fire the VideoEnded event to notify listeners
+        try
+        {
+            VideoEnded?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"FFmpegUnifiedDecoder: Error invoking VideoEnded event: {ex}");
+        }
 
    // If not looping, exit
      if (!Loop) break;
