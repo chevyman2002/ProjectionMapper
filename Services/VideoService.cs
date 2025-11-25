@@ -182,6 +182,20 @@ namespace ProjectionMapper.Services
                 });
             };
 
+            // Subscribe to video end event for playlist support
+            decoder.VideoEnded += () =>
+            {
+                try
+                {
+                    Debug.WriteLine($"VideoService: Video ended for layer {layerKey}");
+                    OnVideoCompleted(layerKey);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"VideoService: Error handling video end for {layerKey}: {ex}");
+                }
+            };
+
             // Preserve existing last frame if any
             BitmapSource? existingLast = null;
             if (_decoders.TryGetValue(layerKey, out var existingTuple)) existingLast = existingTuple.lastFrame;
@@ -628,6 +642,20 @@ namespace ProjectionMapper.Services
                             Debug.WriteLine($"VideoService.ResumeLayerAsync: Error processing frame for {layerId}: {ex}");
                         }
                     });
+                };
+
+                // Subscribe to video end event for playlist support
+                decoder.VideoEnded += () =>
+                {
+                    try
+                    {
+                        Debug.WriteLine($"VideoService.ResumeLayerAsync: Video ended for layer {layerId}");
+                        OnVideoCompleted(layerId);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"VideoService.ResumeLayerAsync: Error handling video end for {layerId}: {ex}");
+                    }
                 };
 
                 _decoders.AddOrUpdate(layerId, (decoder, cts, layer, t.lastFrame, false, savedPosition), (k, old) => (decoder, cts, layer, old.lastFrame, false, savedPosition));

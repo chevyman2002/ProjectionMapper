@@ -553,17 +553,38 @@ namespace ProjectionMapper.Services
                     Debug.WriteLine($"PlaylistService.OnVideoCompleted: All videos in group '{currentGroup?.Name}' completed, advancing to next group");
                     
                     // Advance to next group asynchronously
-                    _ = Task.Run(async () =>
+                    // Using Task.Run to avoid blocking the caller, with proper error handling
+                    Task.Run(async () =>
                     {
                         try
                         {
                             await AdvanceToNextGroupAsync().ConfigureAwait(false);
                         }
+                        catch (OperationCanceledException)
+                        {
+                            // Expected when playlist is stopped
+                            Debug.WriteLine("PlaylistService.OnVideoCompleted: Advance operation cancelled");
+                        }
                         catch (Exception ex)
                         {
                             Debug.WriteLine($"PlaylistService.OnVideoCompleted: Error advancing to next group: {ex}");
+                            // Try to recover by restarting the playlist from the beginning
+                            try
+                            {
+                                await RestartPlaylistAsync().ConfigureAwait(false);
+                            }
+                            catch (Exception ex2)
+                            {
+                                Debug.WriteLine($"PlaylistService.OnVideoCompleted: Recovery failed: {ex2}");
+                            }
                         }
-                    });
+                    }).ContinueWith(t =>
+                    {
+                        if (t.IsFaulted && t.Exception != null)
+                        {
+                            Debug.WriteLine($"PlaylistService.OnVideoCompleted: Unhandled task exception: {t.Exception}");
+                        }
+                    }, TaskContinuationOptions.OnlyOnFaulted);
                 }
             }
             catch (Exception ex)
