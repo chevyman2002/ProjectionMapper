@@ -2,13 +2,23 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows10.0.26100.0</TargetFramework>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
-    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
     <ApplicationIcon>ProjectionMapper.ico</ApplicationIcon>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- Add runtime configuration to prevent stack corruption -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <!-- Enable better error reporting for startup issues -->
+    <ErrorReport>queue</ErrorReport>
+    <DebugType>portable</DebugType>
+    <!-- Add Large Address Aware flag to prevent memory issues -->
+    <LargeAddressAware>true</LargeAddressAware>
   </PropertyGroup>
 
   <ItemGroup>
@@ -32,10 +42,6 @@
            <PackageReference Include="Vortice.D3DCompiler" Version="2.17.0" />
          Confirm the exact versions via nuget.org or Visual Studio's package manager.
     -->
-  </ItemGroup>
-
-  <ItemGroup>
-    <Folder Include="ToDo\" />
   </ItemGroup>
 
   <ItemGroup>

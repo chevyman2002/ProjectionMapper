@@ -57,6 +57,7 @@ namespace ProjectionMapper.Views
         // Collections for tracking all mesh layer visual elements
         private readonly List<System.Windows.Shapes.Polygon> _allMeshPolygons = new();
         private readonly List<(Thumb TL, Thumb TR, Thumb BL, Thumb BR, LayerViewModel Layer)> _allMeshHandles = new();
+        private readonly List<System.Windows.Shapes.Ellipse> _allMeshIndicators = new();
 
         // Track mesh point values at the start of a drag operation for undo/redo
         private Dictionary<int, Vector2> _meshPointsBeforeDrag = new();
@@ -262,20 +263,37 @@ namespace ProjectionMapper.Views
                 _videoService = null;
             }
 
+
             // Use injected VideoService if available
             _videoService = VideoService;
 
             if (_videoService != null && newVm != null)
             {
-                // subscribe to frame events and only show frames for selected layer
+                // subscribe to frame events - match frames by SourceId since FrameDecoded fires with the source layer ID
+                var sourceIdToMatch = newVm.Model?.SourceId ?? newVm.Id;
                 _frameHandler = (layerId, bmp) =>
                 {
-                    if (!_isDisposed && layerId == newVm.Id)
+                    if (!_isDisposed && layerId == sourceIdToMatch)
                     {
                         SafeUpdateInputImage(bmp);
                     }
                 };
                 _videoService.FrameDecoded += _frameHandler;
+
+                // CRITICAL FIX: When switching to a new layer, immediately try to show the last cached frame
+                // This ensures the preview shows even when video is paused
+                try
+                {
+                    if (_videoService.TryGetLastFrame(sourceIdToMatch, out var lastFrame) && lastFrame != null)
+                    {
+                        SafeUpdateInputImage(lastFrame);
+                        System.Diagnostics.Debug.WriteLine($"MeshEditorControl: Loaded cached frame for {sourceIdToMatch}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"MeshEditorControl: Failed to get cached frame: {ex.Message}");
+                }
             }
             else
             {
@@ -392,6 +410,9 @@ namespace ProjectionMapper.Views
                 {
                     try 
                     { 
+                        // NOTE: Visible property only affects overlay visibility, NOT video rendering
+                        // Video content always renders - only the bounding box/handles are hidden
+
                         if (!Dispatcher.CheckAccess())
                         {
                             Dispatcher.BeginInvoke(() => 
@@ -456,7 +477,10 @@ namespace ProjectionMapper.Views
         {
             if (_isDisposed || _suppressVmRebind) return;
 
-            if (e == null || e.PropertyName == nameof(LayerViewModel.MeshPoints) || e.PropertyName == nameof(LayerViewModel.OutputMeshPoints) || string.IsNullOrEmpty(e.PropertyName))
+            if (e == null || e.PropertyName == nameof(LayerViewModel.MeshPoints) || 
+                e.PropertyName == nameof(LayerViewModel.OutputMeshPoints) || 
+                e.PropertyName == nameof(LayerViewModel.ShowOverlay) ||
+                string.IsNullOrEmpty(e.PropertyName))
             {
                 // use BeginInvoke to avoid potential cross-thread issues
                 try 
@@ -535,6 +559,21 @@ namespace ProjectionMapper.Views
             };
 
             _videoService.FrameDecoded += _serviceHandlerForSource;
+
+            // CRITICAL FIX: Immediately try to show the last cached frame
+            // This ensures the preview shows even when video is paused
+            try
+            {
+                if (_videoService.TryGetLastFrame(newId, out var lastFrame) && lastFrame != null)
+                {
+                    SafeUpdateInputImage(lastFrame);
+                    System.Diagnostics.Debug.WriteLine($"MeshEditorControl: Loaded cached frame for source {newId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"MeshEditorControl: Failed to get cached frame for source: {ex.Message}");
+            }
         }
 
         private void PART_Canvas_ManipulationDelta(object sender, ManipulationDeltaEventArgs e)
@@ -701,12 +740,15 @@ namespace ProjectionMapper.Views
                 }
                 else
                 {
-                    // Show the selected layer's overlays with handles for editing
-                    PART_InputPolygon.Visibility = Visibility.Visible;
-                    PART_InputHandle_TL.Visibility = Visibility.Visible;
-                    PART_InputHandle_TR.Visibility = Visibility.Visible;
-                    PART_InputHandle_BL.Visibility = Visibility.Visible;
-                    PART_InputHandle_BR.Visibility = Visibility.Visible;
+                    // Show the selected layer's overlays with handles for editing (only if ShowOverlay is enabled)
+                    var showOverlay = SelectedLayer.ShowOverlay;
+                    var overlayVisibility = showOverlay ? Visibility.Visible : Visibility.Collapsed;
+                    
+                    PART_InputPolygon.Visibility = overlayVisibility;
+                    PART_InputHandle_TL.Visibility = overlayVisibility;
+                    PART_InputHandle_TR.Visibility = overlayVisibility;
+                    PART_InputHandle_BL.Visibility = overlayVisibility;
+                    PART_InputHandle_BR.Visibility = overlayVisibility;
 
                     // Hide output overlays in the input preview - output is shown in the output host
                     PART_OutputRect.Visibility = Visibility.Collapsed;
@@ -768,6 +810,13 @@ namespace ProjectionMapper.Views
                     try { PART_Canvas.Children.Remove(br); } catch { }
                 }
                 _allMeshHandles.Clear();
+
+                // Remove ellipse indicators from canvas
+                foreach (var indicator in _allMeshIndicators)
+                {
+                    try { PART_Canvas.Children.Remove(indicator); } catch { }
+                }
+                _allMeshIndicators.Clear();
             }
             catch { }
         }
@@ -776,6 +825,10 @@ namespace ProjectionMapper.Views
         {
             try
             {
+                // Skip invisible layers or layers with ShowOverlay disabled
+                if (!layer.Visible) return;
+                if (!layer.ShowOverlay) return;
+
                 var pts = layer.MeshPoints;
                 if (pts == null || pts.Length < 4) return;
 
@@ -822,6 +875,7 @@ namespace ProjectionMapper.Views
                 Canvas.SetLeft(tlIndicator, corners[0].X - handleSize / 2);
                 Canvas.SetTop(tlIndicator, corners[0].Y - handleSize / 2);
                 PART_Canvas.Children.Add(tlIndicator);
+                _allMeshIndicators.Add(tlIndicator);
 
                 var trIndicator = new System.Windows.Shapes.Ellipse
                 {
@@ -832,6 +886,7 @@ namespace ProjectionMapper.Views
                 Canvas.SetLeft(trIndicator, corners[1].X - handleSize / 2);
                 Canvas.SetTop(trIndicator, corners[1].Y - handleSize / 2);
                 PART_Canvas.Children.Add(trIndicator);
+                _allMeshIndicators.Add(trIndicator);
 
                 var blIndicator = new System.Windows.Shapes.Ellipse
                 {
@@ -842,6 +897,7 @@ namespace ProjectionMapper.Views
                 Canvas.SetLeft(blIndicator, corners[2].X - handleSize / 2);
                 Canvas.SetTop(blIndicator, corners[2].Y - handleSize / 2);
                 PART_Canvas.Children.Add(blIndicator);
+                _allMeshIndicators.Add(blIndicator);
 
                 var brIndicator = new System.Windows.Shapes.Ellipse
                 {
@@ -852,6 +908,7 @@ namespace ProjectionMapper.Views
                 Canvas.SetLeft(brIndicator, corners[3].X - handleSize / 2);
                 Canvas.SetTop(brIndicator, corners[3].Y - handleSize / 2);
                 PART_Canvas.Children.Add(brIndicator);
+                _allMeshIndicators.Add(brIndicator);
             }
             catch { }
         }
@@ -1019,6 +1076,12 @@ namespace ProjectionMapper.Views
 
                 // Only update the selected layer's external overlay in real-time, not all layers
                 UpdateExternalOverlayForLayer(vm);
+
+                // Force re-render mesh layer with cached frame (important for paused videos)
+                if (_videoService != null && !string.IsNullOrEmpty(vm.Id))
+                {
+                    _videoService.RefreshMeshLayerRendering(vm.Id);
+                }
             }
             catch { }
         }
@@ -1034,10 +1097,12 @@ namespace ProjectionMapper.Views
 
                 var targetMonitor = layer.Model.TargetMonitorIndex;
 
+                // Check both ShowOverlay and Visible properties - both must be true to show overlay
                 var showOverlayPref = layer.Model.ShowOverlay;
-                if (!showOverlayPref) 
+                var isVisible = layer.Model.Visible;
+                if (!showOverlayPref || !isVisible) 
                 {
-                    // Remove overlay if disabled
+                    // Remove overlay if disabled or hidden
                     try 
                     { 
                         _rendererManager.RemoveMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, layerId); 
@@ -1046,22 +1111,8 @@ namespace ProjectionMapper.Views
                     return;
                 }
 
-                // Choose which mesh points to use for external overlay:
-                // If OutputMeshPoints have been modified from defaults (not all corners at 0,0,1,1), use them
-                // Otherwise, use MeshPoints for the overlay
-                Vector2[]? meshPointsToUse = null;
-                var outputPts = layer.OutputMeshPoints;
-                var inputPts = layer.MeshPoints;
-
-                // Check if OutputMeshPoints are still at default positions (indicating they haven't been edited in output pane)
-                bool outputPtsAreDefault = (outputPts != null && outputPts.Length >= 4 &&
-                    IsPointApproximately(outputPts[0], new Vector2(0f, 0f)) &&
-                    IsPointApproximately(outputPts[1], new Vector2(1f, 0f)) &&
-                    IsPointApproximately(outputPts[2], new Vector2(0f, 1f)) &&
-                    IsPointApproximately(outputPts[3], new Vector2(1f, 1f)));
-
-                // If output points are at defaults, use input points; otherwise use output points
-                meshPointsToUse = outputPtsAreDefault ? inputPts : outputPts;
+                // Always use OutputMeshPoints for external overlays - they now have sensible defaults
+                var meshPointsToUse = layer.OutputMeshPoints;
 
                 // Map chosen mesh points to renderer coordinates
                 Point[]? quadForRenderer = null;

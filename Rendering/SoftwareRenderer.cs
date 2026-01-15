@@ -35,6 +35,25 @@ namespace ProjectionMapper.Rendering
             _layers.Clear();
         }
 
+        /// <summary>
+        /// Remove a layer from the composition. Call this when a layer is no longer needed.
+        /// </summary>
+        public void RemoveLayer(string layerId)
+        {
+            if (!string.IsNullOrEmpty(layerId))
+            {
+                _layers.TryRemove(layerId, out _);
+            }
+        }
+
+        /// <summary>
+        /// Clear all layers from composition.
+        /// </summary>
+        public void ClearAllLayers()
+        {
+            _layers.Clear();
+        }
+
         public Task InitializeAsync(int width, int height, CancellationToken token = default)
         {
             if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width));
@@ -142,6 +161,7 @@ namespace ProjectionMapper.Rendering
                     {
                         var entry = kv.Value;
                         if (entry.Frame == null) continue;
+
                         var frame = entry.Frame;
 
                         // CRITICAL: Verify frame is frozen before accessing from render thread
@@ -153,6 +173,20 @@ namespace ProjectionMapper.Rendering
 
                         try
                         {
+                            // Check if destQuad is the corners, if so, use rect drawing
+                            if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
+                            {
+                                var w = _width;
+                                var h = _height;
+                                if (Math.Abs(entry.DestQuad[0].X - 0) < 1 && Math.Abs(entry.DestQuad[0].Y - 0) < 1 &&
+                                    Math.Abs(entry.DestQuad[1].X - w) < 1 && Math.Abs(entry.DestQuad[1].Y - 0) < 1 &&
+                                    Math.Abs(entry.DestQuad[2].X - 0) < 1 && Math.Abs(entry.DestQuad[2].Y - h) < 1 &&
+                                    Math.Abs(entry.DestQuad[3].X - w) < 1 && Math.Abs(entry.DestQuad[3].Y - h) < 1)
+                                {
+                                    entry.DestQuad = null; // Use rect drawing for corners
+                                }
+                            }
+
                             if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
                             {
                                 try

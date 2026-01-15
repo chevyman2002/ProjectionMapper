@@ -3,7 +3,9 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              MinHeight="100" MinWidth="100">
     <Grid Background="Transparent">
-        <Canvas x:Name="PART_Canvas" Background="Transparent" IsHitTestVisible="True" Width="1920" Height="1080">
+        <!-- Canvas now stretches to fill available space instead of being fixed at 1920x1080 -->
+        <Canvas x:Name="PART_Canvas" Background="Transparent" IsHitTestVisible="True" 
+                HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
             <!-- Live preview of the cropped frame for the selected mesh -->
             <Image x:Name="PART_CroppedPreview" Stretch="Fill" Visibility="Collapsed" IsHitTestVisible="False" />
 

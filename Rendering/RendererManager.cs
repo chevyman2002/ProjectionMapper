@@ -28,6 +28,9 @@ namespace ProjectionMapper.Rendering
 
         // Per-monitor renderers for separate composition
         private readonly Dictionary<int, IRenderer> _monitorRenderers = new();
+        private readonly Dictionary<int, RenderLoop> _monitorRenderLoops = new();
+        // Track monitor renderer pixel sizes (width, height)
+        private readonly Dictionary<int, (int Width, int Height)> _monitorRendererSizes = new();
 
         public RendererManager(IRenderer renderer)
         {
@@ -64,8 +67,24 @@ namespace ProjectionMapper.Rendering
             {
                 BitmapSource? frame = null;
 
+                // Prefer monitor renderer size if available
+                if (monitorIndex.HasValue && _monitorRendererSizes.TryGetValue(monitorIndex.Value, out var monSize))
+                {
+                    double w = monSize.Width;
+                    double h = monSize.Height;
+                    if (w > 0 && h > 0)
+                    {
+                        var pts = new Point[4];
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            var p = normalized[i];
+                            pts[i] = new Point(p.X * w, p.Y * h);
+                        }
+                        return pts;
+                    }
+                }
+
                 // If a specific monitor index is requested and a fullscreen host exists for that monitor, prefer that host's current frame
-                // because the mapping should use the pixel space of the target display. Otherwise fall back to the main attached host.
                 if (monitorIndex.HasValue && _fullscreenWindows.TryGetValue(monitorIndex.Value, out var win) && win != null)
                 {
                     try { frame = win.HostControl?.CurrentFrame; }
@@ -73,7 +92,7 @@ namespace ProjectionMapper.Rendering
 
                     if (frame == null)
                     {
-                        // Use the canonical output size for the monitor renderer
+                        // Use the canonical output size for the main renderer
                         double w = OutputWidth > 0 ? OutputWidth : 0;
                         double h = OutputHeight > 0 ? OutputHeight : 0;
                         if (w > 0 && h > 0)
@@ -143,6 +162,7 @@ namespace ProjectionMapper.Rendering
 
             _renderLoop.Start();
             _started = true;
+            OutputWidth = width; OutputHeight = height;
         }
 
         public async Task StopAsync()
@@ -155,6 +175,21 @@ namespace ProjectionMapper.Rendering
                 await _renderLoop.StopAsync().ConfigureAwait(false);
                 _renderLoop = null;
             }
+
+            // Stop monitor render loops
+            foreach (var kv in _monitorRenderLoops.ToArray())
+            {
+                try { kv.Value.StopAsync().GetAwaiter().GetResult(); } catch { }
+                try { kv.Value.Dispose(); } catch { }
+            }
+            _monitorRenderLoops.Clear();
+
+            // Dispose monitor renderers
+            foreach (var kv in _monitorRenderers.ToArray())
+            {
+                try { kv.Value.Dispose(); } catch { }
+            }
+            _monitorRenderers.Clear();
 
             _started = false;
         }
@@ -196,16 +231,23 @@ namespace ProjectionMapper.Rendering
 
         private void OnMonitorFrameReady(int monitorIndex, BitmapSource? bmp)
         {
-            if (_fullscreenWindows.TryGetValue(monitorIndex, out var win) && win != null)
+            try
             {
-                if (bmp == null)
+                if (_fullscreenWindows.TryGetValue(monitorIndex, out var win) && win != null)
                 {
-                    InvokeOnUi(() => win.HostControl?.Clear());
+                    if (bmp == null)
+                    {
+                        InvokeOnUi(() => { try { win.HostControl?.Clear(); } catch { } });
+                    }
+                    else
+                    {
+                        InvokeOnUi(() => { try { win.HostControl?.SetFrame(bmp); } catch { } });
+                    }
                 }
-                else
-                {
-                    InvokeOnUi(() => win.HostControl?.SetFrame(bmp));
-                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"OnMonitorFrameReady failed for monitor {monitorIndex}: {ex}");
             }
         }
 
@@ -249,6 +291,7 @@ namespace ProjectionMapper.Rendering
 
         /// <summary>
         /// Add a mesh overlay for a specific layer to a monitor. Multiple overlays can be added and all will be displayed.
+        /// When a specific monitorIndex is provided, the overlay is added to BOTH the main preview host AND the target monitor.
         /// </summary>
         public void AddMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints, string layerId)
         {
@@ -256,6 +299,17 @@ namespace ProjectionMapper.Rendering
 
             try
             {
+                // ALWAYS add to main host for the output preview pane
+                // Remove any existing overlay for this layer from main host
+                _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
+                
+                // Add the new overlay to main host
+                _mainHostMeshOverlays.Add((quadPoints, showPoints, layerId));
+                
+                // Update the main host display
+                RefreshMeshOverlaysForMainHost();
+
+                // ALSO add to the specific monitor if one is specified
                 if (monitorIndex.HasValue)
                 {
                     if (!_monitorMeshOverlays.ContainsKey(monitorIndex.Value))
@@ -270,28 +324,23 @@ namespace ProjectionMapper.Rendering
                     // Update the display
                     RefreshMeshOverlaysForMonitor(monitorIndex.Value);
                 }
-                else
-                {
-                    // Remove any existing overlay for this layer
-                    _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
-                    
-                    // Add the new overlay
-                    _mainHostMeshOverlays.Add((quadPoints, showPoints, layerId));
-
-                    // Update the display
-                    RefreshMeshOverlaysForMainHost();
-                }
             }
             catch (Exception ex) { Debug.WriteLine($"AddMeshOverlayForMonitor failed: {ex}"); }
         }
 
         /// <summary>
         /// Remove a mesh overlay for a specific layer from a monitor.
+        /// Removes from BOTH the main preview host AND the specified target monitor.
         /// </summary>
         public void RemoveMeshOverlayForMonitor(int? monitorIndex, string layerId)
         {
             try
             {
+                // ALWAYS remove from main host for the output preview pane
+                _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
+                RefreshMeshOverlaysForMainHost();
+
+                // ALSO remove from the specific monitor if one is specified
                 if (monitorIndex.HasValue)
                 {
                     if (_monitorMeshOverlays.TryGetValue(monitorIndex.Value, out var overlays))
@@ -300,10 +349,19 @@ namespace ProjectionMapper.Rendering
                         RefreshMeshOverlaysForMonitor(monitorIndex.Value);
                     }
                 }
-                else
+                
+                // Also try to remove from ALL monitors in case the target monitor changed
+                foreach (var kv in _monitorMeshOverlays.ToArray())
                 {
-                    _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
-                    RefreshMeshOverlaysForMainHost();
+                    if (kv.Value != null)
+                    {
+                        int countBefore = kv.Value.Count;
+                        kv.Value.RemoveAll(x => x.LayerId == layerId);
+                        if (kv.Value.Count != countBefore)
+                        {
+                            RefreshMeshOverlaysForMonitor(kv.Key);
+                        }
+                    }
                 }
             }
             catch (Exception ex) { Debug.WriteLine($"RemoveMeshOverlayForMonitor failed: {ex}"); }
@@ -412,22 +470,62 @@ namespace ProjectionMapper.Rendering
         /// Submit a per-layer frame to the appropriate renderer for composition based on target monitor.
         /// destRect is in renderer output coordinates (pixels).
         /// destQuad: optional quad in renderer coordinates (TopLeft, TopRight, BottomLeft, BottomRight).
+        /// Submits to both the target monitor renderer AND the main renderer so output preview works.
         /// </summary>
         public void SubmitLayerFrameForMonitor(string layerId, BitmapSource? frame, Rect destRect, Point[]? destQuad, double opacity, int targetMonitorIndex)
         {
             try
             {
-                IRenderer renderer;
-                if (targetMonitorIndex == -1 || !_monitorRenderers.TryGetValue(targetMonitorIndex, out renderer))
+                // Always submit to main renderer first so the output preview displays the content
+                _renderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+
+                // If target monitor is unspecified (-1), we're done - only show in main preview
+                if (targetMonitorIndex == -1)
                 {
-                    renderer = _renderer;
+                    return;
                 }
-                renderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+
+                // Also submit to the target monitor renderer if available for fullscreen output
+                if (_monitorRenderers.TryGetValue(targetMonitorIndex, out var monitorRenderer))
+                {
+                    monitorRenderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"RendererManager.SubmitLayerFrameForMonitor failed: {ex}");
                 // swallow - renderer may not support layering (no-op)
+            }
+        }
+
+        /// <summary>
+        /// Remove a layer from the underlying renderer. Call this when a layer should no longer be rendered.
+        /// </summary>
+        public void RemoveLayer(string? layerId)
+        {
+            if (string.IsNullOrEmpty(layerId)) return;
+            
+            try
+            {
+                if (_renderer is SoftwareRenderer sr)
+                {
+                    sr.RemoveLayer(layerId);
+                }
+                
+                // Also remove from all monitor renderers
+                foreach (var kv in _monitorRenderers.ToArray())
+                {
+                    if (kv.Value is SoftwareRenderer monitorSr)
+                    {
+                        try { monitorSr.RemoveLayer(layerId); } catch { }
+                    }
+                }
+                
+                Debug.WriteLine($"RendererManager.RemoveLayer: Removed layer {layerId} from renderers");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RendererManager.RemoveLayer failed: {ex}");
             }
         }
 
@@ -448,168 +546,189 @@ namespace ProjectionMapper.Rendering
                     Debug.WriteLine($"SetFullScreenHostFrame: fullscreen window entry is null for monitor {monitorIndex}");
                     return;
                 }
-
                 if (frame == null)
                 {
-                    Debug.WriteLine($"SetFullScreenHostFrame: clearing frame on monitor {monitorIndex}");
-                    InvokeOnUi(() => win.HostControl.Clear());
-                    return;
+                    InvokeOnUi(() => { try { win.HostControl?.Clear(); } catch { } });
                 }
-
-                Debug.WriteLine($"SetFullScreenHostFrame: setting frame on monitor {monitorIndex}");
-                InvokeOnUi(() =>
+                else
                 {
-                    try
-                    {
-                        win.HostControl.SetFrame(frame);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"SetFullScreenHostFrame: failed to set frame on monitor {monitorIndex}: {ex}");
-                    }
-                });
+                    InvokeOnUi(() => { try { win.HostControl?.SetFrame(frame); } catch { } });
+                }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"SetFullScreenHostFrame: outer exception for monitor {monitorIndex}: {ex}");
+                Debug.WriteLine($"SetFullScreenHostFrame failed: {ex}");
             }
         }
 
-        public void ShowFullScreenWindow(int monitorIndex, FullScreenOutputWindow window)
+        /// <summary>
+        /// Show a fullscreen window on the specified monitor.
+        /// Creates a dedicated renderer and render loop for this monitor.
+        /// </summary>
+        public void ShowFullScreenWindow(int monitorIndex, FullScreenOutputWindow window, int monitorWidth = 0, int monitorHeight = 0)
         {
             try
             {
-                // Dispose old renderer and close old window if exists
+                if (window == null) throw new ArgumentNullException(nameof(window));
+
+                // Clean up existing resources for this monitor if any
+                if (_monitorRenderLoops.TryGetValue(monitorIndex, out var oldLoop))
+                {
+                    try { oldLoop.StopAsync().GetAwaiter().GetResult(); } catch { }
+                    try { oldLoop.Dispose(); } catch { }
+                    _monitorRenderLoops.Remove(monitorIndex);
+                }
                 if (_monitorRenderers.TryGetValue(monitorIndex, out var oldRenderer))
                 {
-                    oldRenderer.Dispose();
+                    try { oldRenderer.Dispose(); } catch { }
                     _monitorRenderers.Remove(monitorIndex);
                 }
-                if (_fullscreenWindows.TryGetValue(monitorIndex, out var oldWin))
+                if (_fullscreenWindows.TryGetValue(monitorIndex, out var oldWin) && oldWin != window)
                 {
                     try { InvokeOnUi(() => oldWin.Close()); } catch { }
                     _fullscreenWindows.Remove(monitorIndex);
                 }
 
-                // Show and activate on UI thread, then register the window
+                // Register the window
+                _fullscreenWindows[monitorIndex] = window;
+
+                // Ensure hosted control stretches to fill in fullscreen
                 InvokeOnUi(() =>
                 {
-                    try
-                    {
-                        // Window may have been positioned via native APIs before; ensure we show it but keep it in Normal state
-                        window.Show();
-                        window.Activate();
-                        try { window.WindowState = WindowState.Normal; } catch { }
-                        try { window.Topmost = true; } catch { }
-                        try { window.Focus(); } catch { }
-
-                        // Force layout/update so the hosted control can initialize its visual tree on the UI thread
-                        try { window.UpdateLayout(); } catch { }
-
-                        _fullscreenWindows[monitorIndex] = window;
-
-                        // Create a dedicated renderer for this monitor
-                        var monitorRenderer = new SoftwareRenderer();
-                        int renderW = OutputWidth > 0 ? OutputWidth : 1920;
-                        int renderH = OutputHeight > 0 ? OutputHeight : 1080;
-
-                        // Initialize and start the monitor renderer asynchronously to avoid blocking the UI thread
-                        _monitorRenderers[monitorIndex] = monitorRenderer;
-
-                        // Initialize and start render loop on background task
-                        Task.Run(async () =>
-                        {
-                            try
-                            {
-                                await monitorRenderer.InitializeAsync(renderW, renderH).ConfigureAwait(false);
-                                monitorRenderer.FrameReady += (bmp) => OnMonitorFrameReady(monitorIndex, bmp);
-
-                                // Start render loop for this monitor on a dedicated STA thread
-                                var monitorRenderLoop = new RenderLoop(async ct =>
-                                {
-                                    await monitorRenderer.RenderFrameAsync(ct).ConfigureAwait(false);
-                                }, targetFps: 30.0);
-
-                                monitorRenderLoop.Start();
-
-                                // Note: we do not keep a strong reference to the monitorRenderLoop here; it will run until Dispose/HideFullScreenWindow
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"ShowFullScreenWindow: failed to initialize monitor renderer for monitor {monitorIndex}: {ex}");
-                            }
-                        });
-
-                        // Note: We need to track render loops per monitor, but for simplicity, we'll dispose in HideFullScreenWindow
-
-                        try
-                        {
-                            var hasHost = window.HostControl != null;
-                            Debug.WriteLine($"ShowFullScreenWindow (UI): monitor {monitorIndex} window registered, HostControl present: {hasHost}, bounds={window.Left},{window.Top},{window.Width}x{window.Height}");
-                        }
-                        catch (Exception exInner) { Debug.WriteLine($"ShowFullScreenWindow (UI): error inspecting HostControl for monitor {monitorIndex}: {exInner}"); }
-                    }
-                    catch (Exception exUi) { Debug.WriteLine($"ShowFullScreenWindow (UI) failed: {exUi}"); }
+                    try { window.HostControl?.SetFullscreenStretch(true); } catch { }
                 });
+
+                // Create a dedicated renderer for this monitor
+                try
+                {
+                    var monitorRenderer = new SoftwareRenderer();
+
+                    int renderW = (monitorWidth > 0) ? monitorWidth : (OutputWidth > 0 ? OutputWidth : 1920);
+                    int renderH = (monitorHeight > 0) ? monitorHeight : (OutputHeight > 0 ? OutputHeight : 1080);
+
+                    _monitorRendererSizes[monitorIndex] = (renderW, renderH);
+
+                    // Initialize monitor renderer
+                    monitorRenderer.InitializeAsync(renderW, renderH, CancellationToken.None).GetAwaiter().GetResult();
+
+                    // Subscribe to its FrameReady event to update the fullscreen host
+                    monitorRenderer.FrameReady += (bmp) => OnMonitorFrameReady(monitorIndex, bmp);
+
+                    // Store renderer
+                    _monitorRenderers[monitorIndex] = monitorRenderer;
+
+                    // Start a render loop for the monitor renderer
+                    var loop = new RenderLoop(async ct => await monitorRenderer.RenderFrameAsync(ct).ConfigureAwait(false), targetFps: 30.0);
+                    loop.Start();
+                    _monitorRenderLoops[monitorIndex] = loop;
+
+                    Debug.WriteLine($"ShowFullScreenWindow: Created renderer for monitor {monitorIndex} at {renderW}x{renderH}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"ShowFullScreenWindow: failed to initialize monitor renderer: {ex}");
+                }
             }
-            catch (Exception ex) { Debug.WriteLine($"ShowFullScreenWindow failed: {ex}"); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ShowFullScreenWindow: exception: {ex}");
+            }
         }
 
         public void HideFullScreenWindow(int monitorIndex)
         {
-            if (!_fullscreenWindows.TryGetValue(monitorIndex, out var win)) return;
-            try { InvokeOnUi(() => win.Close()); } catch (Exception ex) { Debug.WriteLine($"HideFullScreenWindow failed: {ex}"); }
-            _fullscreenWindows.Remove(monitorIndex);
-
-            // Dispose the monitor renderer and render loop
-            if (_monitorRenderers.TryGetValue(monitorIndex, out var renderer))
+            try
             {
-                try { renderer.Dispose(); } catch { }
-                _monitorRenderers.Remove(monitorIndex);
+                if (!_fullscreenWindows.TryGetValue(monitorIndex, out var win) || win == null)
+                {
+                    Debug.WriteLine($"HideFullScreenWindow: no fullscreen window for monitor {monitorIndex}");
+                    return;
+                }
+
+                // Revert host stretch and close window on UI thread
+                try
+                {
+                    InvokeOnUi(() =>
+                    {
+                        try { win.HostControl?.SetFullscreenStretch(false); } catch { }
+                        try { win.Close(); } catch (Exception exClose) { Debug.WriteLine($"HideFullScreenWindow: window close failed: {exClose}"); }
+                    });
+                }
+                catch (Exception exUi)
+                {
+                    Debug.WriteLine($"HideFullScreenWindow: failed to invoke UI close for monitor {monitorIndex}: {exUi}");
+                }
+
+                _fullscreenWindows.Remove(monitorIndex);
+
+                // Dispose associated monitor renderer and stop loop
+                if (_monitorRenderLoops.TryGetValue(monitorIndex, out var loop))
+                {
+                    try { loop.StopAsync().GetAwaiter().GetResult(); } catch (Exception exR) { Debug.WriteLine($"HideFullScreenWindow: monitor render loop stop failed for {monitorIndex}: {exR}"); }
+                    _monitorRenderLoops.Remove(monitorIndex);
+                }
+
+                if (_monitorRenderers.TryGetValue(monitorIndex, out var renderer))
+                {
+                    try { renderer.Dispose(); } catch (Exception exR) { Debug.WriteLine($"HideFullScreenWindow: renderer dispose failed for monitor {monitorIndex}: {exR}"); }
+                    _monitorRenderers.Remove(monitorIndex);
+                }
+
+                // Remove stored size
+                if (_monitorRendererSizes.ContainsKey(monitorIndex)) _monitorRendererSizes.Remove(monitorIndex);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"HideFullScreenWindow: unexpected error for monitor {monitorIndex}: {ex}");
             }
         }
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
-            _renderer.FrameReady -= OnFrameReady;
+            try
+            {
+                // Stop the main loop without waiting
+                if (_renderLoop != null)
+                {
+                    _renderLoop.StopAsync();
+                }
+
+                // Stop monitor loops without waiting
+                foreach (var kv in _monitorRenderLoops.ToArray())
+                {
+                    kv.Value.StopAsync();
+                }
+            }
+            catch { }
 
             try
             {
-                // Stop the render loop synchronously to ensure no further RenderFrameAsync calls
-                // are made against the renderer while we are disposing it. Use GetAwaiter().GetResult()
-                // to synchronously wait for StopAsync to complete on dispose.
-                try 
-                { 
-                    if (_renderLoop != null)
-                    {
-                        _renderLoop.StopAsync().GetAwaiter().GetResult(); 
-                    }
-                } 
-                catch (Exception exStop) { Debug.WriteLine($"RendererManager.Dispose: StopAsync failed: {exStop}"); }
-
-                // Dispose the render loop and renderer after stopping the loop.
-                try { _renderLoop?.Dispose(); } catch (Exception exLoop) { Debug.WriteLine($"RendererManager.Dispose: renderLoop.Dispose failed: {exLoop}"); }
-                try { _renderer.Dispose(); } catch (Exception exR) { Debug.WriteLine($"RendererManager.Dispose: renderer.Dispose failed: {exR}"); }
+                _renderer.Dispose();
             }
-            catch (Exception ex)
+            catch { }
+
+            // Dispose all monitor renderers
+            foreach (var kv in _monitorRenderers.ToArray())
             {
-                Debug.WriteLine($"RendererManager.Dispose: unexpected error while stopping renderer: {ex}");
+                try { kv.Value.Dispose(); } catch { }
             }
+            _monitorRenderers.Clear();
 
+            // Dispose monitor loops
+            foreach (var kv in _monitorRenderLoops.ToArray())
+            {
+                try { kv.Value.Dispose(); } catch { }
+            }
+            _monitorRenderLoops.Clear();
+
+            // Close all fullscreen windows
             foreach (var win in _fullscreenWindows.Values.ToList())
             {
-                try { InvokeOnUi(() => win.Close()); } catch (Exception ex) { Debug.WriteLine($"Dispose closing fullscreen window failed: {ex}"); }
+                try { InvokeOnUi(() => win.Close()); } catch { }
             }
             _fullscreenWindows.Clear();
 
-            // Dispose monitor renderers
-            foreach (var renderer in _monitorRenderers.Values)
-            {
-                try { renderer.Dispose(); } catch { }
-            }
-            _monitorRenderers.Clear();
+            _disposed = true;
         }
     }
 }

@@ -18,5 +18,16 @@ namespace ProjectionMapper.Services
         /// Unregister and stop decoding for a layer.
         /// </summary>
         Task UnregisterLayerAsync(string layerId);
+
+        /// <summary>
+        /// Forces a refresh of rendering for a specific mesh layer using the cached last frame from its source.
+        /// This is useful when mesh points are edited while video is paused.
+        /// </summary>
+        void RefreshMeshLayerRendering(string meshLayerId);
+
+        /// <summary>
+        /// Forces a refresh of rendering for all mesh layers of a given source.
+        /// </summary>
+        void RefreshAllMeshLayersForSource(string sourceId);
     }
 }

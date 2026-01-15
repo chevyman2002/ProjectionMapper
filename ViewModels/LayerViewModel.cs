@@ -166,5 +166,16 @@ namespace ProjectionMapper.ViewModels
                 RaisePropertyChanged();
             }
         }
+
+        public int TargetMonitorIndex
+        {
+            get => _model.TargetMonitorIndex;
+            set
+            {
+                if (_model.TargetMonitorIndex == value) return;
+                _model.TargetMonitorIndex = value;
+                RaisePropertyChanged();
+            }
+        }
     }
 }

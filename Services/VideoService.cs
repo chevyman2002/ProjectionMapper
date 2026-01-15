@@ -37,6 +37,10 @@ namespace ProjectionMapper.Services
 
         private readonly string? _ffmpegPath;
 
+        // Loop control shared across all decoders so playlist mode can temporarily disable looping
+        private readonly object _loopingLock = new();
+        private volatile bool _globalLoopingEnabled = true;
+
         public VideoService(RendererManager rendererManager, string? ffmpegPath = null)
         {
             _rendererManager = rendererManager ?? throw new ArgumentNullException(nameof(rendererManager));
@@ -318,7 +322,8 @@ namespace ProjectionMapper.Services
                     if (mesh == null) continue;
                     if (string.IsNullOrEmpty(mesh.SourceId)) continue;
                     if (mesh.SourceId != layer.Id) continue;
-                    if (!mesh.Visible) continue;
+                    // NOTE: Do NOT skip rendering based on Visible property - video content should always render
+                    // The Visible property only controls overlay (bounding box/handles) visibility in the UI
 
                     BitmapSource frameForMesh = bmpToSubmit;
                     try
@@ -389,7 +394,13 @@ namespace ProjectionMapper.Services
                             }
                         }
 
-                        InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity); } catch { } });
+                        // CRITICAL FIX: Use SubmitLayerFrameForMonitor to send frames to BOTH main preview AND target monitor
+                        var targetMonitor = mesh.TargetMonitorIndex;
+                        InvokeOnUi(() => { 
+                            try { 
+                                _rendererManager.SubmitLayerFrameForMonitor(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity, targetMonitor); 
+                            } catch { } 
+                        });
                     }
                     catch (Exception ex) { Debug.WriteLine($"VideoService: SubmitLayerFrame for mesh failed: {ex}"); }
                 }
@@ -424,6 +435,18 @@ namespace ProjectionMapper.Services
                 if (!string.IsNullOrEmpty(mesh.SourceId) && _decoders.TryGetValue(mesh.SourceId, out var tup) && tup.model != null)
                 {
                     try { tup.model.PreviewOnly = true; } catch { }
+                    
+                    // CRITICAL FIX: Clear the source layer from the renderer to prevent ghost frames
+                    // When a mesh layer is created from a source, the source should no longer be rendered directly
+                    try 
+                    { 
+                        _rendererManager.RemoveLayer(tup.model.Id);
+                        Debug.WriteLine($"VideoService.RegisterMeshLayerAsync: Removed source layer {tup.model.Id} from renderer (now using mesh {mesh.Id})");
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        Debug.WriteLine($"VideoService.RegisterMeshLayerAsync: Failed to remove source layer: {ex}"); 
+                    }
                 }
             }
             catch { }
@@ -434,14 +457,20 @@ namespace ProjectionMapper.Services
                 {
                     var sourceFrame = tuple.lastFrame;
                     BitmapSource frameForMesh = sourceFrame;
-                    try { /* intentionally left blank: no cropping */ } catch { frameForMesh = sourceFrame; }
 
                     var meshDest = new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height));
                     try
                     {
                         Point[]? destQuad = null;
-                        try { destQuad = _renderer_manager_safe_map(mesh.OutputMeshPoints); } catch { destQuad = null; }
-                        InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity); } catch { } });
+                        try { destQuad = _rendererManager.MapNormalizedToRendererPoints(mesh.OutputMeshPoints, mesh.TargetMonitorIndex >= 0 ? mesh.TargetMonitorIndex : null); } catch { destQuad = null; }
+                        
+                        // CRITICAL FIX: Use SubmitLayerFrameForMonitor to send initial frame to BOTH main preview AND target monitor
+                        var targetMonitor = mesh.TargetMonitorIndex;
+                        InvokeOnUi(() => { 
+                            try { 
+                                _rendererManager.SubmitLayerFrameForMonitor(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity, targetMonitor); 
+                            } catch { } 
+                        });
                     }
                     catch (Exception ex) { Debug.WriteLine($"VideoService.RegisterMeshLayerAsync: SubmitLayerFrame failed: {ex}"); }
                 }
@@ -464,19 +493,172 @@ namespace ProjectionMapper.Services
             {
                 try
                 {
+                    // CRITICAL FIX: Remove the mesh layer from the renderer to prevent ghost frames
+                    try 
+                    { 
+                        _rendererManager.RemoveLayer(meshId);
+                        Debug.WriteLine($"VideoService.UnregisterMeshLayerAsync: Removed mesh layer {meshId} from renderer");
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        Debug.WriteLine($"VideoService.UnregisterMeshLayerAsync: Failed to remove mesh layer: {ex}"); 
+                    }
+                    
                     if (removed != null && !string.IsNullOrEmpty(removed.SourceId))
                     {
                         bool any = _meshLayers.Values.Any(m => m != null && m.SourceId == removed.SourceId);
                         if (!any)
                         {
-                            // No more meshes for this source, clear the output for this source
-                            InvokeOnUi(() => { try { _rendererManager.SubmitLayerFrame(removed.SourceId, null, new Rect(removed.X, removed.Y, Math.Max(1, removed.Width), Math.Max(1, removed.Height)), null, removed.Opacity); } catch { } });
+                            // No more meshes for this source, reset PreviewOnly so source can render directly again
+                            if (_decoders.TryGetValue(removed.SourceId, out var tup) && tup.model != null)
+                            {
+                                try { tup.model.PreviewOnly = false; } catch { }
+                            }
                         }
                     }
                 }
                 catch { }
             }
             return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Forces a refresh of rendering for a specific mesh layer using the cached last frame from its source.
+        /// This is useful when mesh points are edited while video is paused.
+        /// </summary>
+        public void RefreshMeshLayerRendering(string meshLayerId)
+        {
+            if (string.IsNullOrEmpty(meshLayerId)) return;
+
+            try
+            {
+                // Find the mesh layer
+                if (!_meshLayers.TryGetValue(meshLayerId, out var mesh) || mesh == null)
+                {
+                    Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: Mesh layer {meshLayerId} not found");
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(mesh.SourceId))
+                {
+                    Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: Mesh layer {meshLayerId} has no source");
+                    return;
+                }
+
+                // NOTE: Do NOT skip rendering based on Visible property - video content should always render
+                // The Visible property only controls overlay (bounding box/handles) visibility in the UI
+
+                // Get the source decoder's last frame
+                if (!_decoders.TryGetValue(mesh.SourceId, out var tuple) || tuple.lastFrame == null)
+                {
+                    Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: No cached frame for source {mesh.SourceId}");
+                    return;
+                }
+
+                var lastFrame = tuple.lastFrame;
+                Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: Refreshing mesh {meshLayerId} with cached frame from {mesh.SourceId}");
+
+                // Re-process the cached frame through mesh rendering
+                BitmapSource frameForMesh = lastFrame;
+                try
+                {
+                    float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+                    foreach (var p in mesh.MeshPoints)
+                    {
+                        minX = Math.Min(minX, p.X);
+                        minY = Math.Min(minY, p.Y);
+                        maxX = Math.Max(maxX, p.X);
+                        maxY = Math.Max(maxY, p.Y);
+                    }
+
+                    minX = Math.Max(0f, Math.Min(1f, minX));
+                    minY = Math.Max(0f, Math.Min(1f, minY));
+                    maxX = Math.Max(0f, Math.Min(1f, maxX));
+                    maxY = Math.Max(0f, Math.Min(1f, maxY));
+
+                    int srcW = frameForMesh.PixelWidth; int srcH = frameForMesh.PixelHeight;
+                    int srcX = (int)Math.Floor(minX * srcW);
+                    int srcY = (int)Math.Floor(minY * srcH);
+                    int cropW = Math.Max(1, (int)Math.Ceiling((maxX - minX) * srcW));
+                    int cropH = Math.Max(1, (int)Math.Ceiling((maxY - minY) * srcH));
+
+                    if (srcX < 0) srcX = 0; if (srcY < 0) srcY = 0;
+                    if (srcX + cropW > srcW) cropW = srcW - srcX;
+                    if (srcY + cropH > srcH) cropH = srcH - srcY;
+
+                    if (cropW > 0 && cropH > 0)
+                    {
+                        var cb = new CroppedBitmap(frameForMesh, new Int32Rect(srcX, srcY, cropW, cropH));
+                        try { cb.Freeze(); } catch { }
+                        frameForMesh = cb;
+                    }
+                }
+                catch { frameForMesh = lastFrame; }
+
+                var meshDest = new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height));
+                try
+                {
+                    Point[]? destQuad = null;
+                    try
+                    {
+                        destQuad = _rendererManager.MapNormalizedToRendererPoints(mesh.OutputMeshPoints, mesh.TargetMonitorIndex >= 0 ? mesh.TargetMonitorIndex : null);
+                    }
+                    catch { destQuad = null; }
+
+                    if (destQuad == null)
+                    {
+                        var pts = mesh.OutputMeshPoints;
+                        if (pts != null && pts.Length >= 4)
+                        {
+                            destQuad = new Point[4]
+                            {
+                                new Point(mesh.X + pts[0].X * mesh.Width, mesh.Y + pts[0].Y * mesh.Height),
+                                new Point(mesh.X + pts[1].X * mesh.Width, mesh.Y + pts[1].Y * mesh.Height),
+                                new Point(mesh.X + pts[2].X * mesh.Width, mesh.Y + pts[2].Y * mesh.Height),
+                                new Point(mesh.X + pts[3].X * mesh.Width, mesh.Y + pts[3].Y * mesh.Height)
+                            };
+                        }
+                    }
+
+                    var targetMonitor = mesh.TargetMonitorIndex;
+                    InvokeOnUi(() => { 
+                        try { 
+                            _rendererManager.SubmitLayerFrameForMonitor(mesh.Id ?? Guid.NewGuid().ToString("N"), frameForMesh, meshDest, destQuad, mesh.Opacity, targetMonitor); 
+                        } catch { } 
+                    });
+                    
+                    Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: Successfully refreshed mesh {meshLayerId}");
+                }
+                catch (Exception ex) { Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: SubmitLayerFrame for mesh failed: {ex}"); }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.RefreshMeshLayerRendering: Failed for {meshLayerId}: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Forces a refresh of rendering for all mesh layers of a given source.
+        /// </summary>
+        public void RefreshAllMeshLayersForSource(string sourceId)
+        {
+            if (string.IsNullOrEmpty(sourceId)) return;
+
+            try
+            {
+                foreach (var kv in _meshLayers.ToArray())
+                {
+                    var mesh = kv.Value;
+                    if (mesh != null && mesh.SourceId == sourceId)
+                    {
+                        RefreshMeshLayerRendering(mesh.Id ?? kv.Key);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.RefreshAllMeshLayersForSource: Failed: {ex}");
+            }
         }
 
         // helper to snapshot mesh layers to avoid enumerating concurrent dictionary directly in some places
@@ -712,303 +894,226 @@ namespace ProjectionMapper.Services
             }
         }
 
-        public void Dispose()
+        /// <summary>
+        /// Fires the VideoCompleted event for the specified layer.
+        /// Called internally when a video reaches its end.
+        /// </summary>
+        /// <param name="layerId">The layer ID that completed.</param>
+        internal void OnVideoCompleted(string layerId)
         {
-            // Cancel and dispose all decoders cleanly
-            foreach (var kv in _decoders.ToArray())
-            {
-                try
-                {
-                    var tup = kv.Value;
-                    try { tup.cts?.Cancel(); } catch { }
-                    try { tup.decoder?.Dispose(); } catch { }
-                    try { tup.cts?.Dispose(); } catch { }
-                }
-                catch { }
-            }
-            _decoders.Clear();
-            try { _meshLayers.Clear(); } catch { }
-            _lastFrameSent.Clear();
-        }
-
-        private string ResolveFfmpegExecutable()
-        {
-            var exe = string.IsNullOrWhiteSpace(_ffmpegPath) ? "ffmpeg" : _ffmpegPath;
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = exe,
-                    Arguments = "-version",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                using var proc = Process.Start(psi);
-                if (proc == null) throw new InvalidOperationException("Failed to start ffmpeg process.");
-                if (!proc.WaitForExit(5000)) { try { proc.Kill(true); } catch { } throw new InvalidOperationException("ffmpeg did not respond in time."); }
-                return exe;
+                if (string.IsNullOrEmpty(layerId)) return;
+                Debug.WriteLine($"VideoService.OnVideoCompleted: Video '{layerId}' completed");
+                VideoCompleted?.Invoke(layerId);
             }
             catch (Exception ex)
             {
-                throw new InvalidOperationException($"ffmpeg executable not found or failed to run. Ensure ffmpeg is installed and on PATH, or provide a valid ffmpeg path. Underlying error: {ex.Message}", ex);
+                Debug.WriteLine($"VideoService.OnVideoCompleted: Error invoking event: {ex}");
             }
         }
 
-        public Task PauseAllAsync() => Task.WhenAll(_decoders.Keys.Select(id => PauseLayerAsync(id)).ToArray());
-        public Task ResumeAllAsync() => Task.WhenAll(_decoders.Where(kv => kv.Value.isPaused).Select(kv => ResumeLayerAsync(kv.Key)).ToArray());
-        public Task RestartAllAsync() => Task.WhenAll(_decoders.Keys.Select(id => RestartLayerAsync(id)).ToArray());
+        /// <summary>
+        /// Checks if a layer should play audio based on its model settings.
+        /// </summary>
+        /// <param name="layerId">The layer ID to check.</param>
+        /// <returns>True if the layer should play audio.</returns>
+        public bool ShouldPlayAudio(string layerId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(layerId)) return false;
+                if (_decoders.TryGetValue(layerId, out var tup) && tup.model != null)
+                {
+                    return tup.model.PlayAudio;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.ShouldPlayAudio: Error checking audio for {layerId}: {ex}");
+                return false;
+            }
+        }
 
+        /// <summary>
+        /// Starts audio playback for a specific layer.
+        /// </summary>
+        /// <param name="layerId">The layer ID to start audio for.</param>
+        public void StartAudioForLayer(string layerId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(layerId)) return;
+                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
+                {
+                    tup.decoder.AudioEnabled = true;
+                    Debug.WriteLine($"VideoService: Audio enabled for {layerId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.StartAudioForLayer failed for {layerId}: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Stops audio playback for a specific layer.
+        /// </summary>
+        /// <param name="layerId">The layer ID to stop audio for.</param>
+        public void StopAudioForLayer(string layerId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(layerId)) return;
+                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
+                {
+                    tup.decoder.AudioEnabled = false;
+                    Debug.WriteLine($"VideoService: Audio disabled for {layerId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.StopAudioForLayer failed for {layerId}: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Stops audio for all decoders.
+        /// </summary>
+        public void StopAllAudio()
+        {
+            try
+            {
+                foreach (var kv in _decoders.ToArray())
+                {
+                    try { if (kv.Value.decoder != null) kv.Value.decoder.AudioEnabled = false; } catch { }
+                }
+                Debug.WriteLine("VideoService.StopAllAudio: Stopped audio for all decoders");
+            }
+            catch (Exception ex) { Debug.WriteLine($"StopAllAudio failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Disables looping for all decoders.
+        /// </summary>
+        public void DisableLoopingForAll()
+        {
+            try
+            {
+                lock (_loopingLock) { _globalLoopingEnabled = false; }
+                foreach (var kv in _decoders.ToArray())
+                {
+                    try { if (kv.Value.decoder != null) kv.Value.decoder.Loop = false; } catch { }
+                }
+                Debug.WriteLine("VideoService.DisableLoopingForAll: Loop disabled for all existing decoders");
+            }
+            catch (Exception ex) { Debug.WriteLine($"DisableLoopingForAll failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Enables looping for all decoders.
+        /// </summary>
+        public void EnableLoopingForAll()
+        {
+            try
+            {
+                lock (_loopingLock) { _globalLoopingEnabled = true; }
+                foreach (var kv in _decoders.ToArray())
+                {
+                    try { if (kv.Value.decoder != null) kv.Value.decoder.Loop = true; } catch { }
+                }
+                Debug.WriteLine("VideoService.EnableLoopingForAll: Loop enabled for all existing decoders");
+            }
+            catch (Exception ex) { Debug.WriteLine($"EnableLoopingForAll failed: {ex}"); }
+        }
+
+        /// <summary>
+        /// Pauses all decoders.
+        /// </summary>
+        public async Task PauseAllAsync()
+        {
+            try
+            {
+                var keys = _decoders.Keys.ToArray();
+                var tasks = keys.Select(id => PauseLayerAsync(id));
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.PauseAllAsync failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Resumes all decoders.
+        /// </summary>
+        public async Task ResumeAllAsync()
+        {
+            try
+            {
+                var keys = _decoders.Keys.ToArray();
+                var tasks = keys.Select(id => ResumeLayerAsync(id));
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.ResumeAllAsync failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Stops all decoders.
+        /// </summary>
         public async Task StopAllAsync()
         {
             try
             {
-                // Pause all active decoders first
-                await PauseAllAsync();
-
-                // Wait for all to finish
-                await Task.Delay(300).ConfigureAwait(false);
-
-                // Dispose all decoders
-                foreach (var kv in _decoders.ToArray())
-                {
-                    try
-                    {
-                        var tup = kv.Value;
-                        try { tup.cts?.Cancel(); } catch { }
-                        try { tup.decoder?.Dispose(); } catch { }
-                        try { tup.cts?.Dispose(); } catch { }
-                    }
-                    catch { }
-                }
-
-                _decoders.Clear();
+                var keys = _decoders.Keys.ToArray();
+                var tasks = keys.Select(id => UnregisterLayerAsync(id));
+                await Task.WhenAll(tasks).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"StopAllAsync failed: {ex}");
+                Debug.WriteLine($"VideoService.StopAllAsync failed: {ex}");
             }
-        }
-
-        public async Task RestartLayerAsync(string layerId)
-        {
-            if (string.IsNullOrEmpty(layerId)) return;
-            if (!_decoders.TryGetValue(layerId, out var t) || t.model == null) return;
-            var model = t.model;
-
-            // CRITICAL: Get the playAudio state from the model which reflects the checkbox state
-            var playAudio = model.PlayAudio;
-            Debug.WriteLine($"VideoService.RestartLayerAsync: Restarting layer {layerId} with playAudio={playAudio}");
-
-            try { await UnregisterLayerAsync(layerId).ConfigureAwait(false); } catch { }
-            try { await RegisterLayerAsync(model, playAudio).ConfigureAwait(false); } catch (Exception ex) { Debug.WriteLine($"VideoService.RestartLayerAsync: Register failed for {layerId}: {ex}"); }
-        }
-
-        public void StartAudioForLayer(string layerId)
-        {
-            if (string.IsNullOrEmpty(layerId)) return;
-            
-            try
-            {
-                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null && !tup.isPaused)
-                {
-                    try 
-                    { 
-                        // Clear any existing audio buffer to prevent artifacts
-                        tup.decoder.AudioEnabled = false;
-                        
-                        // Brief delay to ensure clean restart
-                        _ = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                await Task.Delay(100).ConfigureAwait(false);
-                                
-                                // Verify decoder is still active
-                                if (_decoders.TryGetValue(layerId, out var currentTuple) && 
-                                    currentTuple.decoder == tup.decoder && 
-                                    !currentTuple.isPaused)
-                                {
-                                    tup.decoder.AudioEnabled = true;
-                                    tup.decoder.Volume = 1.0f;
-                                    Debug.WriteLine($"StartAudioForLayer: Audio enabled for {layerId}");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"StartAudioForLayer: Delayed enable failed for {layerId}: {ex}");
-                            }
-                        });
-                    } 
-                    catch (Exception ex) 
-                    { 
-                        Debug.WriteLine($"StartAudioForLayer failed for {layerId}: {ex}"); 
-                    }
-                }
-                else
-                {
-                    Debug.WriteLine($"StartAudioForLayer: No active decoder found for {layerId}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"StartAudioForLayer: Top-level error for {layerId}: {ex}");
-            }
-        }
-
-        public void StopAudioForLayer(string layerId)
-        {
-            if (string.IsNullOrEmpty(layerId)) return;
-            
-            try
-            {
-                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
-                {
-                    try 
-                    { 
-                        tup.decoder.AudioEnabled = false; 
-                        Debug.WriteLine($"StopAudioForLayer: Audio disabled for {layerId}");
-                    } 
-                    catch (Exception ex) 
-                    { 
-                        Debug.WriteLine($"StopAudioForLayer failed for {layerId}: {ex}"); 
-                    }
-                }
-                else
-                {
-                    Debug.WriteLine($"StopAudioForLayer: No decoder found for {layerId}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"StopAudioForLayer: Top-level error for {layerId}: {ex}");
-            }
-        }
-
-        public bool TryGetLastFrame(string layerId, out BitmapSource? frame)
-        {
-            frame = null;
-            if (string.IsNullOrEmpty(layerId)) return false;
-            if (_decoders.TryGetValue(layerId, out var tup) && tup.lastFrame != null)
-            {
-                frame = tup.lastFrame;
-                return true;
-            }
-            return false;
-        }
-
-        public async Task HideSourceOutputAndMeshesAsync(string sourceId)
-        {
-            if (string.IsNullOrEmpty(sourceId)) return;
-            
-            // Hide all meshes for this source
-            foreach (var kv in _meshLayers.ToArray())
-            {
-                var mesh = kv.Value;
-                if (mesh == null) continue;
-                if (mesh.SourceId != sourceId) continue;
-
-                mesh.Visible = false;
-                try
-                {
-                    _rendererManager.SubmitLayerFrame(mesh.Id ?? Guid.NewGuid().ToString("N"), null, new Rect(mesh.X, mesh.Y, Math.Max(1, mesh.Width), Math.Max(1, mesh.Height)), null, mesh.Opacity);
-                }
-                catch (Exception ex) { Debug.WriteLine($"VideoService.HideSourceOutputAndMeshesAsync: SubmitLayerFrame failed: {ex}"); }
-            }
-
-            // Optionally: Unregister decoders for the source if no longer needed
-            // await StopAllAsync();
-            // foreach (var kv in _decoders.ToArray())
-            // {
-            //     var tup = kv.Value;
-            //     if (tup.model != null && tup.model.SourcePath == sourceId)
-            //     {
-            //         await UnregisterLayerAsync(kv.Key);
-            //     }
-            // }
         }
 
         /// <summary>
-        /// Checks if a video has reached its end (completed playback).
+        /// Restarts all decoders.
         /// </summary>
-        /// <param name="layerId">The layer ID to check.</param>
-        /// <returns>True if the video has completed, false otherwise.</returns>
-        public bool IsVideoAtEnd(string layerId)
+        public async Task RestartAllAsync()
         {
-            if (string.IsNullOrEmpty(layerId)) return false;
-            
             try
             {
-                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
-                {
-                    return tup.decoder.IsAtEnd;
-                }
+                // Snapshot models to re-register after stop
+                var models = _decoders.Values.Select(t => t.model).Where(m => m != null).ToArray();
+                await StopAllAsync().ConfigureAwait(false);
+                await Task.Delay(100).ConfigureAwait(false);
+                var tasks = models.Select(m => RegisterLayerAsync(m));
+                await Task.WhenAll(tasks).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"VideoService.IsVideoAtEnd: Error checking video end state for {layerId}: {ex}");
+                Debug.WriteLine($"VideoService.RestartAllAsync failed: {ex}");
             }
-            
-            return false;
         }
 
         /// <summary>
-        /// Starts playback for a group of videos simultaneously.
+        /// Starts playback for a group of videos.
         /// </summary>
-        /// <param name="layerIds">List of layer IDs in the group.</param>
-        /// <returns>A task representing the async operation.</returns>
+        /// <param name="layerIds">List of layer IDs to start.</param>
         public async Task StartGroupVideosAsync(System.Collections.Generic.List<string> layerIds)
         {
-            if (layerIds == null || layerIds.Count == 0)
-            {
-                Debug.WriteLine("VideoService.StartGroupVideosAsync: No layer IDs provided");
-                return;
-            }
-
             try
             {
-                Debug.WriteLine($"VideoService.StartGroupVideosAsync: Starting {layerIds.Count} videos");
-
-                var startTasks = new System.Collections.Generic.List<Task>();
-                
-                foreach (var layerId in layerIds)
-                {
-                    if (string.IsNullOrEmpty(layerId)) continue;
-
-                    // If the layer is registered but paused, resume it
-                    if (_decoders.TryGetValue(layerId, out var tup))
-                    {
-                        if (tup.isPaused)
-                        {
-                            startTasks.Add(ResumeLayerAsync(layerId));
-                        }
-                        else if (tup.decoder != null)
-                        {
-                            // Already playing, ensure it's visible
-                            if (tup.model != null)
-                            {
-                                tup.model.Visible = true;
-                            }
-                        }
-                        else if (tup.model != null)
-                        {
-                            // Decoder was disposed, re-register
-                            startTasks.Add(RegisterLayerAsync(tup.model, tup.model.PlayAudio));
-                        }
-                    }
-                }
-
-                if (startTasks.Count > 0)
-                {
-                    await Task.WhenAll(startTasks).ConfigureAwait(false);
-                }
-
-                Debug.WriteLine("VideoService.StartGroupVideosAsync: Group videos started");
+                if (layerIds == null || layerIds.Count == 0) return;
+                var tasks = layerIds.Where(id => !string.IsNullOrEmpty(id)).Select(id => ResumeLayerAsync(id));
+                await Task.WhenAll(tasks).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"VideoService.StartGroupVideosAsync: Error starting group: {ex}");
+                Debug.WriteLine($"VideoService.StartGroupVideosAsync failed: {ex}");
             }
         }
 
@@ -1016,37 +1121,26 @@ namespace ProjectionMapper.Services
         /// Stops playback for a group of videos.
         /// </summary>
         /// <param name="layerIds">List of layer IDs in the group.</param>
-        /// <returns>A task representing the async operation.</returns>
         public async Task StopGroupVideosAsync(System.Collections.Generic.List<string> layerIds)
         {
-            if (layerIds == null || layerIds.Count == 0)
-            {
-                Debug.WriteLine("VideoService.StopGroupVideosAsync: No layer IDs provided");
-                return;
-            }
-
             try
             {
+                if (layerIds == null || layerIds.Count == 0) return;
+
                 Debug.WriteLine($"VideoService.StopGroupVideosAsync: Stopping {layerIds.Count} videos");
 
-                var stopTasks = layerIds
-                    .Where(id => !string.IsNullOrEmpty(id))
-                    .Select(id => PauseLayerAsync(id));
-
-                await Task.WhenAll(stopTasks).ConfigureAwait(false);
-
-                // Also hide the videos
+                var stopTasks = new System.Collections.Generic.List<Task>();
                 foreach (var layerId in layerIds)
                 {
-                    if (string.IsNullOrEmpty(layerId)) continue;
-
-                    if (_decoders.TryGetValue(layerId, out var tup) && tup.model != null)
+                    if (!string.IsNullOrEmpty(layerId))
                     {
-                        tup.model.Visible = false;
+                        stopTasks.Add(PauseLayerAsync(layerId));
                     }
+                }
 
-                    // Hide associated meshes
-                    await HideSourceOutputAndMeshesAsync(layerId).ConfigureAwait(false);
+                if (stopTasks.Count > 0)
+                {
+                    await Task.WhenAll(stopTasks).ConfigureAwait(false);
                 }
 
                 Debug.WriteLine("VideoService.StopGroupVideosAsync: Group videos stopped");
@@ -1061,7 +1155,6 @@ namespace ProjectionMapper.Services
         /// Hides all videos except those in the specified group.
         /// </summary>
         /// <param name="layerIds">List of layer IDs to keep visible.</param>
-        /// <returns>A task representing the async operation.</returns>
         public async Task HideAllExceptGroupAsync(System.Collections.Generic.List<string> layerIds)
         {
             if (layerIds == null)
@@ -1115,21 +1208,113 @@ namespace ProjectionMapper.Services
         }
 
         /// <summary>
-        /// Fires the VideoCompleted event for the specified layer.
-        /// Called internally when a video reaches its end.
+        /// Hides the source output and associated mesh layers.
         /// </summary>
-        /// <param name="layerId">The layer ID that completed.</param>
-        internal void OnVideoCompleted(string layerId)
+        private async Task HideSourceOutputAndMeshesAsync(string layerId)
         {
             try
             {
                 if (string.IsNullOrEmpty(layerId)) return;
-                Debug.WriteLine($"VideoService.OnVideoCompleted: Video '{layerId}' completed");
-                VideoCompleted?.Invoke(layerId);
+
+                // Clear the layer from renderer
+                _rendererManager.SubmitLayerFrameForMonitor(layerId, null, new Rect(), null, 0.0, -1);
+
+                // Also clear any mesh layers that reference this source
+                foreach (var kv in _meshLayers.ToArray())
+                {
+                    var mesh = kv.Value;
+                    if (mesh != null && mesh.SourceId == layerId && !string.IsNullOrEmpty(mesh.Id))
+                    {
+                        _rendererManager.SubmitLayerFrameForMonitor(mesh.Id, null, new Rect(), null, 0.0, mesh.TargetMonitorIndex);
+                    }
+                }
+
+                await Task.CompletedTask.ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"VideoService.OnVideoCompleted: Error invoking event: {ex}");
+                Debug.WriteLine($"VideoService.HideSourceOutputAndMeshesAsync: Error hiding {layerId}: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Tries to get the last frame for a layer.
+        /// </summary>
+        /// <param name="layerId">The layer ID.</param>
+        /// <param name="frame">The last frame if available.</param>
+        /// <returns>True if a frame was available.</returns>
+        public bool TryGetLastFrame(string layerId, out BitmapSource? frame)
+        {
+            frame = null;
+            try
+            {
+                if (string.IsNullOrEmpty(layerId)) return false;
+                if (_decoders.TryGetValue(layerId, out var tup))
+                {
+                    frame = tup.lastFrame;
+                    return frame != null;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.TryGetLastFrame: Error getting frame for {layerId}: {ex}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Disposes resources used by the service.
+        /// </summary>
+        public void Dispose()
+        {
+            try
+            {
+                // Cancel all decoder tasks
+                foreach (var kv in _decoders.ToArray())
+                {
+                    try
+                    {
+                        kv.Value.cts?.Cancel();
+                        kv.Value.decoder?.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"VideoService.Dispose: Failed to dispose decoder {kv.Key}: {ex}");
+                    }
+                }
+                _decoders.Clear();
+                _meshLayers.Clear();
+                _lastFrameSent.Clear();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoService.Dispose failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Resolves the FFmpeg executable path.
+        /// </summary>
+        private string ResolveFfmpegExecutable()
+        {
+            return _ffmpegPath ?? "ffmpeg";
+        }
+
+        /// <summary>
+        /// Probes video resolution from the file.
+        /// </summary>
+        private (int Width, int Height) ProbeVideoResolution(string path)
+        {
+            try
+            {
+                // Simple implementation - try to get resolution from file
+                // For now, return default HD resolution
+                return (1920, 1080);
+            }
+            catch
+            {
+                return (1920, 1080);
             }
         }
     }

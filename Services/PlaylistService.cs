@@ -64,6 +64,8 @@ namespace ProjectionMapper.Services
             
             // Subscribe to video completion events from VideoService
             _videoService.VideoCompleted += OnVideoCompleted;
+            
+            Debug.WriteLine("PlaylistService: Constructor completed, VideoCompleted event subscribed");
         }
 
         /// <summary>
@@ -174,6 +176,22 @@ namespace ProjectionMapper.Services
                 }
 
                 Debug.WriteLine($"PlaylistService.StartPlaylistAsync: Starting playlist with {groups.Count} groups");
+
+                // CRITICAL FIX: Disable looping for ALL videos in the project when playlist mode starts
+                // This prevents videos from restarting independently and allows proper group-based advancement
+                try
+                {
+                    Debug.WriteLine("PlaylistService.StartPlaylistAsync: Disabling Loop for all videos in project");
+                    _videoService.DisableLoopingForAll();
+                    
+                    // Wait a moment to ensure the setting takes effect
+                    await Task.Delay(100).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.StartPlaylistAsync: Error disabling looping: {ex}");
+                }
+
                 PlaybackStateChanged?.Invoke(PlaylistPlaybackState.Playing);
 
                 await StartCurrentGroupAsync().ConfigureAwait(false);
@@ -227,7 +245,7 @@ namespace ProjectionMapper.Services
         }
 
         /// <summary>
-        /// Resumes playback of the current group from where it was paused.
+        /// Resumes playbook of the current group from where it was paused.
         /// </summary>
         /// <returns>A task representing the async operation.</returns>
         public async Task ResumeCurrentGroupAsync()
@@ -270,8 +288,9 @@ namespace ProjectionMapper.Services
         /// <summary>
         /// Stops the playlist and resets to the beginning.
         /// </summary>
+        /// <param name="reEnableLooping">Whether to re-enable looping for all videos (true when exiting playlist mode completely).</param>
         /// <returns>A task representing the async operation.</returns>
-        public async Task StopPlaylistAsync()
+        public async Task StopPlaylistAsync(bool reEnableLooping = false)
         {
             try
             {
@@ -286,6 +305,21 @@ namespace ProjectionMapper.Services
 
                 Debug.WriteLine("PlaylistService.StopPlaylistAsync: Stopping all playback");
                 await _videoService.StopAllAsync().ConfigureAwait(false);
+
+                // Only re-enable looping when explicitly exiting playlist mode (e.g., switching to legacy mode)
+                // Do NOT re-enable looping during normal stop operations (e.g., project load, restart)
+                if (reEnableLooping)
+                {
+                    try
+                    {
+                        Debug.WriteLine("PlaylistService.StopPlaylistAsync: Re-enabling Loop for all videos (exiting playlist mode)");
+                        _videoService.EnableLoopingForAll();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"PlaylistService.StopPlaylistAsync: Error re-enabling looping: {ex}");
+                    }
+                }
 
                 PlaybackStateChanged?.Invoke(PlaylistPlaybackState.Stopped);
             }
@@ -472,6 +506,23 @@ namespace ProjectionMapper.Services
 
                 Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Starting group '{currentGroup.Name}' (index {_currentGroupIndex}) with {currentGroup.SourceIds.Count} videos");
 
+                // CRITICAL FIX: Stop audio for ALL videos first to prevent simultaneous audio playback
+                try
+                {
+                    // Get all registered layers and stop their audio
+                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Stopping audio for all videos");
+                    await Task.Run(() =>
+                    {
+                        // We need to access all decoders and stop their audio
+                        // The VideoService will provide a method to stop all audio
+                        _videoService.StopAllAudio();
+                    }).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error stopping all audio: {ex}");
+                }
+
                 // Hide all videos except those in the current group
                 await _videoService.HideAllExceptGroupAsync(currentGroup.SourceIds).ConfigureAwait(false);
 
@@ -481,13 +532,63 @@ namespace ProjectionMapper.Services
                     if (!string.IsNullOrEmpty(sourceId))
                     {
                         _videoCompletionStatus[sourceId] = false;
+                        Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Initialized completion tracking for {sourceId}");
                     }
+                }
+
+                // CRITICAL FIX: Before starting videos, ensure looping is disabled multiple times
+                // This is necessary because video registration might re-enable looping
+                try
+                {
+                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Disabling loop for all videos (before start)");
+                    _videoService.DisableLoopingForAll();
+                    await Task.Delay(100).ConfigureAwait(false); // Brief delay to ensure setting takes effect
+                    
+                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Re-confirming loop disabled for all videos (second pass)");
+                    _videoService.DisableLoopingForAll();
+                    await Task.Delay(50).ConfigureAwait(false); // Brief delay to ensure setting takes effect
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error disabling looping: {ex}");
                 }
 
                 // Start all videos in the group
                 await _videoService.StartGroupVideosAsync(currentGroup.SourceIds).ConfigureAwait(false);
 
+                // CRITICAL FIX: After starting videos, disable looping again in case new decoders were created
+                try
+                {
+                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Re-confirming loop disabled for all videos (after start)");
+                    _videoService.DisableLoopingForAll();
+                    await Task.Delay(50).ConfigureAwait(false); // Brief delay to ensure setting takes effect
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error re-disabling looping after start: {ex}");
+                }
+
+                // CRITICAL FIX: Enable audio for only the preferred video in this group to avoid unintended muting
+                try
+                {
+                    var preferredAudioLayerId = GetPreferredAudioSourceId(currentGroup);
+                    if (!string.IsNullOrEmpty(preferredAudioLayerId))
+                    {
+                        Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Enabling audio for preferred layer {preferredAudioLayerId}");
+                        _videoService.StartAudioForLayer(preferredAudioLayerId);
+                    }
+                    else
+                    {
+                        Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: No preferred audio layer found for this group (PlayAudio=false for all)");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error enabling preferred group audio: {ex}");
+                }
+
                 GroupChanged?.Invoke(_currentGroupIndex);
+                Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Group '{currentGroup.Name}' started successfully");
             }
             catch (Exception ex)
             {
@@ -504,12 +605,64 @@ namespace ProjectionMapper.Services
             {
                 if (sourceIds == null || sourceIds.Count == 0) return;
 
+                // CRITICAL FIX: Stop audio for all videos in the group before stopping video playback
+                Debug.WriteLine($"PlaylistService.StopGroupVideosAsync: Stopping audio for {sourceIds.Count} videos");
+                foreach (var sourceId in sourceIds)
+                {
+                    if (string.IsNullOrEmpty(sourceId)) continue;
+                    
+                    try
+                    {
+                        _videoService.StopAudioForLayer(sourceId);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"PlaylistService.StopGroupVideosAsync: Error stopping audio for {sourceId}: {ex}");
+                    }
+                }
+
                 await _videoService.StopGroupVideosAsync(sourceIds).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"PlaylistService.StopGroupVideosAsync: Error stopping group: {ex}");
             }
+        }
+
+        /// <summary>
+        /// Determines which video within the supplied group should provide audio output.
+        /// Prefers the first source that currently has PlayAudio enabled.
+        /// </summary>
+        /// <param name="group">The playlist group under evaluation.</param>
+        /// <returns>The layer ID that should provide audio, or null if none qualify.</returns>
+        private string? GetPreferredAudioSourceId(PlaylistGroupModel? group)
+        {
+            if (group == null || group.SourceIds == null || group.SourceIds.Count == 0)
+            {
+                return null;
+            }
+
+            foreach (var sourceId in group.SourceIds)
+            {
+                if (string.IsNullOrEmpty(sourceId))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (_videoService.ShouldPlayAudio(sourceId))
+                    {
+                        return sourceId;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.GetPreferredAudioSourceId: Failed to evaluate {sourceId}: {ex}");
+                }
+            }
+
+            return null;
         }
 
         private void OnVideoCompleted(string layerId)
@@ -526,6 +679,7 @@ namespace ProjectionMapper.Services
                 {
                     if (!_isPlaying)
                     {
+                        Debug.WriteLine($"PlaylistService.OnVideoCompleted: Playlist not playing, ignoring completion for {layerId}");
                         return;
                     }
 
@@ -535,17 +689,21 @@ namespace ProjectionMapper.Services
                     if (currentGroup == null || !currentGroup.SourceIds.Contains(layerId))
                     {
                         // This video is not in the current group, ignore
+                        Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' not in current group, ignoring");
                         return;
                     }
 
                     // Mark this video as completed
                     _videoCompletionStatus[layerId] = true;
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' completed in group '{currentGroup.Name}'");
+                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' completed in group '{currentGroup.Name}' ({_videoCompletionStatus.Count(kvp => kvp.Value)} of {currentGroup.SourceIds.Count} completed)");
 
                     // Check if all videos in the group have completed
-                    allCompleted = currentGroup.SourceIds
-                        .Where(id => !string.IsNullOrEmpty(id))
-                        .All(id => _videoCompletionStatus.TryGetValue(id, out var completed) && completed);
+                    var videosInGroup = currentGroup.SourceIds.Where(id => !string.IsNullOrEmpty(id)).ToList();
+                    var completedVideos = videosInGroup.Where(id => _videoCompletionStatus.TryGetValue(id, out var completed) && completed).ToList();
+                    
+                    allCompleted = completedVideos.Count == videosInGroup.Count;
+                    
+                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Group completion status: {completedVideos.Count}/{videosInGroup.Count} videos completed (allCompleted={allCompleted})");
                 }
 
                 if (allCompleted && !isPaused)
@@ -558,6 +716,8 @@ namespace ProjectionMapper.Services
                     {
                         try
                         {
+                            // Small delay to ensure all completion processing is done
+                            await Task.Delay(200).ConfigureAwait(false);
                             await AdvanceToNextGroupAsync().ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)
@@ -600,6 +760,7 @@ namespace ProjectionMapper.Services
         {
             try
             {
+                Debug.WriteLine("PlaylistService.Dispose: Unsubscribing from VideoCompleted event");
                 _videoService.VideoCompleted -= OnVideoCompleted;
                 _cts?.Cancel();
                 _cts?.Dispose();
