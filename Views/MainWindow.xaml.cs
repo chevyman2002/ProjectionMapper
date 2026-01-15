@@ -12,6 +12,8 @@ using ProjectionMapper.Services;
 using ProjectionMapper.Models;
 using ProjectionMapper.ViewModels;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Windows.Threading;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
@@ -45,6 +47,12 @@ namespace ProjectionMapper
 
         // Track fullscreen windows for preview restore
         private readonly Dictionary<int, bool> _previewMonitorStates = new();
+        private readonly Dictionary<int, FullScreenOutputWindow> _activeMonitorWindows = new();
+
+        // P/Invoke for positioning windows
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+
+        private record MonitorInfo(int Width, int Height, int Left, int Top);
 
         private class MonitorItem
         {
@@ -53,1453 +61,1307 @@ namespace ProjectionMapper
             public override string ToString() => Name;
         }
 
-        private void PART_MonitorCombo_DropDownOpened(object? sender, EventArgs e)
-        {
-            try
-            {
-                RefreshMonitors();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"PART_MonitorCombo_DropDownOpened: failed to refresh monitors: {ex}");
-            }
-        }
-
-        private void RefreshMonitors()
-        {
-            try
-            {
-                // remember current selection so we can restore if possible
-                int prevSelected = -1;
-                try { prevSelected = PART_MonitorCombo != null ? PART_MonitorCombo.SelectedIndex : -1; } catch { prevSelected = -1; }
-
-                var newMonitors = EnumerateMonitors();
-
-                // update internal list
-                _monitors = newMonitors;
-
-                // rebuild ObservableCollection of items on UI thread
-                Dispatcher.Invoke(() =>
-                {
-                    _monitorItems.Clear();
-                    for (int i = 0; i < _monitors.Count; i++)
-                    {
-                        var m = _monitors[i];
-                        _monitorItems.Add(new MonitorItem { Index = i, Name = $"Display {i + 1} ({m.Width}x{m.Height})" });
-                    }
-
-                    // try to restore previous selection if still valid
-                    if (PART_MonitorCombo != null)
-                    {
-                        if (prevSelected >= 0 && prevSelected < _monitorItems.Count)
-                        {
-                            PART_MonitorCombo.SelectedIndex = prevSelected;
-                        }
-                        else
-                        {
-                            PART_MonitorCombo.SelectedIndex = -1;
-                        }
-                    }
-                }, DispatcherPriority.Normal);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"RefreshMonitors: failed: {ex}");
-            }
-        }
-
         public MainWindow()
         {
-            InitializeComponent();
-
-            _vm = new MainWindowViewModel();
-            DataContext = _vm;
-
-            // Create a software renderer and renderer manager, attach the host (output preview)
-            _softwareRenderer = new SoftwareRenderer();
-            _rendererManager = new RendererManager(_softwareRenderer);
-            // Attach to the output host so the composed output shows on the right panel
-            _rendererManager.AttachHost(PART_OutputHost);
-
-            // Make the renderer manager available as a resource so child controls can find it if needed
-            this.Resources["RendererManager"] = _rendererManager;
-
-            // Create VideoService (ffmpeg path empty -> expects ffmpeg on PATH)
-            _videoService = new VideoService(_rendererManager, ffmpegPath: null);
-            _fileDialog = new FileDialogService();
-            _projectService = new ProjectService();
-            
-            // Create PlaylistService for group-based playback
-            _playlistService = new PlaylistService(_videoService);
-            _playlistService.GroupChanged += OnPlaylistGroupChanged;
-            _playlistService.PlaylistCompleted += OnPlaylistCompleted;
-
-            // Expose VideoService so MeshEditorControl can subscribe for isolated previews
-            this.Resources["VideoService"] = _videoService;
-
-            // Wire ViewModel events
-            _vm.ImportRequested += async () => await HandleImportAsync();
-            _vm.PreviewRequested += () => HandlePreview();
-            _vm.DeleteImportedRequested += async imported => await HandleDeleteImportedAsync(imported);
-            _vm.SaveProjectRequested += async () => await HandleSaveProjectAsync();
-            _vm.SaveAsProjectRequested += async () => await HandleSaveAsProjectAsync();
-            _vm.LoadProjectRequested += async () => await HandleLoadProjectAsync();
-            _vm.NewProjectRequested += async () => await HandleNewProjectAsync();
-
-            // Update window title when HasUnsavedChanges property changes
-            _vm.PropertyChanged += (sender, e) =>
+            try
             {
-                if (e.PropertyName == nameof(MainWindowViewModel.HasUnsavedChanges))
-                {
-                    UpdateWindowTitle();
-                }
-            };
+                System.Diagnostics.Debug.WriteLine("MainWindow constructor starting...");
+                
+                InitializeComponent();
 
-            // Wire playback controls to VideoService
-            _vm.PlayPauseRequestedAsync += async () =>
-            {
+                _vm = new MainWindowViewModel();
+                DataContext = _vm;
+                _vm.PropertyChanged += OnViewModelPropertyChanged;
+
+                // Track audio flag changes for imported videos to keep VideoService audio state in sync
                 try
                 {
-                    // Check if in playlist mode
-                    if (_vm.IsPlaylistMode && _vm.PlaylistGroups.Count > 0)
-                    {
-                        // Playlist mode: use PlaylistService for group-based playback
-                        if (_vm.IsPlaying)
-                        {
-                            if (_playlistService.IsPaused)
-                            {
-                                Debug.WriteLine("PlaylistService: Resuming current group");
-                                await _playlistService.ResumeCurrentGroupAsync();
-                            }
-                            else
-                            {
-                                Debug.WriteLine("PlaylistService: Starting playlist");
-                                var groups = _vm.BuildPlaylistGroupModels();
-                                await _playlistService.StartPlaylistAsync(groups);
-                            }
-                        }
-                        else
-                        {
-                            Debug.WriteLine("PlaylistService: Pausing current group");
-                            await _playlistService.PauseCurrentGroupAsync();
-                        }
-                    }
-                    else
-                    {
-                        // Legacy mode: use VideoService for independent playback
-                        if (_vm.IsPlaying)
-                        {
-                            Debug.WriteLine("VideoService: Resuming all layers");
-                            await _videoService.ResumeAllAsync();
-                            Debug.WriteLine("VideoService: Resume completed");
-                        }
-                        else
-                        {
-                            Debug.WriteLine("VideoService: Pausing all layers");
-                            await _videoService.PauseAllAsync();
-                            Debug.WriteLine("VideoService: Pause completed");
-                        }
-                    }
+                    _vm.ImportedVideos.CollectionChanged += OnImportedVideosCollectionChanged;
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"PlayPause operation failed: {ex}");
+                    Debug.WriteLine($"MainWindow: Failed to subscribe to ImportedVideos changes: {ex}");
                 }
-            };
 
-            _vm.RestartRequestedAsync += async () =>
-            {
-                try
+                // Create a software renderer and renderer manager, attach the host (output preview)
+                _softwareRenderer = new SoftwareRenderer();
+                _rendererManager = new RendererManager(_softwareRenderer);
+                // Attach to the output host so the composed output shows on the right panel
+                _rendererManager.AttachHost(PART_OutputHost);
+
+                // Make the renderer manager available as a resource so child controls can find it if needed
+                this.Resources["RendererManager"] = _rendererManager;
+
+                // Create VideoService (ffmpeg path empty -> expects ffmpeg on PATH)
+                _videoService = new VideoService(_rendererManager, ffmpegPath: null);
+                _fileDialog = new FileDialogService();
+                _projectService = new ProjectService();
+                
+                // Create PlaylistService for group-based playback
+                _playlistService = new PlaylistService(_videoService);
+                UpdateLoopingMode(_vm.IsPlaylistMode);
+                
+                // Expose VideoService so MeshEditorControl can subscribe for isolated previews
+                this.Resources["VideoService"] = _videoService;
+
+                // Wire event handlers to actual implementations
+                _vm.ImportRequested += OnImportRequested;
+                _vm.PreviewRequested += OnPreviewRequested;
+                _vm.DeleteImportedRequested += OnDeleteImportedRequested;
+                _vm.SaveProjectRequested += OnSaveProjectRequested;
+                _vm.SaveAsProjectRequested += OnSaveAsProjectRequested;
+                _vm.LoadProjectRequested += OnLoadProjectRequested;
+                _vm.NewProjectRequested += OnNewProjectRequested;
+                _vm.PlayPauseRequestedAsync += OnPlayPauseRequestedAsync;
+                _vm.RestartRequestedAsync += OnRestartRequestedAsync;
+                _vm.MeshLayerCreated += OnMeshLayerCreated;
+
+                // Hook up playlist service events
+                _playlistService.GroupChanged += (index) =>
                 {
-                    if (_vm.IsPlaylistMode && _vm.PlaylistGroups.Count > 0)
+                    try
                     {
-                        Debug.WriteLine("PlaylistService: Restarting playlist");
-                        await _playlistService.RestartPlaylistAsync();
+                        Debug.WriteLine($"MainWindow: Playlist group changed to index {index}");
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        Debug.WriteLine("VideoService: Restarting all layers");
-                        await _videoService.RestartAllAsync();
-                        Debug.WriteLine("VideoService: Restart completed");
+                        Debug.WriteLine($"MainWindow: Playlist group changed handler error: {ex}");
                     }
-                }
-                catch (Exception ex)
+                };
+                _playlistService.PlaylistCompleted += () =>
                 {
-                    Debug.WriteLine($"Restart operation failed: {ex}");
-                }
-            };
-
-            // populate monitor list for UI using Win32 EnumDisplayMonitors and store monitor info
-            try
-            {
-                _monitors = EnumerateMonitors();
-                for (int i = 0; i < _monitors.Count; i++)
-                {
-                    var m = _monitors[i];
-                    _monitorItems.Add(new MonitorItem { Index = i, Name = $"Display {i + 1} ({m.Width}x{m.Height})" });
-                }
-            }
-            catch { }
-
-            // assign itemsource for combo (ComboBox defined in XAML with x:Name PART_MonitorCombo)
-            Loaded += (_, __) =>
-            {
-                if (PART_MonitorCombo != null)
-                {
-                    PART_MonitorCombo.ItemsSource = _monitorItems;
-                    PART_MonitorCombo.SelectionChanged += PART_MonitorCombo_SelectionChanged;
-                    // Re-scan displays each time the drop-down is opened so available monitors are up-to-date
-                    try { PART_MonitorCombo.DropDownOpened += PART_MonitorCombo_DropDownOpened; } catch { }
-                }
-                // We prefer a single monitor combo for selecting the output monitor for the selected source.
-                // Hide the per-mesh combo to avoid duplicate controls; the PART_MonitorCombo will be used to
-                // assign the host and all its mesh layers to the chosen monitor.
-                try { if (PART_MeshMonitorCombo != null) PART_MeshMonitorCombo.Visibility = Visibility.Collapsed; } catch { }
-
-                // Wire up audio control event handlers
-                HookAudioControls();
-
-                // Wire mesh overlay checkbox
-                try
-                {
-                    if (PART_ShowMeshOverlayCheckbox != null)
+                    try
                     {
-                        PART_ShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
-                        PART_ShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
-                        // default checked
-                        PART_ShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                        Debug.WriteLine("MainWindow: Playlist completed");
                     }
-                    if (PART_GlobalShowMeshOverlayCheckbox != null)
+                    catch (Exception ex)
                     {
-                        PART_GlobalShowMeshOverlayCheckbox.Checked += (s, e) => { _rendererManager.ShowMeshOverlay = true; };
-                        PART_GlobalShowMeshOverlayCheckbox.Unchecked += (s, e) => { _rendererManager.ShowMeshOverlay = false; _rendererManager.ClearAllOverlays(); };
-                        PART_GlobalShowMeshOverlayCheckbox.IsChecked = _rendererManager.ShowMeshOverlay;
+                        Debug.WriteLine($"MainWindow: Playlist completed handler error: {ex}");
                     }
-                    // Show grid checkbox - call SetCoordinateGrid on output host when checked
-                    if (PART_ShowGridCheckbox != null)
+                };
+
+                // Basic Loaded handler - initialize renderer before loading any project
+                Loaded += async (_, __) =>
+                {
+                    try
                     {
-                        PART_ShowGridCheckbox.Checked += (s, e) =>
+                        // Initialize renderer with default HD size
+                        var w = 1920;
+                        var h = 1080;
+                        await _rendererManager.StartAsync(w, h);
+                        Debug.WriteLine($"MainWindow: Renderer initialized with size {w}x{h}");
+
+                        // Enumerate monitors and populate the dropdown
+                        EnumerateMonitors();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Renderer start failed: {ex}");
+                    }
+                };
+
+                // Handle window closing with proper cleanup and shutdown
+                Closing += async (sender, e) =>
+                {
+                    try
+                    {
+                        Debug.WriteLine("MainWindow: Window closing, checking for unsaved changes");
+                        
+                        // Check for unsaved changes
+                        if (_vm.HasUnsavedChanges)
                         {
-                            try
+                            var result = MessageBox.Show(
+                                "You have unsaved changes. Do you want to save before closing?",
+                                "Unsaved Changes",
+                                MessageBoxButton.YesNoCancel,
+                                MessageBoxImage.Question);
+
+                            if (result == MessageBoxResult.Cancel)
                             {
-                                // display grid every 100 renderer pixels by default
-                                PART_OutputHost?.SetCoordinateGrid(100);
+                                e.Cancel = true;
+                                return;
                             }
-                            catch { }
-                        };
-                        PART_ShowGridCheckbox.Unchecked += (s, e) =>
-                        {
-                            try { PART_OutputHost?.ClearGridOverlay(); } catch { }
-                        };
-                        PART_ShowGridCheckbox.IsChecked = false;
-                    }
-                }
-                catch { }
-            };
 
-            // Start renderer (use output host size; fallback to 1280x720)
-            Loaded += async (_, __) =>
-            {
-                var hostForSize = PART_OutputHost ?? PART_InputHost;
-                var w = (int)Math.Max(1, hostForSize.ActualWidth);
-                var h = (int)Math.Max(1, hostForSize.ActualHeight);
-                if (w == 0 || h == 0) { w = 1280; h = 720; }
-                await _rendererManager.StartAsync(w, h);
-            };
-
-            // Handle window closing properly without blocking the UI thread
-            Closing += MainWindow_Closing;
-
-            // Hook mesh layer created event so we can register with VideoService
-            _vm.MeshLayerCreated += async mesh =>
-            {
-                if (mesh != null && !string.IsNullOrEmpty(mesh.Id))
-                {
-                    try
-                    {
-                        // If the user has selected a monitor for the imported video, ensure the new mesh
-                        // inherits that target so overlays and compositor mapping apply to the same output host.
-                        var imported = _vm.SelectedImportedVideo;
-                        if (imported?.HostLayer != null)
-                        {
-                            mesh.TargetMonitorIndex = imported.HostLayer.TargetMonitorIndex;
+                            if (result == MessageBoxResult.Yes)
+                            {
+                                await OnSaveProjectRequested();
+                                // If save failed or was cancelled, don't close
+                                if (_vm.HasUnsavedChanges)
+                                {
+                                    e.Cancel = true;
+                                    return;
+                                }
+                            }
                         }
+
+                        Debug.WriteLine("MainWindow: Disposing services");
+                        
+                        // Stop all video playback first - use Task.Run to avoid deadlock on UI thread
+                        try 
+                        { 
+                            Task.Run(async () => await _videoService.StopAllAsync()).Wait(2000); 
+                        } 
+                        catch (Exception ex) 
+                        { 
+                            Debug.WriteLine($"MainWindow: StopAllAsync failed: {ex}"); 
+                        }
+                        
+                        // Close all fullscreen windows first
+                        foreach (var kv in _activeMonitorWindows.ToList())
+                        {
+                            try { kv.Value.Close(); } catch (Exception ex) { Debug.WriteLine($"MainWindow: Closing fullscreen window failed: {ex}"); }
+                        }
+                        _activeMonitorWindows.Clear();
+                        
+                        try { _rendererManager?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"MainWindow: RendererManager dispose failed: {ex}"); }
+                        try { _videoService?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"MainWindow: VideoService dispose failed: {ex}"); }
+                        try { _playlistService?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"MainWindow: PlaylistService dispose failed: {ex}"); }
+
+                        Debug.WriteLine("MainWindow: Cleanup completed, shutting down application");
+                        
+                        // Force application shutdown
+                        Application.Current.Shutdown();
                     }
-                    catch { }
-
-                    await _videoService.RegisterMeshLayerAsync(mesh);
-
-                    // Also update all mesh overlays for the imported video
-                    UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
-                }
-            };
-        }
-
-        private void HookAudioControls()
-        {
-            try
-            {
-                // Wire PlayAudio checkbox
-                if (PART_PlayAudioCheckbox != null)
-                {
-                    PART_PlayAudioCheckbox.Checked += PlayAudioCheckbox_CheckedChanged;
-                    PART_PlayAudioCheckbox.Unchecked += PlayAudioCheckbox_CheckedChanged;
-                }
-
-                // Volume slider removed - volume is now fixed at 100%
-      // Mute checkbox removed - audio is off by default until "Play Audio" is checked
-            }
-     catch { }
-        }
-
-        private void PlayAudioCheckbox_CheckedChanged(object sender, RoutedEventArgs e)
-        {
-try
-{
-          var imported = _vm.SelectedImportedVideo;
-  if (imported?.HostLayer == null) return;
-
-        var playAudio = imported.PlayAudio; // This reads from the bound property
-
-       if (playAudio)
-     {
-        // Start audio for host layer without re-registering the decoder (prevents duplicate decoders)
-         if (!string.IsNullOrEmpty(imported.HostLayer.Id))
-       {
-      _videoService.StartAudioForLayer(imported.HostLayer.Id);
-         }
-     }
-    else
-      {
-       // Stop audio for host layer
-      if (!string.IsNullOrEmpty(imported.HostLayer.Id))
-     {
-     _videoService.StopAudioForLayer(imported.HostLayer.Id);
-           }
-        }
-  }
-      catch { }
-  }
-
-        private void PART_MeshMonitorCombo_SelectionChanged(object? sender, SelectionChangedEventArgs e)
-        {
-            var combo = sender as ComboBox;
-            if (combo == null) return;
-            var item = combo.SelectedItem as MonitorItem;
-            var meshVm = _vm.SelectedMeshLayer;
-            if (meshVm == null) return;
-
-            // set target monitor on underlying model
-            if (meshVm.Model != null)
-            {
-                meshVm.Model.TargetMonitorIndex = item != null ? item.Index : -1;
-
-                // show fullscreen for this mesh if assigned
-                if (meshVm.Model.TargetMonitorIndex >= 0 && meshVm.Model.TargetMonitorIndex < _monitors.Count)
-                {
-                    CreateOrShowFullScreenForMonitor(meshVm.Model.TargetMonitorIndex);
-                }
-            }
-        }
-
-        private void CreateOrShowFullScreenForMonitor(int monitorIndex)
-        {
-            if (monitorIndex < 0 || monitorIndex >= _monitors.Count) return;
-            var mon = _monitors[monitorIndex];
-
-            // create fullscreen window and position it using monitor bounds converted to DIPs
-            var win = new FullScreenOutputWindow
-            {
-                WindowStyle = WindowStyle.None,
-                ResizeMode = ResizeMode.NoResize,
-                ShowInTaskbar = false,
-                Topmost = true
-            };
-
-            // Convert monitor pixel boundaries to WPF DIPs
-            var source = PresentationSource.FromVisual(this);
-            double dpiX = 1.0, dpiY = 1.0;
-            if (source != null && source.CompositionTarget != null)
-            {
-                dpiX = source.CompositionTarget.TransformFromDevice.M11;
-                dpiY = source.CompositionTarget.TransformFromDevice.M22;
-            }
-
-            win.Left = mon.Left * dpiX;
-            win.Top = mon.Top * dpiY;
-            win.Width = mon.Width * dpiX;
-            win.Height = mon.Height * dpiY;
-
-            win.WindowStartupLocation = WindowStartupLocation.Manual;
-
-            // Ensure native handle exists so we can position the window before showing it
-            try
-            {
-                var helper = new WindowInteropHelper(win);
-                var hwnd = helper.EnsureHandle();
-
-                const uint SWP_SHOWWINDOW = 0x0040;
-                var flags = SWP_SHOWWINDOW;
-
-                Debug.WriteLine($"CreateOrShowFullScreenForMonitor: calling SetWindowPos for monitor {monitorIndex} -> rect {mon.Left},{mon.Top} {mon.Width}x{mon.Height}");
-                bool ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, flags);
-                var err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-                Debug.WriteLine($"CreateOrShowFullScreenForMonitor: SetWindowPos returned {ok}, GetLastError={err}");
-
-                if (!ok)
-                {
-                    try
+                    catch (Exception ex)
                     {
-                        const int GWL_STYLE = -16;
-                        const int WS_POPUP = unchecked((int)0x80000000);
-                        var prev = GetWindowLong(hwnd, GWL_STYLE);
-                        SetWindowLong(hwnd, GWL_STYLE, prev | WS_POPUP);
-                        ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, flags);
-                        err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-                        Debug.WriteLine($"CreateOrShowFullScreenForMonitor: retry SetWindowPos returned {ok}, GetLastError={err}");
+                        Debug.WriteLine($"MainWindow: Closing handler failed: {ex}");
+                        // Force shutdown even if cleanup fails
+                        Application.Current.Shutdown();
                     }
-                    catch (Exception ex) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: retry SetWindowPos exception: {ex}"); }
-                }
+                };
 
-                // Show the window after native positioning
-                win.Show();
-
-                try { _rendererManager.ShowFullScreenWindow(monitorIndex, win); Debug.WriteLine($"CreateOrShowFullScreenForMonitor: ShowFullScreenWindow success for monitor {monitorIndex}"); } catch (Exception ex) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: ShowFullScreenWindow failed: {ex}"); }
-                try { _rendererManager.AttachHost(monitorIndex, win); Debug.WriteLine($"CreateOrShowFullScreenForMonitor: AttachHost success for monitor {monitorIndex}"); } catch (Exception ex) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: AttachHost failed: {ex}"); }
+                System.Diagnostics.Debug.WriteLine("MainWindow constructor completed successfully");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"CreateOrShowFullScreenForMonitor: placement/show failed: {ex}");
-                try { win.Show(); _rendererManager.ShowFullScreenWindow(monitorIndex, win); _rendererManager.AttachHost(monitorIndex, win); } catch (Exception ex2) { Debug.WriteLine($"CreateOrShowFullScreenForMonitor: fallback show failed: {ex2}"); }
+                System.Diagnostics.Debug.WriteLine($"MainWindow constructor failed: {ex}");
+                
+                // Show error dialog
+                try
+                {
+                    MessageBox.Show($"Failed to initialize application: {ex.Message}\n\nCheck debug output for details.", 
+                        "Initialization Error", 
+                        MessageBoxButton.OK, 
+                        MessageBoxImage.Error);
+                }
+                catch { }
+                
+                throw; // Re-throw to prevent partially initialized window
             }
         }
 
-        private void PART_MonitorCombo_SelectionChanged(object? sender, SelectionChangedEventArgs e)
-        {
-            var combo = sender as ComboBox;
-            if (combo == null) return;
-            var item = combo.SelectedItem as MonitorItem;
-            var imported = _vm.SelectedImportedVideo;
-            if (imported?.HostLayer != null && item != null)
-            {
-                // Apply selection to host layer
-                imported.HostLayer.TargetMonitorIndex = item.Index;
+        #region Global Mesh Overlay Toggle
 
-                // Apply same monitor to all mesh layers of this imported video so they collectively display on the chosen monitor
-                foreach (var meshVm in imported.MeshLayers)
+        /// <summary>
+        /// Handles the global mesh overlay visibility toggle.
+        /// When unchecked, hides all mesh overlays on all outputs.
+        /// </summary>
+        private void OnGlobalShowMeshOverlayChanged(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // Guard against null _rendererManager during initialization
+                // (checkbox events can fire during InitializeComponent before services are created)
+                if (_rendererManager == null)
                 {
-                    try { if (meshVm.Model != null) meshVm.Model.TargetMonitorIndex = item.Index; } catch { }
+                    Debug.WriteLine("**_rendererManager** was null.");
+                    return;
                 }
 
-                // Create or show fullscreen window on the selected monitor
-                if (item.Index >= 0 && item.Index < _monitors.Count)
+                bool show = PART_GlobalShowMeshOverlayCheckbox.IsChecked == true;
+                _rendererManager.ShowMeshOverlay = show;
+                Debug.WriteLine($"MainWindow: Global mesh overlay visibility set to {show}");
+
+                if (show)
                 {
-                    _rendererManager.HideFullScreenWindow(item.Index);
-                    CreateOrShowFullScreenForMonitor(item.Index);
+                    // Refresh all mesh overlays to make them visible again
+                    RefreshAllMeshOverlays();
                 }
                 else
                 {
-                    // hide any existing fullscreen for this index
-                    _rendererManager.HideFullScreenWindow(item.Index);
+                    // Clear all overlays from all hosts
+                    _rendererManager.ClearAllOverlays();
                 }
-
-                // Update all mesh overlays for the new monitor
-                UpdateAllMeshOverlaysForImportedVideo(imported);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: OnGlobalShowMeshOverlayChanged failed: {ex}");
             }
         }
 
-        private async Task HandleImportAsync()
+        /// <summary>
+        /// Refreshes mesh overlays for all mesh layers to reflect current visibility state.
+        /// </summary>
+        private void RefreshAllMeshOverlays()
         {
             try
             {
-                // Show open file dialog - only single file in this simple UI
-                var path = await _fileDialog.ShowOpenFileDialogAsync("Import video", "Video files|*.mp4;*.mov;*.mkv;*.avi;*.wmv;*.webm|All files|*.*");
-                if (string.IsNullOrEmpty(path)) return;
-                if (!File.Exists(path)) return;
+                foreach (var video in _vm.ImportedVideos)
+                {
+                    foreach (var mesh in video.MeshLayers)
+                    {
+                        if (mesh?.Model == null) continue;
+                        if (!mesh.ShowOverlay) continue;
 
-                // Create an ImportedVideoViewModel (parent node)
+                        var layerId = mesh.Model.Id;
+                        if (string.IsNullOrEmpty(layerId)) continue;
+
+                        var targetMonitor = mesh.TargetMonitorIndex;
+                        var quadPoints = _rendererManager.MapNormalizedToRendererPoints(mesh.OutputMeshPoints, targetMonitor >= 0 ? targetMonitor : null);
+                        
+                        if (quadPoints != null && quadPoints.Length >= 4)
+                        {
+                            _rendererManager.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadPoints, true, layerId);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: RefreshAllMeshOverlays failed: {ex}");
+            }
+        }
+
+        #endregion
+
+        #region Event Handler Implementations
+
+        private async void OnImportRequested()
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: Import requested");
+                
+                var path = await _fileDialog.ShowOpenFileDialogAsync(
+                    "Import Video",
+                    "Video Files (*.mp4;*.avi;*.mov;*.mkv;*.wmv)|*.mp4;*.avi;*.mov;*.mkv;*.wmv|All Files (*.*)|*.*");
+
+                if (string.IsNullOrEmpty(path))
+                {
+                    Debug.WriteLine("MainWindow: Import cancelled by user");
+                    return;
+                }
+
+                Debug.WriteLine($"MainWindow: Importing video from {path}");
+
+                // Create imported video view model
                 var id = Guid.NewGuid().ToString("N");
-                var importedVm = new ImportedVideoViewModel(id, Path.GetFileName(path), path);
+                var name = Path.GetFileNameWithoutExtension(path);
+                var imported = new ImportedVideoViewModel(id, name, path);
 
-                // Create a host decoding layer so the video is available for isolated preview
+                // Create host layer for this video
                 var hostLayer = new LayerModel
                 {
                     Id = id,
-                    Name = importedVm.Name,
+                    Name = $"{name} (Host)",
                     SourcePath = path,
-                    // play immediately for isolated preview only; do not submit frames to main renderer until mesh created
-                    PreviewOnly = true
+                    Width = _rendererManager.OutputWidth,
+                    Height = _rendererManager.OutputHeight,
+                    Visible = true,
+                    PreviewOnly = false
                 };
 
-                // Determine default decode size from input host if available
-                var hostForLayer = PART_InputHost ?? PART_OutputHost;
-                var w = (int)Math.Max(1, hostForLayer.ActualWidth);
-                var h = (int)Math.Max(1, hostForLayer.ActualHeight);
-                if (w == 0 || h == 0) { w = 1280; h = 720; }
-                hostLayer.X = 0; hostLayer.Y = 0; hostLayer.Width = w; hostLayer.Height = h;
+                imported.HostLayer = hostLayer;
+                imported.NotifyHostLayerChanged();
 
-                // Register decoder for the imported video so MeshEditor can show isolated preview and so output is submitted to renderer
-                await _videoService.RegisterLayerAsync(hostLayer);
-                importedVm.HostLayer = hostLayer;
-
-                // Notify the ImportedVideoViewModel that HostLayer changed so bindings update
-                importedVm.NotifyHostLayerChanged();
-
-                // Add to view model collection (parent node). Do NOT create mesh layer automatically.
-                // Ensure we marshal back to UI thread
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    _vm.ImportedVideos.Add(importedVm);
-                    // Select the imported video in the VM
-                    _vm.SelectedImportedVideo = importedVm;
-
-                    // update monitor combo selection if available
-                    if (PART_MonitorCombo != null && importedVm.HostLayer != null)
-                    {
-                        PART_MonitorCombo.SelectedIndex = importedVm.HostLayer.TargetMonitorIndex >= 0 ? importedVm.HostLayer.TargetMonitorIndex : -1;
-                    }
-                }, DispatcherPriority.Normal);
-            }
-            catch (Exception ex)
-            {
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    MessageBox.Show($"Failed to import video: {ex.Message}", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
-            }
-        }
-
-        private async Task HandleDeleteImportedAsync(ImportedVideoViewModel? imported)
-        {
-            if (imported == null) return;
-
-            var res = MessageBox.Show(this, $"Delete imported source '{imported.Name}' and all its mesh layers?", "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-            if (res != MessageBoxResult.Yes) return;
-
-            try
-            {
-                // Unregister any host decoder
-                if (imported.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
-                {
-                    await _videoService.UnregisterLayerAsync(imported.HostLayer.Id);
-                }
-            }
-            catch { }
-
-            // Remove all nested mesh layers
-            try
-            {
-                imported.MeshLayers.Clear();
-            }
-            catch { }
-
-            // Remove from VM collection
-            await Dispatcher.InvokeAsync(() =>
-            {
-                _vm.ImportedVideos.Remove(imported);
-
-                // Clear selection if it was the deleted one
-                if (_vm.SelectedImportedVideo == imported) _vm.SelectedImportedVideo = null;
-                if (_vm.SelectedMeshLayer != null && imported.MeshLayers.Contains(_vm.SelectedMeshLayer)) _vm.SelectedMeshLayer = null;
-            });
-        }
-
-        private void TreeView_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
-        {
-            // If a mesh LayerViewModel is selected, set SelectedMeshLayer on VM
-            if (e.NewValue is LayerViewModel layerVm)
-            {
-                _vm.SelectedMeshLayer = layerVm;
-                // reflect current mesh monitor selection in UI
-                if (PART_MeshMonitorCombo != null && layerVm.Model != null)
-                {
-                    PART_MeshMonitorCombo.SelectedIndex = layerVm.Model.TargetMonitorIndex >= 0 ? layerVm.Model.TargetMonitorIndex : -1;
-                }
-                
-                // Update all mesh overlays for the target monitor
-                UpdateAllMeshOverlaysForImportedVideo(_vm.SelectedImportedVideo);
-                return;
-            }
-
-            // If an imported video (parent) is selected, set SelectedImportedVideo
-            if (e.NewValue is ImportedVideoViewModel imported)
-            {
+                // Add to view model
+                _vm.ImportedVideos.Add(imported);
                 _vm.SelectedImportedVideo = imported;
-                // Optionally select nothing for mesh layer
-                _vm.SelectedMeshLayer = null;
 
-                // update monitor combo selection
-                if (PART_MonitorCombo != null && imported.HostLayer != null)
-                {
-                    PART_MonitorCombo.SelectedIndex = imported.HostLayer.TargetMonitorIndex >= 0 ? imported.HostLayer.TargetMonitorIndex : -1;
-                }
+                // Register with video service
+                await _videoService.RegisterLayerAsync(hostLayer, playAudio: false);
 
-                // Ensure PlayAudio checkbox reflects state; it's bound in XAML so this is just to ensure service state
-                try
-                {
-                    // If PlayAudio is true and no audio player exists, start audio
-                    if (imported.HostLayer != null && imported.HostLayer.PlayAudio)
-                    {
-                        _ = _videoService.RegisterLayerAsync(imported.HostLayer, playAudio: true);
-                    }
-                }
-                catch { }
-
-                // Update all mesh overlays for this imported video
-                UpdateAllMeshOverlaysForImportedVideo(imported);
-                return;
-            }
-
-            // Otherwise clear selections
-            _vm.SelectedImportedVideo = null;
-            _vm.SelectedMeshLayer = null;
-        }
-
-        private void UpdateAllMeshOverlaysForImportedVideo(ImportedVideoViewModel? imported)
-        {
-            if (imported == null) return;
-
-            try
-            {
-                var targetMonitor = imported.HostLayer?.TargetMonitorIndex ?? -1;
-                
-                // Update overlays for all mesh layers of this imported video
-                foreach (var meshVm in imported.MeshLayers)
-                {
-                    if (meshVm?.Model == null) continue;
-                    
-                    var layerId = meshVm.Model.Id;
-                    if (string.IsNullOrEmpty(layerId)) continue;
-                    
-                    var showOverlayPref = meshVm.Model.ShowOverlay;
-                    if (!showOverlayPref) continue;
-
-                    try
-                    {
-                        // Map normalized output mesh points to renderer coordinates
-                        Point[]? quadForRenderer = null;
-                        try
-                        {
-                            quadForRenderer = _rendererManager?.MapNormalizedToRendererPoints(meshVm.OutputMeshPoints, targetMonitor >= 0 ? targetMonitor : null);
-                        }
-                        catch { quadForRenderer = null; }
-
-                        if (quadForRenderer != null && quadForRenderer.Length >= 4)
-                        {
-                            _rendererManager?.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadForRenderer, true, layerId);
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-        }
-
-        // Ensure right-click selects the TreeViewItem under the mouse so context menu actions apply to it
-        private void TreeView_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
-        {
-            var clickedElement = e.OriginalSource as DependencyObject;
-            if (clickedElement == null) return;
-
-            var tvi = VisualUpwardSearch<TreeViewItem>(clickedElement);
-            if (tvi != null)
-            {
-                tvi.IsSelected = true;
-                // do not mark handled so ContextMenu still opens
-            }
-        }
-
-        private static T? VisualUpwardSearch<T>(DependencyObject source) where T : DependencyObject
-        {
-            while (source != null && !(source is T))
-            {
-                source = VisualTreeHelper.GetParent(source);
-            }
-            return source as T;
-        }
-
-        // Context menu click handlers
-        private void CreateMeshMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            var cm = FindParentContextMenu(mi);
-            var imported = (cm?.PlacementTarget as FrameworkElement)?.DataContext as ImportedVideoViewModel;
-            if (imported != null)
-            {
-                _vm.SelectedImportedVideo = imported;
-                if (_vm.CreateMeshCommand.CanExecute(null)) _vm.CreateMeshCommand.Execute(null);
-            }
-        }
-
-        private void DeleteSourceMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            var cm = FindParentContextMenu(mi);
-            var imported = (cm?.PlacementTarget as FrameworkElement)?.DataContext as ImportedVideoViewModel;
-            if (imported != null)
-            {
-                // Use VM event so confirmation and deletion flow is centralized
-                _vm.DeleteImportedCommand.Execute(imported);
-            }
-        }
-
-        private void ImportedContextMenu_Opened(object sender, RoutedEventArgs e)
-        {
-            var cm = sender as ContextMenu;
-            if (cm == null) return;
-            var fe = cm.PlacementTarget as FrameworkElement;
-            var imported = fe?.DataContext as ImportedVideoViewModel;
-            if (imported == null) return;
-
-            // find hide/show menu item by Tag
-            var mi = cm.Items.OfType<MenuItem>().FirstOrDefault(m => m.Tag as string == "HideShowToggle");
-            if (mi == null) return;
-
-            // If host layer is paused/hidden, show 'Show', otherwise 'Hide'
-            if (imported.HostLayer == null)
-            {
-                mi.Header = "Hide Source Output/Meshes";
-                return;
-            }
-
-            var visible = imported.HostLayer.Visible;
-            mi.Header = visible ? "Hide Source Output/Meshes" : "Show Source Output/Meshes";
-        }
-
-        private async void HideSourceOutputMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            var cm = FindParentContextMenu(mi);
-            var imported = (cm?.PlacementTarget as FrameworkElement)?.DataContext as ImportedVideoViewModel;
-            if (imported != null)
-            {
-                try
-                {
-                    if (imported.HostLayer != null)
-                    {
-                        // toggle
-                        if (imported.HostLayer.Visible)
-                        {
-                            // hide: update UI immediately
-                            await Dispatcher.InvokeAsync(() =>
-                            {
-                                foreach (var meshVm in imported.MeshLayers.ToList()) meshVm.Visible = false;
-                                imported.HostLayer.Visible = false;
-                            }, DispatcherPriority.Normal);
-
-                            // pause decoding to hide output
-                            await _videoService.PauseLayerAsync(imported.HostLayer.Id);
-
-                            // hide any fullscreen assigned to host
-                            if (imported.HostLayer.TargetMonitorIndex >= 0)
-                            {
-                                _rendererManager.HideFullScreenWindow(imported.HostLayer.TargetMonitorIndex);
-                            }
-
-                            // hide any fullscreen assigned to mesh layers
-                            foreach (var meshVm in imported.MeshLayers)
-                            {
-                                if (meshVm.Model?.TargetMonitorIndex >= 0)
-                                {
-                                    _rendererManager.HideFullScreenWindow(meshVm.Model.TargetMonitorIndex);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // show: resume decoding first
-                            await _videoService.ResumeLayerAsync(imported.HostLayer.Id);
-
-                            // update UI on UI thread
-                            await Dispatcher.InvokeAsync(() =>
-                            {
-                                imported.HostLayer.Visible = true;
-                                foreach (var meshVm in imported.MeshLayers.ToList()) meshVm.Visible = true;
-                            }, DispatcherPriority.Normal);
-
-                            // restore fullscreen for host if assigned
-                            if (imported.HostLayer.TargetMonitorIndex >= 0)
-                            {
-                                CreateOrShowFullScreenForMonitor(imported.HostLayer.TargetMonitorIndex);
-                            }
-
-                            // restore fullscreen for meshes if assigned
-                            foreach (var meshVm in imported.MeshLayers)
-                            {
-                                if (meshVm.Model?.TargetMonitorIndex >= 0)
-                                {
-                                    CreateOrShowFullScreenForMonitor(meshVm.Model.TargetMonitorIndex);
-                                }
-                            }
-                        }
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private void DeleteMeshMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            var cm = FindParentContextMenu(mi);
-            var layer = (cm?.PlacementTarget as FrameworkElement)?.DataContext as LayerViewModel;
-            if (layer != null)
-            {
-                var parent = _vm.ImportedVideos.FirstOrDefault(iv => iv.MeshLayers.Contains(layer));
-                if (parent != null)
-                {
-                    parent.MeshLayers.Remove(layer);
-                    if (_vm.SelectedMeshLayer == layer) _vm.SelectedMeshLayer = null;
-                }
-            }
-        }
-
-        private void CopyMeshMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            var cm = FindParentContextMenu(mi);
-            var layer = (cm?.PlacementTarget as FrameworkElement)?.DataContext as LayerViewModel;
-            if (layer != null)
-            {
-                _vm.SelectedMeshLayer = layer;
-                if (_vm.CopyMeshCommand.CanExecute(null)) _vm.CopyMeshCommand.Execute(null);
-            }
-        }
-
-        private void PasteMeshMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            var cm = FindParentContextMenu(mi);
-            var fe = cm?.PlacementTarget as FrameworkElement;
-            if (fe?.DataContext is ImportedVideoViewModel imported)
-            {
-                _vm.SelectedImportedVideo = imported;
-                if (_vm.PasteMeshCommand.CanExecute(null)) _vm.PasteMeshCommand.Execute(null);
-            }
-            else if (fe?.DataContext is LayerViewModel layer)
-            {
-                var parent = _vm.ImportedVideos.FirstOrDefault(iv => iv.MeshLayers.Contains(layer));
-                if (parent != null)
-                {
-                    _vm.SelectedImportedVideo = parent;
-                    if (_vm.PasteMeshCommand.CanExecute(null)) _vm.PasteMeshCommand.Execute(null);
-                }
-            }
-        }
-
-        private void RenameMeshMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            var mi = sender as MenuItem;
-            LayerViewModel? layerVm = null;
-
-            // Try command parameter first (safer when context menu is separated)
-            try
-            {
-                layerVm = mi?.CommandParameter as LayerViewModel;
-            }
-            catch { }
-
-            // Fallback: attempt to find the placement target's DataContext
-            if (layerVm == null)
-            {
-                try
-                {
-                    var cm = FindParentContextMenu(mi);
-                    layerVm = (cm?.PlacementTarget as FrameworkElement)?.DataContext as LayerViewModel;
-                }
-                catch { }
-            }
-
-            // Final fallback: use currently selected mesh in VM
-            if (layerVm == null) layerVm = _vm.SelectedMeshLayer;
-            if (layerVm == null) return;
-
-            // Simple prompt dialog
-            var prompt = new Window
-            {
-                Title = "Rename Mesh",
-                Width = 400,
-                Height = 140,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Owner = this,
-                ResizeMode = ResizeMode.NoResize
-            };
-
-            var sp = new StackPanel { Margin = new Thickness(10) };
-            sp.Children.Add(new TextBlock { Text = "Enter new name:", Margin = new Thickness(0,0,0,6) });
-            var tb = new TextBox { Text = layerVm.Name ?? string.Empty };
-            sp.Children.Add(tb);
-            var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0,10,0,0) };
-            var ok = new Button { Content = "OK", Width = 80, IsDefault = true };
-            var cancel = new Button { Content = "Cancel", Width = 80, IsCancel = true, Margin = new Thickness(8,0,0,0) };
-            btnPanel.Children.Add(ok); btnPanel.Children.Add(cancel);
-            sp.Children.Add(btnPanel);
-            prompt.Content = sp;
-
-            ok.Click += (_, __) => prompt.DialogResult = true;
-
-            if (prompt.ShowDialog() == true)
-            {
-                var newName = tb.Text?.Trim();
-                if (!string.IsNullOrEmpty(newName))
-                {
-                    // Ensure uniqueness - if name exists, append numeric suffix
-                    var baseName = newName;
-                    int suffix = 1;
-                    bool exists;
-                    do
-                    {
-                        exists = _vm.ImportedVideos.SelectMany(iv => iv.MeshLayers).Any(m => m != layerVm && string.Equals(m.Name, newName, StringComparison.OrdinalIgnoreCase));
-                        if (exists)
-                        {
-                            newName = baseName + " " + (++suffix).ToString();
-                        }
-                    } while (exists);
-
-                    // Update viewmodel property which updates underlying model and notifies UI
-                    layerVm.Name = newName;
-
-                    // Ensure selection reflects renamed item
-                    try { _vm.SelectedMeshLayer = layerVm; } catch { }
-                }
-            }
-        }
-
-        private static ContextMenu? FindParentContextMenu(DependencyObject d)
-        {
-            while (d != null)
-            {
-                if (d is ContextMenu cm) return cm;
-                d = VisualTreeHelper.GetParent(d);
-            }
-            return null;
-        }
-
-        private void AboutMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var aboutWindow = new Views.AboutWindow
-                {
-                    Owner = this
-                };
-                aboutWindow.ShowDialog();
+                Debug.WriteLine($"MainWindow: Successfully imported video '{name}'");
+                _vm.StatusText = $"Imported: {name}";
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"AboutMenuItem_Click failed: {ex}");
-                MessageBox.Show(
-                    $"Failed to open About dialog: {ex.Message}",
-                    "Error",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
+                Debug.WriteLine($"MainWindow: Import failed: {ex}");
+                MessageBox.Show($"Failed to import video: {ex.Message}", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
-        private void ExitMenuItem_Click(object sender, RoutedEventArgs e)
+        private void OnPreviewRequested()
         {
             try
             {
-                Close();
+                Debug.WriteLine("MainWindow: Preview requested - feature not yet implemented");
+                MessageBox.Show("Full-screen preview feature coming soon!", "Preview", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"ExitMenuItem_Click failed: {ex}");
+                Debug.WriteLine($"MainWindow: Preview failed: {ex}");
             }
         }
 
-        private void UpdateWindowTitle()
+        private async void OnDeleteImportedRequested(ImportedVideoViewModel? imported)
         {
             try
             {
-                var baseTitle = "Projection Mapper";
-                
-                if (!string.IsNullOrEmpty(_currentProjectPath))
+                if (imported == null)
                 {
-                    baseTitle += $" - {Path.GetFileName(_currentProjectPath)}";
+                    Debug.WriteLine("MainWindow: Delete imported requested with null video");
+                    return;
                 }
-                
-                if (_vm.HasUnsavedChanges)
-                {
-                    baseTitle += " *";
-                }
-                
-                Title = baseTitle;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"UpdateWindowTitle failed: {ex}");
-            }
-        }
 
-        private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
-        {
-            // Check if there are unsaved changes
-            if (_vm.HasUnsavedChanges)
-            {
+                Debug.WriteLine($"MainWindow: Delete imported requested for '{imported.Name}'");
+
                 var result = MessageBox.Show(
-                    "You have unsaved changes. Do you want to save your project before closing?",
-                    "Unsaved Changes",
-                    MessageBoxButton.YesNoCancel,
+                    $"Are you sure you want to delete '{imported.Name}' and all its mesh layers?",
+                    "Confirm Delete",
+                    MessageBoxButton.YesNo,
                     MessageBoxImage.Question);
 
-                if (result == MessageBoxResult.Yes)
+                if (result != MessageBoxResult.Yes)
                 {
-                    // User wants to save - cancel closing and try to save
-                    e.Cancel = true;
-                    
-                    // Attempt to save the project
-                    Task.Run(async () =>
+                    Debug.WriteLine("MainWindow: Delete cancelled by user");
+                    return;
+                }
+
+                // Unregister host layer
+                if (imported.HostLayer != null)
+                {
+                    await _videoService.UnregisterLayerAsync(imported.HostLayer.Id ?? string.Empty);
+                }
+
+                // Unregister all mesh layers
+                foreach (var mesh in imported.MeshLayers.ToArray())
+                {
+                    if (mesh.Model?.Id != null)
                     {
-                        try
-                        {
-                            await HandleSaveProjectAsync();
-                            
-                            // If save was successful (no more unsaved changes), close the window
-                            await Dispatcher.InvokeAsync(() =>
-                            {
-                                if (!_vm.HasUnsavedChanges)
-                                {
-                                    // Temporarily remove the Closing handler to prevent recursion
-                                    Closing -= MainWindow_Closing;
-                                    Close();
-                                }
-                            });
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"Save before close failed: {ex}");
-                            await Dispatcher.InvokeAsync(() =>
-                            {
-                                MessageBox.Show(
-                                    "Failed to save project. Your changes will be lost if you close without saving.", 
-                                    "Save Error", 
-                                    MessageBoxButton.OK, 
-                                    MessageBoxImage.Error);
-                            });
-                        }
-                    });
-                    return; // Cancel the close for now
-                }
-                else if (result == MessageBoxResult.Cancel)
-                {
-                    // User cancelled - don't close
-                    e.Cancel = true;
-                    return;
-                }
-                // If result is No, continue with closing (don't save)
-            }
-
-            // Don't block the closing - let the window close immediately
-            // Start async cleanup on background thread
-            Task.Run(async () =>
-            {
-                try
-                {
-                    Debug.WriteLine("MainWindow_Closing: Starting async cleanup");
-                    
-                    // Stop all video services first
-                    try 
-                    { 
-                        await _videoService.StopAllAsync().ConfigureAwait(false); 
-                        Debug.WriteLine("MainWindow_Closing: VideoService stopped");
-                    } 
-                    catch (Exception ex) 
-                    { 
-                        Debug.WriteLine($"MainWindow_Closing: VideoService stop failed: {ex}"); 
+                        await _videoService.UnregisterMeshLayerAsync(mesh.Model.Id);
                     }
-
-                    // Stop renderer manager
-                    try 
-                    { 
-                        await _rendererManager.StopAsync().ConfigureAwait(false);
-                        Debug.WriteLine("MainWindow_Closing: RendererManager stopped"); 
-                    } 
-                    catch (Exception ex) 
-                    { 
-                        Debug.WriteLine($"MainWindow_Closing: RendererManager stop failed: {ex}"); 
-                    }
-
-                    // Dispose services
-                    try 
-                    { 
-                        _videoService.Dispose(); 
-                        Debug.WriteLine("MainWindow_Closing: VideoService disposed");
-                    } 
-                    catch (Exception ex) 
-                    { 
-                        Debug.WriteLine($"MainWindow_Closing: VideoService dispose failed: {ex}"); 
-                    }
-
-                    try 
-                    { 
-                        _rendererManager.Dispose(); 
-                        Debug.WriteLine("MainWindow_Closing: RendererManager disposed");
-                    } 
-                    catch (Exception ex) 
-                    { 
-                        Debug.WriteLine($"MainWindow_Closing: RendererManager dispose failed: {ex}"); 
-                    }
-
-                    Debug.WriteLine("MainWindow_Closing: Async cleanup completed");
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"MainWindow_Closing: Cleanup failed: {ex}");
-                }
-            });
-        }
-
-        private void HandlePreview()
-        {
-            try
-            {
-                var imported = _vm.SelectedImportedVideo;
-                if (imported?.HostLayer == null) 
-                {
-                    MessageBox.Show("Please select a video source first.", "Preview", MessageBoxButton.OK, MessageBoxImage.Information);
-                    return;
                 }
 
-                var targetMonitor = imported.HostLayer.TargetMonitorIndex;
-                if (targetMonitor < 0 || targetMonitor >= _monitors.Count)
-                {
-                    MessageBox.Show("Please assign an output display to the selected source first.", "Preview", MessageBoxButton.OK, MessageBoxImage.Information);
-                    return;
-                }
+                // Remove from view model
+                _vm.ImportedVideos.Remove(imported);
 
-                // Toggle preview: if fullscreen is already shown, hide it; otherwise show it
-                if (_previewMonitorStates.ContainsKey(targetMonitor) && _previewMonitorStates[targetMonitor])
-                {
-                    // Hide/restore
-                    _rendererManager.HideFullScreenWindow(targetMonitor);
-                    _previewMonitorStates[targetMonitor] = false;
-                    _vm.StatusText = $"Preview closed for Display {targetMonitor + 1}";
-                }
-                else
-                {
-                    // Show fullscreen
-                    _rendererManager.HideFullScreenWindow(targetMonitor); // Hide any existing first
-                    CreateOrShowFullScreenForMonitor(targetMonitor);
-                    _previewMonitorStates[targetMonitor] = true;
-                    _vm.StatusText = $"Preview showing on Display {targetMonitor + 1} (press Escape to close)";
-                }
+                Debug.WriteLine($"MainWindow: Successfully deleted '{imported.Name}'");
+                _vm.StatusText = $"Deleted: {imported.Name}";
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"HandlePreview failed: {ex}");
-                MessageBox.Show($"Preview failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                Debug.WriteLine($"MainWindow: Delete imported failed: {ex}");
+                MessageBox.Show($"Failed to delete video: {ex.Message}", "Delete Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
-        private async Task HandleSaveProjectAsync()
+        private async Task OnSaveProjectRequested()
         {
             try
             {
-                string? path = _currentProjectPath;
-                
-                // If no current path, show save dialog (this MUST be on UI thread)
-                if (string.IsNullOrEmpty(path))
+                Debug.WriteLine("MainWindow: Save project requested");
+
+                // If no current path, do Save As
+                if (string.IsNullOrEmpty(_currentProjectPath))
                 {
-                    // Ensure we're on UI thread when showing file dialog
-                    await Dispatcher.InvokeAsync(async () =>
-                    {
-                        path = await _fileDialog.ShowSaveFileDialogAsync(
-                            "Save Project",
-                            "Untitled.pmproj",
-                            "Projection Mapper Project (*.pmproj)|*.pmproj|All files|*.*");
-                    });
-                    
-                    if (string.IsNullOrEmpty(path)) return; // User cancelled
+                    await OnSaveAsProjectRequested();
+                    return;
                 }
 
-                // Build project model from current state - MUST be done on UI thread
-                ProjectModel? project = null;
-                try
-                {
-                    // Ensure we're on UI thread when building project model
-                    await Dispatcher.InvokeAsync(() =>
-                    {
-                        project = BuildProjectModel();
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"HandleSaveProjectAsync: BuildProjectModel failed: {ex}");
-                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                
-                if (project == null)
-                {
-                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                
-                // Save project on background thread to avoid blocking UI
-                bool success = false;
-                try
-                {
-                    success = await Task.Run(async () =>
-                    {
-                        return await _projectService.SaveAsync(project, path);
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"HandleSaveProjectAsync: Save operation failed: {ex}");
-                    success = false;
-                }
-                
-                // Update UI based on result (ensure on UI thread)
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    if (success)
-                    {
-                        _currentProjectPath = path;
-                        _vm.StatusText = $"Project saved to {Path.GetFileName(path)}";
-                        
-                        // Mark project as clean after successful save
-                        _vm.MarkProjectClean();
-                        UpdateWindowTitle();
-                    }
-                    else
-                    {
-                        MessageBox.Show("Failed to save project. Check the logs for details.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"HandleSaveProjectAsync failed: {ex}");
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    MessageBox.Show($"Failed to save project: {ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
-            }
-        }
+                Debug.WriteLine($"MainWindow: Saving project to {_currentProjectPath}");
 
-        private async Task HandleSaveAsProjectAsync()
-        {
-            try
-            {
-                string? path = null;
-                
-                // Always show save dialog for Save As (this MUST be on UI thread)
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    path = await _fileDialog.ShowSaveFileDialogAsync(
-                        "Save Project As",
-                        string.IsNullOrEmpty(_currentProjectPath) ? "Untitled.pmproj" : Path.GetFileName(_currentProjectPath),
-                        "Projection Mapper Project (*.pmproj)|*.pmproj|All files|*.*");
-                });
-                
-                if (string.IsNullOrEmpty(path)) return; // User cancelled
+                // Build project model from current state
+                var project = BuildProjectModel();
 
-                // Build project model from current state - MUST be done on UI thread
-                ProjectModel? project = null;
-                try
-                {
-                    // Ensure we're on UI thread when building project model
-                    await Dispatcher.InvokeAsync(() =>
-                    {
-                        project = BuildProjectModel();
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"HandleSaveAsProjectAsync: BuildProjectModel failed: {ex}");
-                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                
-                if (project == null)
-                {
-                    MessageBox.Show("Failed to build project model.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                
-                // Save project on background thread to avoid blocking UI
-                bool success = false;
-                try
-                {
-                    success = await Task.Run(async () =>
-                    {
-                        return await _projectService.SaveAsync(project, path);
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"HandleSaveAsProjectAsync: Save operation failed: {ex}");
-                    success = false;
-                }
-                
-                // Update UI based on result
+                // Save project
+                var success = await _projectService.SaveAsync(project, _currentProjectPath);
+
                 if (success)
                 {
-                    _currentProjectPath = path;
-                    _vm.StatusText = $"Project saved to {Path.GetFileName(path)}";
-                    
-                    // Mark project as clean after successful save
                     _vm.MarkProjectClean();
-                    UpdateWindowTitle();
+                    Debug.WriteLine("MainWindow: Project saved successfully");
+                    _vm.StatusText = $"Saved: {Path.GetFileName(_currentProjectPath)}";
                 }
                 else
                 {
-                    MessageBox.Show("Failed to save project. Check the logs for details.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    Debug.WriteLine("MainWindow: Project save failed");
+                    MessageBox.Show("Failed to save project. Check debug output for details.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"HandleSaveAsProjectAsync failed: {ex}");
+                Debug.WriteLine($"MainWindow: Save project failed: {ex}");
                 MessageBox.Show($"Failed to save project: {ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
-        private async Task HandleLoadProjectAsync()
+        private async Task OnSaveAsProjectRequested()
         {
             try
             {
-                string? path = null;
-                
-                // Show open file dialog (this MUST be on UI thread)
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    path = await _fileDialog.ShowOpenFileDialogAsync(
-                        "Open Project",
-                        "Projection Mapper Project (*.pmproj)|*.pmproj|All files|*.*");
-                });
-                
-                if (string.IsNullOrEmpty(path)) return; // User cancelled
+                Debug.WriteLine("MainWindow: Save As project requested");
 
-                // Load project
-                var project = await _projectService.LoadAsync(path);
-                
-                if (project == null)
+                var path = await _fileDialog.ShowSaveFileDialogAsync(
+                    "Save Project As",
+                    "Untitled.pmproj",
+                    "ProjectionMapper Project (*.pmproj)|*.pmproj|All Files (*.*)|*.*");
+
+                if (string.IsNullOrEmpty(path))
                 {
-                    await Dispatcher.InvokeAsync(() =>
-                    {
-                        MessageBox.Show("Failed to load project. The file may be corrupt or in an incompatible format.", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    });
+                    Debug.WriteLine("MainWindow: Save As cancelled by user");
                     return;
                 }
 
-                // Clear current project state
-                await ClearCurrentProjectAsync();
+                Debug.WriteLine($"MainWindow: Saving project to {path}");
 
-                // Apply loaded project
-                await ApplyLoadedProjectAsync(project);
+                // Build project model from current state
+                var project = BuildProjectModel();
 
-                // Update UI state (ensure on UI thread)
-                await Dispatcher.InvokeAsync(() =>
+                // Save project
+                var success = await _projectService.SaveAsync(project, path);
+
+                if (success)
                 {
                     _currentProjectPath = path;
-                    _vm.StatusText = $"Project loaded from {Path.GetFileName(path)}";
-                    
-                    // Mark project as clean after successful load
                     _vm.MarkProjectClean();
-                    
-                    // Update window title
-                    UpdateWindowTitle();
-                });
+                    Debug.WriteLine("MainWindow: Project saved successfully");
+                    _vm.StatusText = $"Saved: {Path.GetFileName(path)}";
+                    Title = $"ProjectionMapper - {Path.GetFileName(path)}";
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: Project save failed");
+                    MessageBox.Show("Failed to save project. Check debug output for details.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"HandleLoadProjectAsync failed: {ex}");
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    MessageBox.Show($"Failed to load project: {ex.Message}", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
+                Debug.WriteLine($"MainWindow: Save As project failed: {ex}");
+                MessageBox.Show($"Failed to save project: {ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
-        private async Task HandleNewProjectAsync()
+        private async Task OnLoadProjectRequested()
         {
             try
             {
-                // Check if there are unsaved changes and prompt user
+                Debug.WriteLine("MainWindow: Load project requested");
+
+                // Check for unsaved changes
                 if (_vm.HasUnsavedChanges)
                 {
                     var result = MessageBox.Show(
-                        "You have unsaved changes. Do you want to save your project before creating a new one?",
+                        "You have unsaved changes. Do you want to save before loading a new project?",
                         "Unsaved Changes",
                         MessageBoxButton.YesNoCancel,
                         MessageBoxImage.Question);
 
-                    if (result == MessageBoxResult.Yes)
+                    if (result == MessageBoxResult.Cancel)
                     {
-                        // User wants to save first
-                        await HandleSaveProjectAsync();
-                        
-                        // If save failed or was cancelled, don't proceed with new project
-                        if (_vm.HasUnsavedChanges)
-                        {
-                            return; // Save failed or was cancelled
-                        }
-                    }
-                    else if (result == MessageBoxResult.Cancel)
-                    {
-                        // User cancelled - don't create new project
+                        Debug.WriteLine("MainWindow: Load cancelled by user");
                         return;
                     }
-                    // If result is No, continue with creating new project (discard changes)
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        await OnSaveProjectRequested();
+                        // If save failed, don't load
+                        if (_vm.HasUnsavedChanges)
+                        {
+                            return;
+                        }
+                    }
+                }
+
+                var path = await _fileDialog.ShowOpenFileDialogAsync(
+                    "Load Project",
+                    "ProjectionMapper Project (*.pmproj)|*.pmproj|All Files (*.*)|*.*");
+
+                if (string.IsNullOrEmpty(path))
+                {
+                    Debug.WriteLine("MainWindow: Load cancelled by user");
+                    return;
+                }
+
+                Debug.WriteLine($"MainWindow: Loading project from {path}");
+
+                // Load project
+                var project = await _projectService.LoadAsync(path);
+
+                if (project == null)
+                {
+                    Debug.WriteLine("MainWindow: Project load failed");
+                    MessageBox.Show("Failed to load project. The file may be corrupted or incompatible.", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
                 }
 
                 // Clear current project state
-                await ClearCurrentProjectAsync();
+                await ClearProjectState();
 
-                // Reset to a clean project state
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    // Clear the current project path
-                    _currentProjectPath = null;
-                    
-                    // Reset view model to clean state
-                    _vm.ImportedVideos.Clear();
-                    _vm.SelectedImportedVideo = null;
-                    _vm.SelectedMeshLayer = null;
-                    
-                    // Reset global settings to defaults
-                    _rendererManager.ShowMeshOverlay = true;
-                    _vm.InputZoom = 1.0;
-                    _vm.OutputZoom = 1.0;
-                    
-                    // Reset UI checkboxes to defaults
-                    if (PART_ShowGridCheckbox != null) PART_ShowGridCheckbox.IsChecked = false;
-                    if (PART_GlobalShowMeshOverlayCheckbox != null) PART_GlobalShowMeshOverlayCheckbox.IsChecked = true;
-                    if (PART_ShowMeshOverlayCheckbox != null) PART_ShowMeshOverlayCheckbox.IsChecked = true;
-                    
-                    // Clear any monitor selections
-                    if (PART_MonitorCombo != null) PART_MonitorCombo.SelectedIndex = -1;
-                    
-                    // Mark as clean and update UI
-                    _vm.MarkProjectClean();
-                    _vm.StatusText = "New project created";
-                    UpdateWindowTitle();
-                    
-                }, DispatcherPriority.Normal);
+                // Load project state into UI
+                await LoadProjectState(project);
 
-                // Hide all fullscreen windows
-                foreach (var monitorIndex in _previewMonitorStates.Keys.ToList())
+                _currentProjectPath = path;
+                _vm.MarkProjectClean();
+                Debug.WriteLine("MainWindow: Project loaded successfully");
+                _vm.StatusText = $"Loaded: {Path.GetFileName(path)}";
+                Title = $"ProjectionMapper - {Path.GetFileName(path)}";
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: Load project failed: {ex}");
+                MessageBox.Show($"Failed to load project: {ex.Message}", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task OnNewProjectRequested()
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: New project requested");
+
+                // Check for unsaved changes
+                if (_vm.HasUnsavedChanges)
                 {
+                    var result = MessageBox.Show(
+                        "You have unsaved changes. Do you want to save before creating a new project?",
+                        "Unsaved Changes",
+                        MessageBoxButton.YesNoCancel,
+                        MessageBoxImage.Question);
+
+                    if (result == MessageBoxResult.Cancel)
+                    {
+                        Debug.WriteLine("MainWindow: New project cancelled by user");
+                        return;
+                    }
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        await OnSaveProjectRequested();
+                        // If save failed, don't create new project
+                        if (_vm.HasUnsavedChanges)
+                        {
+                            return;
+                        }
+                    }
+                }
+
+                // Clear current project state
+                await ClearProjectState();
+
+                _currentProjectPath = null;
+                _vm.MarkProjectClean();
+                Debug.WriteLine("MainWindow: New project created");
+                _vm.StatusText = "New project created";
+                Title = "ProjectionMapper - Untitled";
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: New project failed: {ex}");
+                MessageBox.Show($"Failed to create new project: {ex.Message}", "New Project Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task OnPlayPauseRequestedAsync()
+        {
+            try
+            {
+                Debug.WriteLine($"MainWindow: Play/Pause requested, IsPlaying={_vm.IsPlaying}");
+
+                if (_vm.IsPlaying)
+                {
+                    if (!_vm.IsPlaylistMode && _vm.PlaylistGroups.Count > 0)
+                    {
+                        Debug.WriteLine("MainWindow: Playlist groups detected - enabling playlist mode automatically");
+                        _vm.IsPlaylistMode = true;
+                    }
+
+                    // Start or resume playback
+                    if (_vm.IsPlaylistMode)
+                    {
+                        // Check if playlist is paused - resume instead of starting fresh
+                        if (_playlistService.IsPaused)
+                        {
+                            Debug.WriteLine("MainWindow: Resuming playlist playback from pause");
+                            await _playlistService.ResumeCurrentGroupAsync();
+                        }
+                        else
+                        {
+                            Debug.WriteLine("MainWindow: Starting playlist playback");
+                            // Build list of playlist groups from the view model
+                            var groups = _vm.BuildPlaylistGroupModels();
+                            await _playlistService.StartPlaylistAsync(groups);
+                        }
+                    }
+                    else
+                    {
+                        Debug.WriteLine("MainWindow: Starting legacy playback");
+                        await _videoService.ResumeAllAsync();
+                    }
+                    _vm.StatusText = "Playing";
+                }
+                else
+                {
+                    // Pause playback
+                    if (_vm.IsPlaylistMode)
+                    {
+                        Debug.WriteLine("MainWindow: Pausing playlist playback");
+                        await _playlistService.PauseCurrentGroupAsync();
+                    }
+                    else
+                    {
+                        Debug.WriteLine("MainWindow: Pausing legacy playback");
+                        await _videoService.PauseAllAsync();
+                    }
+                    _vm.StatusText = "Paused";
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: Play/Pause failed: {ex}");
+                MessageBox.Show($"Playback error: {ex.Message}", "Playback Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task OnRestartRequestedAsync()
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: Restart requested");
+
+                if (_vm.IsPlaylistMode)
+                {
+                    Debug.WriteLine("MainWindow: Restarting playlist playback");
+                    await _playlistService.RestartPlaylistAsync();
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: Restarting legacy playback");
+                    await _videoService.RestartAllAsync();
+                }
+
+                _vm.StatusText = "Restarted";
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: Restart failed: {ex}");
+                MessageBox.Show($"Restart error: {ex.Message}", "Restart Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async void OnMeshLayerCreated(LayerModel? layer)
+        {
+            try
+            {
+                if (layer == null)
+                {
+                    Debug.WriteLine("MainWindow: Mesh layer created with null model");
+                    return;
+                }
+
+                Debug.WriteLine($"MainWindow: Mesh layer created: {layer.Name}");
+                await _videoService.RegisterMeshLayerAsync(layer);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: Mesh layer registration failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Reacts to view-model property changes so service behavior (like looping) stays in sync with UI state.
+        /// </summary>
+        private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            try
+            {
+                if (e.PropertyName == nameof(MainWindowViewModel.IsPlaylistMode))
+                {
+                    UpdateLoopingMode(_vm.IsPlaylistMode);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: OnViewModelPropertyChanged failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Ensures decoder looping behavior matches the active playback mode. Playlist mode disables looping so clips stop at EOF.
+        /// </summary>
+        private void UpdateLoopingMode(bool playlistModeActive)
+        {
+            try
+            {
+                if (playlistModeActive)
+                {
+                    _videoService.DisableLoopingForAll();
+                    Debug.WriteLine("MainWindow: Looping disabled (playlist mode)");
+                }
+                else
+                {
+                    _videoService.EnableLoopingForAll();
+                    Debug.WriteLine("MainWindow: Looping enabled (legacy mode)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: UpdateLoopingMode failed: {ex}");
+            }
+        }
+
+        #endregion
+
+        #region Helper Methods
+
+        /// <summary>
+        /// Subscribes to property changes on imported videos so we can react to PlayAudio toggles.
+        /// </summary>
+        private void AttachImportedVideoHandlers(ImportedVideoViewModel? video)
+        {
+            if (video == null) return;
+
+            try
+            {
+                video.PropertyChanged -= ImportedVideo_PropertyChanged;
+                video.PropertyChanged += ImportedVideo_PropertyChanged;
+
+                video.MeshLayers.CollectionChanged -= MeshLayers_CollectionChanged;
+                video.MeshLayers.CollectionChanged += MeshLayers_CollectionChanged;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: AttachImportedVideoHandlers failed: {ex}");
+            }
+        }
+
+        // Track when last EnsureMonitorWindows was called to prevent rapid calls
+        private DateTime _lastEnsureMonitorWindowsCall = DateTime.MinValue;
+        private readonly object _ensureMonitorWindowsLock = new();
+
+        /// <summary>
+        /// Ensures fullscreen output windows exist for all monitors referenced by any mesh layer.
+        /// Also removes windows that are no longer needed.
+        /// </summary>
+        private void EnsureMonitorWindows()
+        {
+            try
+            {
+                // Throttle calls to prevent rapid window creation/destruction
+                lock (_ensureMonitorWindowsLock)
+                {
+                    var now = DateTime.UtcNow;
+                    if ((now - _lastEnsureMonitorWindowsCall).TotalMilliseconds < 100)
+                    {
+                        return;
+                    }
+                    _lastEnsureMonitorWindowsCall = now;
+                }
+
+                if (_monitors == null || _monitors.Count == 0)
+                {
+                    // Nothing to reconcile without monitor metadata
+                    foreach (var idx in _activeMonitorWindows.Keys.ToList())
+                    {
+                        HideMonitorWindow(idx);
+                    }
+                    return;
+                }
+
+                var required = new HashSet<int>();
+
+                // Only mesh layers target monitors - collect all target monitor indices
+                foreach (var video in _vm.ImportedVideos)
+                {
+                    foreach (var mesh in video.MeshLayers)
+                    {
+                        var meshMonitor = mesh.Model?.TargetMonitorIndex ?? -1;
+                        if (meshMonitor >= 0)
+                        {
+                            required.Add(meshMonitor);
+                        }
+                    }
+                }
+
+                // Hide windows no longer referenced by any layer
+                foreach (var active in _activeMonitorWindows.Keys.ToList())
+                {
+                    if (!required.Contains(active))
+                    {
+                        HideMonitorWindow(active);
+                    }
+                }
+
+                // Spin up windows for newly required monitors
+                foreach (var monitorIndex in required)
+                {
+                    ShowMonitorWindow(monitorIndex);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: EnsureMonitorWindows failed: {ex}");
+            }
+        }
+
+        // P/Invoke to place window at exact monitor pixel bounds
+        private const uint SWP_SHOWWINDOW = 0x0040;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        /// <summary>
+        /// Creates (or reuses) a fullscreen output window for the requested monitor.
+        /// Uses the same approach as the original working implementation.
+        /// </summary>
+        private void ShowMonitorWindow(int monitorIndex)
+        {
+            if (monitorIndex < 0)
+            {
+                return;
+            }
+
+            // Check if monitors list is valid and has this index
+            if (_monitors == null || monitorIndex >= _monitors.Count)
+            {
+                Debug.WriteLine($"MainWindow: ShowMonitorWindow - monitor index {monitorIndex} out of range (count: {_monitors?.Count ?? 0})");
+                return;
+            }
+
+            if (_activeMonitorWindows.ContainsKey(monitorIndex))
+            {
+                return;
+            }
+
+            try
+            {
+                var mon = _monitors[monitorIndex];
+                if (mon == null)
+                {
+                    Debug.WriteLine($"MainWindow: ShowMonitorWindow - monitor {monitorIndex} is null");
+                    return;
+                }
+
+                // Create fullscreen window and position it using monitor bounds converted to DIPs
+                var win = new FullScreenOutputWindow
+                {
+                    WindowStyle = WindowStyle.None,
+                    ResizeMode = ResizeMode.NoResize,
+                    ShowInTaskbar = false,
+                    Topmost = true,
+                    WindowState = WindowState.Normal
+                };
+
+                // Convert monitor pixel boundaries to WPF DIPs
+                var source = PresentationSource.FromVisual(this);
+                double dpiX = 1.0, dpiY = 1.0;
+                if (source != null && source.CompositionTarget != null)
+                {
+                    dpiX = source.CompositionTarget.TransformFromDevice.M11;
+                    dpiY = source.CompositionTarget.TransformFromDevice.M22;
+                }
+
+                win.Left = mon.Left / dpiX;
+                win.Top = mon.Top / dpiY;
+                win.Width = mon.Width / dpiX;
+                win.Height = mon.Height / dpiX;
+
+                win.WindowStartupLocation = WindowStartupLocation.Manual;
+
+                win.Closed += FullScreenWindow_Closed;
+                win.Tag = monitorIndex;
+
+                // Ensure native handle exists so we can position the window before showing it
+                try
+                {
+                    var helper = new WindowInteropHelper(win);
+                    var hwnd = helper.EnsureHandle();
+
+                    const int GWL_STYLE = -16;
+                    const int WS_POPUP = unchecked((int)0x80000000);
+
+                    Debug.WriteLine($"MainWindow: Calling SetWindowPos for monitor {monitorIndex} -> rect {mon.Left},{mon.Top} {mon.Width}x{mon.Height}");
+                    bool ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, SWP_SHOWWINDOW);
+                    var err = Marshal.GetLastWin32Error();
+                    Debug.WriteLine($"MainWindow: SetWindowPos returned {ok}, GetLastError={err}");
+
+                    if (!ok)
+                    {
+                        try
+                        {
+                            var prev = GetWindowLong(hwnd, GWL_STYLE);
+                            SetWindowLong(hwnd, GWL_STYLE, prev | WS_POPUP);
+                            ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, SWP_SHOWWINDOW);
+                            err = Marshal.GetLastWin32Error();
+                            Debug.WriteLine($"MainWindow: Retry SetWindowPos returned {ok}, GetLastError={err}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"MainWindow: Retry SetWindowPos exception: {ex}");
+                        }
+                    }
+
+                    // Show the window AFTER native positioning
+                    win.Show();
+
+                    _activeMonitorWindows[monitorIndex] = win;
+
+                    // Initialize the fullscreen renderer for this monitor
+                    _rendererManager.ShowFullScreenWindow(monitorIndex, win, mon.Width, mon.Height);
+                    _rendererManager.AttachHost(monitorIndex, win);
+
+                    // Set to maximized to ensure true fullscreen
+                    win.WindowState = WindowState.Maximized;
+
+                    Debug.WriteLine($"MainWindow: ShowMonitorWindow success for monitor {monitorIndex}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"MainWindow: ShowMonitorWindow placement/show failed: {ex}");
                     try
                     {
-                        _rendererManager.HideFullScreenWindow(monitorIndex);
-                        _previewMonitorStates[monitorIndex] = false;
+                        win.WindowState = WindowState.Maximized;
+                        win.Show();
+                        _activeMonitorWindows[monitorIndex] = win;
+                        _rendererManager.ShowFullScreenWindow(monitorIndex, win, mon.Width, mon.Height);
+                        _rendererManager.AttachHost(monitorIndex, win);
                     }
-                    catch (Exception ex)
+                    catch (Exception ex2)
                     {
-                        Debug.WriteLine($"HandleNewProjectAsync: Failed to hide fullscreen: {ex}");
+                        Debug.WriteLine($"MainWindow: ShowMonitorWindow fallback show failed: {ex2}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"HandleNewProjectAsync failed: {ex}");
-                await Dispatcher.InvokeAsync(() =>
+                Debug.WriteLine($"MainWindow: ShowMonitorWindow failed for monitor {monitorIndex}: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Hides and disposes the fullscreen output window assigned to the specified monitor.
+        /// </summary>
+        private void HideMonitorWindow(int monitorIndex)
+        {
+            if (!_activeMonitorWindows.TryGetValue(monitorIndex, out var window))
+            {
+                return;
+            }
+
+            try
+            {
+                window.Closed -= FullScreenWindow_Closed;
+                _activeMonitorWindows.Remove(monitorIndex);
+                _rendererManager.HideFullScreenWindow(monitorIndex);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: HideMonitorWindow failed for monitor {monitorIndex}: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Cleans up renderer bookkeeping if a fullscreen window is closed directly by the user (e.g., via ESC).
+        /// </summary>
+        private void FullScreenWindow_Closed(object? sender, EventArgs e)
+        {
+            if (sender is not FullScreenOutputWindow window)
+            {
+                return;
+            }
+
+            if (window.Tag is int monitorIndex)
+            {
+                window.Closed -= FullScreenWindow_Closed;
+                _activeMonitorWindows.Remove(monitorIndex);
+
+                try
                 {
-                    MessageBox.Show($"Failed to create new project: {ex.Message}", "New Project Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
+                    _rendererManager.HideFullScreenWindow(monitorIndex);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"MainWindow: FullScreenWindow_Closed cleanup failed for monitor {monitorIndex}: {ex}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Removes property change handlers from imported videos to prevent memory leaks.
+        /// </summary>
+        private void DetachImportedVideoHandlers(ImportedVideoViewModel? video)
+        {
+            if (video == null) return;
+
+            try
+            {
+                video.PropertyChanged -= ImportedVideo_PropertyChanged;
+                video.MeshLayers.CollectionChanged -= MeshLayers_CollectionChanged;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: DetachImportedVideoHandlers failed: {ex}");
+            }
+        }
+
+        private void MeshLayers_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+        {
+            try
+            {
+                EnsureMonitorWindows();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: MeshLayers_CollectionChanged failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Handles changes to imported video properties so audio state stays consistent with the UI.
+        /// </summary>
+        private void ImportedVideo_PropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            if (sender is not ImportedVideoViewModel video || e.PropertyName != nameof(ImportedVideoViewModel.PlayAudio))
+            {
+                return;
+            }
+
+            try
+            {
+                var layerId = video.HostLayer?.Id;
+                if (string.IsNullOrEmpty(layerId))
+                {
+                    return;
+                }
+
+                // CRITICAL FIX: In playlist mode, only allow audio changes for videos in the current group
+                // Otherwise, toggling audio on one video would affect all videos
+                if (_vm.IsPlaylistMode && _playlistService.IsPlaying)
+                {
+                    var currentGroup = _playlistService.CurrentGroup;
+                    if (currentGroup == null || !currentGroup.SourceIds.Contains(layerId))
+                    {
+                        Debug.WriteLine($"MainWindow: Ignoring audio toggle for {layerId} - not in current playlist group");
+                        return;
+                    }
+                }
+
+                if (video.PlayAudio)
+                {
+                    _videoService.StartAudioForLayer(layerId);
+                }
+                else
+                {
+                    _videoService.StopAudioForLayer(layerId);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: ImportedVideo_PropertyChanged failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Keeps handler subscriptions aligned with the imported videos collection.
+        /// </summary>
+        private void OnImportedVideosCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+        {
+            try
+            {
+                if (e.Action == NotifyCollectionChangedAction.Reset)
+                {
+                    foreach (var video in _vm.ImportedVideos)
+                    {
+                        AttachImportedVideoHandlers(video);
+                    }
+                    EnsureMonitorWindows();
+                    return;
+                }
+
+                if (e.NewItems != null)
+                {
+                    foreach (ImportedVideoViewModel video in e.NewItems)
+                    {
+                        AttachImportedVideoHandlers(video);
+                    }
+                }
+
+                if (e.OldItems != null)
+                {
+                    foreach (ImportedVideoViewModel video in e.OldItems)
+                    {
+                        DetachImportedVideoHandlers(video);
+                    }
+                }
+
+                EnsureMonitorWindows();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: OnImportedVideosCollectionChanged failed: {ex}");
+            }
+        }
+
+        // P/Invoke helpers to query physical display mode (to avoid DPI scaling artifacts)
+        private const int ENUM_CURRENT_SETTINGS = -1;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+        private struct DEVMODE
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public short dmSpecVersion;
+            public short dmDriverVersion;
+            public short dmSize;
+            public short dmDriverExtra;
+            public int dmFields;
+
+            public int dmPositionX;
+            public int dmPositionY;
+            public int dmDisplayOrientation;
+            public int dmDisplayFixedOutput;
+
+            public short dmColor;
+            public short dmDuplex;
+            public short dmYResolution;
+            public short dmTTOption;
+            public short dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public short dmLogPixels;
+            public int dmBitsPerPel;
+            public int dmPelsWidth;
+            public int dmPelsHeight;
+            public int dmDisplayFlags;
+            public int dmDisplayFrequency;
+            // remaining fields omitted
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Ansi)]
+        private static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+
+        /// <summary>
+        /// Enumerates connected monitors and populates the monitor dropdown.
+        /// Uses EnumDisplaySettings to obtain the physical pixel resolution to avoid DPI scaling artifacts.
+        /// </summary>
+        private void EnumerateMonitors()
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: Enumerating monitors...");
+                _monitors.Clear();
+                _monitorItems.Clear();
+
+                // Use Windows Forms to enumerate display devices, but query EnumDisplaySettings
+                System.Windows.Forms.Screen[]? screens = null;
+                try
+                {
+                    screens = System.Windows.Forms.Screen.AllScreens;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"MainWindow: Screen.AllScreens failed (display may be disconnecting): {ex}");
+                    return;
+                }
+
+                if (screens == null || screens.Length == 0)
+                {
+                    Debug.WriteLine("MainWindow: No screens found");
+                    return;
+                }
+
+                for (int i = 0; i < screens.Length; i++)
+                {
+                    try
+                    {
+                        var screen = screens[i];
+                        if (screen == null) continue;
+
+                        int physW = screen.Bounds.Width;
+                        int physH = screen.Bounds.Height;
+
+                        try
+                        {
+                            // Query current display mode for the device name to get true physical pixels
+                            var dm = new DEVMODE();
+                            dm.dmDeviceName = new string('\0', 32);
+                            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+
+                            if (EnumDisplaySettings(screen.DeviceName, ENUM_CURRENT_SETTINGS, ref dm))
+                            {
+                                // Use dmPelsWidth/dmPelsHeight which reflect the actual mode in pixels
+                                if (dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0)
+                                {
+                                    physW = dm.dmPelsWidth;
+                                    physH = dm.dmPelsHeight;
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"MainWindow: EnumDisplaySettings failed for {screen.DeviceName}: {ex}");
+                        }
+
+                        var bounds = screen.Bounds;
+
+                        _monitors.Add(new MonitorInfo(physW, physH, bounds.Left, bounds.Top));
+
+                        var isPrimary = screen.Primary ? " (Primary)" : "";
+                        var monitorItem = new MonitorItem
+                        {
+                            Index = i,
+                            Name = $"Display {i + 1}: {physW}x{physH}{isPrimary}"
+                        };
+                        _monitorItems.Add(monitorItem);
+
+                        Debug.WriteLine($"MainWindow: Found monitor {i}: {monitorItem.Name} at ({bounds.Left}, {bounds.Top})");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"MainWindow: Failed to enumerate monitor {i}: {ex}");
+                    }
+                }
+
+                // Populate PART_MeshMonitorCombo (for mesh layers)
+                if (PART_MeshMonitorCombo != null)
+                {
+                    PART_MeshMonitorCombo.Items.Clear();
+                    PART_MeshMonitorCombo.Items.Add("(None)");
+                    foreach (var item in _monitorItems)
+                    {
+                        PART_MeshMonitorCombo.Items.Add(item.Name);
+                    }
+                    PART_MeshMonitorCombo.SelectedIndex = 0;
+
+                    // Wire up selection changed event for PART_MeshMonitorCombo
+                    PART_MeshMonitorCombo.SelectionChanged -= OnMeshMonitorComboSelectionChanged;
+                    PART_MeshMonitorCombo.SelectionChanged += OnMeshMonitorComboSelectionChanged;
+                }
+
+                Debug.WriteLine($"MainWindow: Found {_monitorItems.Count} monitors");
+
+                // Reconcile fullscreen output windows with the latest monitor inventory
+                EnsureMonitorWindows();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: EnumerateMonitors failed: {ex}");
+            }
+        }
+
+        private void OnMeshMonitorComboSelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            try
+            {
+                if (_vm.SelectedMeshLayer == null) return;
+                
+                var selectedIndex = PART_MeshMonitorCombo.SelectedIndex - 1; // -1 because "None" is at index 0
+                
+                // Use the ViewModel property to trigger PropertyChanged notification
+                // This allows the overlay system to detect the change and update overlays accordingly
+                _vm.SelectedMeshLayer.TargetMonitorIndex = selectedIndex;
+                Debug.WriteLine($"MainWindow: Set target monitor to {selectedIndex} for mesh layer");
+
+                EnsureMonitorWindows();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: OnMeshMonitorComboSelectionChanged failed: {ex}");
             }
         }
 
@@ -1510,454 +1372,571 @@ try
                 var project = new ProjectModel
                 {
                     Name = _vm.ActiveProject?.Name ?? "Untitled Project",
-                    CreatedAt = _vm.ActiveProject?.CreatedAt ?? DateTime.UtcNow,
-                    ShowMeshOverlay = _rendererManager.ShowMeshOverlay,
-                    ShowCoordinateGrid = PART_ShowGridCheckbox?.IsChecked ?? false,
+                    ProjectVersion = 2,
+                    PlaylistMode = _vm.IsPlaylistMode,
+                    ShowMeshOverlay = true,
+                    ShowCoordinateGrid = false,
                     InputZoom = _vm.InputZoom,
                     OutputZoom = _vm.OutputZoom
                 };
 
-                // Convert imported videos to serializable format
-                // We need to copy all data on the UI thread to avoid cross-thread access violations
+                // Add imported videos
                 foreach (var imported in _vm.ImportedVideos)
                 {
-                    try
+                    var videoData = new ImportedVideoData
                     {
-                        if (imported?.HostLayer == null) continue;
+                        Id = imported.Id,
+                        Name = imported.Name,
+                        SourcePath = imported.SourcePath,
+                        PlayAudio = imported.PlayAudio,
+                        Visible = true
+                    };
 
-                        var importedData = new ImportedVideoData
+                    // Add mesh layers
+                    foreach (var mesh in imported.MeshLayers)
+                    {
+                        var meshData = new MeshLayerData
                         {
-                            Id = imported.HostLayer.Id ?? Guid.NewGuid().ToString("N"),
-                            Name = imported.Name ?? string.Empty,
-                            SourcePath = imported.SourcePath ?? string.Empty,
-                            TargetMonitorIndex = imported.HostLayer.TargetMonitorIndex,
-                            PlayAudio = imported.PlayAudio,
-                            Visible = imported.HostLayer.Visible
+                            Id = mesh.Model.Id ?? Guid.NewGuid().ToString("N"),
+                            Name = mesh.Name ?? "Mesh",
+                            SourceId = mesh.Model.SourceId ?? string.Empty,
+                            X = mesh.X,
+                            Y = mesh.Y,
+                            Width = mesh.Width,
+                            Height = mesh.Height,
+                            Opacity = mesh.Opacity,
+                            Visible = mesh.Visible,
+                            RotationDegrees = mesh.RotationDegrees,
+                            // Access TargetMonitorIndex through the Model property
+                            TargetMonitorIndex = mesh.Model.TargetMonitorIndex,
+                            ShowOverlay = mesh.ShowOverlay
                         };
 
-                        // Convert mesh layers
-                        foreach (var meshVm in imported.MeshLayers)
+                        // Copy mesh points
+                        var srcPoints = mesh.Model.MeshPoints;
+                        var srcOutputPoints = mesh.Model.OutputMeshPoints;
+                        meshData.MeshPoints = new float[8];
+                        meshData.OutputMeshPoints = new float[8];
+
+                        for (int i = 0; i < 4 && i < srcPoints.Length; i++)
                         {
-                            try
-                            {
-                                if (meshVm?.Model == null) continue;
-
-                                var meshData = new MeshLayerData
-                                {
-                                    Id = meshVm.Model.Id ?? Guid.NewGuid().ToString("N"),
-                                    Name = meshVm.Name ?? string.Empty,
-                                    SourceId = meshVm.Model.SourceId ?? string.Empty,
-                                    X = meshVm.X,
-                                    Y = meshVm.Y,
-                                    Width = meshVm.Width,
-                                    Height = meshVm.Height,
-                                    Opacity = meshVm.Opacity,
-                                    Visible = meshVm.Visible,
-                                    RotationDegrees = meshVm.RotationDegrees,
-                                    TargetMonitorIndex = meshVm.Model.TargetMonitorIndex,
-                                    ShowOverlay = meshVm.Model.ShowOverlay
-                                };
-
-                                // Convert mesh points to flat array - read from the model arrays directly
-                                var meshPts = meshVm.Model.MeshPoints;
-                                if (meshPts != null && meshPts.Length >= 4)
-                                {
-                                    meshData.MeshPoints = new float[]
-                                    {
-                                        meshPts[0].X, meshPts[0].Y,
-                                        meshPts[1].X, meshPts[1].Y,
-                                        meshPts[2].X, meshPts[2].Y,
-                                        meshPts[3].X, meshPts[3].Y
-                                    };
-                                }
-
-                                var outputPts = meshVm.Model.OutputMeshPoints;
-                                if (outputPts != null && outputPts.Length >= 4)
-                                {
-                                    meshData.OutputMeshPoints = new float[]
-                                    {
-                                        outputPts[0].X, outputPts[0].Y,
-                                        outputPts[1].X, outputPts[1].Y,
-                                        outputPts[2].X, outputPts[2].Y,
-                                        outputPts[3].X, outputPts[3].Y
-                                    };
-                                }
-
-                                importedData.MeshLayers.Add(meshData);
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"BuildProjectModel: Failed to convert mesh layer: {ex}");
-                            }
+                            meshData.MeshPoints[i * 2] = srcPoints[i].X;
+                            meshData.MeshPoints[i * 2 + 1] = srcPoints[i].Y;
                         }
 
-                        project.ImportedVideos.Add(importedData);
+                        for (int i = 0; i < 4 && i < srcOutputPoints.Length; i++)
+                        {
+                            meshData.OutputMeshPoints[i * 2] = srcOutputPoints[i].X;
+                            meshData.OutputMeshPoints[i * 2 + 1] = srcOutputPoints[i].Y;
+                        }
+
+                        videoData.MeshLayers.Add(meshData);
                     }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"BuildProjectModel: Failed to convert imported video: {ex}");
-                    }
+
+                    project.ImportedVideos.Add(videoData);
                 }
 
-                // Save playlist groups
+                // Add playlist groups
                 project.PlaylistGroups = _vm.BuildPlaylistGroupModels();
-                project.PlaylistMode = _vm.IsPlaylistMode;
 
                 return project;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"BuildProjectModel failed: {ex}");
+                Debug.WriteLine($"MainWindow: BuildProjectModel failed: {ex}");
                 throw;
             }
         }
 
-        private async Task ClearCurrentProjectAsync()
+        private async Task ClearProjectState()
         {
             try
             {
-                // Stop and unregister all video layers
-                foreach (var imported in _vm.ImportedVideos.ToList())
-                {
-                    try
-                    {
-                        if (imported.HostLayer != null && !string.IsNullOrEmpty(imported.HostLayer.Id))
-                        {
-                            await _videoService.UnregisterLayerAsync(imported.HostLayer.Id);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"ClearCurrentProjectAsync: Failed to unregister layer: {ex}");
-                    }
-                }
+                Debug.WriteLine("MainWindow: Clearing project state");
 
-                // Clear UI collections
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    _vm.ImportedVideos.Clear();
-                    _vm.SelectedImportedVideo = null;
-                    _vm.SelectedMeshLayer = null;
-                    
-                    // Clear playlist groups
-                    _vm.PlaylistGroups.Clear();
-                    _vm.SelectedPlaylistGroup = null;
-                    _vm.CurrentPlaylistGroup = null;
-                    _vm.IsPlaylistMode = false;
-                }, DispatcherPriority.Normal);
+                // Stop playback - pass re-enable looping flag to restore legacy mode behavior
+                await _playlistService.StopPlaylistAsync(reEnableLooping: true);
+                await _videoService.StopAllAsync();
 
-                // Stop playlist service if running
-                try
+                // Clear imported videos (detach handlers first to avoid lingering subscriptions)
+                foreach (var video in _vm.ImportedVideos.ToList())
                 {
-                    await _playlistService.StopPlaylistAsync();
+                    DetachImportedVideoHandlers(video);
                 }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"ClearCurrentProjectAsync: Failed to stop playlist: {ex}");
-                }
+                _vm.ImportedVideos.Clear();
 
-                // Hide all fullscreen windows
-                foreach (var monitorIndex in _previewMonitorStates.Keys.ToList())
-                {
-                    try
-                    {
-                        _rendererManager.HideFullScreenWindow(monitorIndex);
-                        _previewMonitorStates[monitorIndex] = false;
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"ClearCurrentProjectAsync: Failed to hide fullscreen: {ex}");
-                    }
-                }
+                // Clear playlist groups
+                _vm.PlaylistGroups.Clear();
+
+                // Reset playlist mode
+                _vm.IsPlaylistMode = false;
+
+                Debug.WriteLine("MainWindow: Project state cleared");
+
+                // Ensure fullscreen outputs are closed when nothing targets them
+                EnsureMonitorWindows();
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"ClearCurrentProjectAsync failed: {ex}");
+                Debug.WriteLine($"MainWindow: ClearProjectState failed: {ex}");
+                throw;
             }
         }
 
-        private async Task ApplyLoadedProjectAsync(ProjectModel project)
+        private async Task LoadProjectState(ProjectModel project)
         {
             try
             {
-                // Restore global settings
-                _rendererManager.ShowMeshOverlay = project.ShowMeshOverlay;
+                Debug.WriteLine($"MainWindow: Loading project state for '{project.Name}'");
+
+                // Set project properties
+                _vm.IsPlaylistMode = project.PlaylistMode;
                 _vm.InputZoom = project.InputZoom;
                 _vm.OutputZoom = project.OutputZoom;
-                
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    if (PART_ShowGridCheckbox != null) PART_ShowGridCheckbox.IsChecked = project.ShowCoordinateGrid;
-                    if (PART_GlobalShowMeshOverlayCheckbox != null) PART_GlobalShowMeshOverlayCheckbox.IsChecked = project.ShowMeshOverlay;
-                }, DispatcherPriority.Normal);
 
-                // Restore imported videos
-                foreach (var importedData in project.ImportedVideos)
+                // Load imported videos
+                foreach (var videoData in project.ImportedVideos)
                 {
-                    try
+                    var imported = new ImportedVideoViewModel(videoData.Id, videoData.Name, videoData.SourcePath);
+
+                    // Create host layer
+                    var hostLayer = new LayerModel
                     {
-                        // Check if source file exists
-                        if (!File.Exists(importedData.SourcePath))
-                        {
-                            Debug.WriteLine($"ApplyLoadedProjectAsync: Source file not found: {importedData.SourcePath}");
-                            MessageBox.Show($"Source file not found: {importedData.SourcePath}\n\nThis video will be skipped.", "Missing File", MessageBoxButton.OK, MessageBoxImage.Warning);
-                            continue;
-                        }
+                        Id = videoData.Id,
+                        Name = $"{videoData.Name} (Host)",
+                        SourcePath = videoData.SourcePath,
+                        Width = _rendererManager.OutputWidth,
+                        Height = _rendererManager.OutputHeight,
+                        Visible = videoData.Visible,
+                        PlayAudio = videoData.PlayAudio,
+                        PreviewOnly = videoData.MeshLayers.Count > 0
+                    };
 
-                        // Create ImportedVideoViewModel
-                        var importedVm = new ImportedVideoViewModel(importedData.Id, importedData.Name, importedData.SourcePath);
+                    imported.HostLayer = hostLayer;
+                    imported.NotifyHostLayerChanged();
 
-                        // Create host layer
-                        var hostLayer = new LayerModel
+                    // Load mesh layers
+                    foreach (var meshData in videoData.MeshLayers)
+                    {
+                        var meshModel = new LayerModel
                         {
-                            Id = importedData.Id,
-                            Name = importedData.Name,
-                            SourcePath = importedData.SourcePath,
-                            TargetMonitorIndex = importedData.TargetMonitorIndex,
-                            PlayAudio = importedData.PlayAudio,
-                            Visible = importedData.Visible,
-                            PreviewOnly = importedData.MeshLayers.Count > 0 // Preview only if meshes exist
+                            Id = meshData.Id,
+                            Name = meshData.Name,
+                            SourceId = meshData.SourceId,
+                            X = meshData.X,
+                            Y = meshData.Y,
+                            Width = meshData.Width,
+                            Height = meshData.Height,
+                            Opacity = meshData.Opacity,
+                            Visible = meshData.Visible,
+                            RotationDegrees = meshData.RotationDegrees,
+                            TargetMonitorIndex = meshData.TargetMonitorIndex,
+                            ShowOverlay = meshData.ShowOverlay
                         };
 
-                        // Determine decode size
-                        var hostForLayer = PART_InputHost ?? PART_OutputHost;
-                        var w = (int)Math.Max(1, hostForLayer.ActualWidth);
-                        var h = (int)Math.Max(1, hostForLayer.ActualHeight);
-                        if (w == 0 || h == 0) { w = 1280; h = 720; }
-                        hostLayer.X = 0; hostLayer.Y = 0; hostLayer.Width = w; hostLayer.Height = h;
-
-                        // Register decoder
-                        await _videoService.RegisterLayerAsync(hostLayer);
-                        importedVm.HostLayer = hostLayer;
-                        importedVm.NotifyHostLayerChanged();
-
-                        // Restore mesh layers
-                        foreach (var meshData in importedData.MeshLayers)
+                        // Copy mesh points
+                        for (int i = 0; i < 4 && (i * 2 + 1) < meshData.MeshPoints.Length; i++)
                         {
-                            var layerModel = new LayerModel
-                            {
-                                Id = meshData.Id,
-                                Name = meshData.Name,
-                                SourceId = meshData.SourceId,
-                                X = meshData.X,
-                                Y = meshData.Y,
-                                Width = meshData.Width,
-                                Height = meshData.Height,
-                                Opacity = meshData.Opacity,
-                                Visible = meshData.Visible,
-                                RotationDegrees = meshData.RotationDegrees,
-                                TargetMonitorIndex = meshData.TargetMonitorIndex,
-                                ShowOverlay = meshData.ShowOverlay
-                            };
-
-                            // Restore mesh points from flat array
-                            if (meshData.MeshPoints != null && meshData.MeshPoints.Length >= 8)
-                            {
-                                layerModel.MeshPoints[0] = new Vector2(meshData.MeshPoints[0], meshData.MeshPoints[1]);
-                                layerModel.MeshPoints[1] = new Vector2(meshData.MeshPoints[2], meshData.MeshPoints[3]);
-                                layerModel.MeshPoints[2] = new Vector2(meshData.MeshPoints[4], meshData.MeshPoints[5]);
-                                layerModel.MeshPoints[3] = new Vector2(meshData.MeshPoints[6], meshData.MeshPoints[7]);
-                            }
-
-                            if (meshData.OutputMeshPoints != null && meshData.OutputMeshPoints.Length >= 8)
-                            {
-                                layerModel.OutputMeshPoints[0] = new Vector2(meshData.OutputMeshPoints[0], meshData.OutputMeshPoints[1]);
-                                layerModel.OutputMeshPoints[1] = new Vector2(meshData.OutputMeshPoints[2], meshData.OutputMeshPoints[3]);
-                                layerModel.OutputMeshPoints[2] = new Vector2(meshData.OutputMeshPoints[4], meshData.OutputMeshPoints[5]);
-                                layerModel.OutputMeshPoints[3] = new Vector2(meshData.OutputMeshPoints[6], meshData.OutputMeshPoints[7]);
-                            }
-
-                            var meshVm = new LayerViewModel(layerModel);
-                            importedVm.MeshLayers.Add(meshVm);
-
-                            // Register mesh layer with video service
-                            await _videoService.RegisterMeshLayerAsync(layerModel);
+                            meshModel.MeshPoints[i] = new Vector2(
+                                meshData.MeshPoints[i * 2],
+                                meshData.MeshPoints[i * 2 + 1]);
                         }
 
-                        // Add to UI
-                        await Dispatcher.InvokeAsync(() =>
+                        for (int i = 0; i < 4 && (i * 2 + 1) < meshData.OutputMeshPoints.Length; i++)
                         {
-                            _vm.ImportedVideos.Add(importedVm);
-                            
-                            // Update monitor combo if this is the first imported video
-                            if (_vm.ImportedVideos.Count == 1)
-                            {
-                                _vm.SelectedImportedVideo = importedVm;
-                                if (PART_MonitorCombo != null && importedVm.HostLayer != null)
-                                {
-                                    PART_MonitorCombo.SelectedIndex = importedVm.HostLayer.TargetMonitorIndex >= 0 ? importedVm.HostLayer.TargetMonitorIndex : -1;
-                                }
-                            }
-                        }, DispatcherPriority.Normal);
+                            meshModel.OutputMeshPoints[i] = new Vector2(
+                                meshData.OutputMeshPoints[i * 2],
+                                meshData.OutputMeshPoints[i * 2 + 1]);
+                        }
+
+                        var meshVm = new LayerViewModel(meshModel);
+                        imported.MeshLayers.Add(meshVm);
+
+                        await _videoService.RegisterMeshLayerAsync(meshModel);
                     }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"ApplyLoadedProjectAsync: Failed to load imported video {importedData.Name}: {ex}");
-                    }
+
+                    _vm.ImportedVideos.Add(imported);
+                    await _videoService.RegisterLayerAsync(hostLayer, playAudio: videoData.PlayAudio);
                 }
 
                 // Load playlist groups
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    try
-                    {
-                        _vm.LoadPlaylistGroups(project.PlaylistGroups);
-                        _vm.IsPlaylistMode = project.PlaylistMode;
-                        
-                        // Populate video references in groups
-                        _vm.UpdatePlaylistGroupVideos();
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"ApplyLoadedProjectAsync: Failed to load playlist groups: {ex}");
-                    }
-                }, DispatcherPriority.Normal);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"ApplyLoadedProjectAsync failed: {ex}");
-            }
+                _vm.LoadPlaylistGroups(project.PlaylistGroups);
+                _vm.UpdatePlaylistGroupVideos();
+
+                // In playlist mode, looping is already disabled (set earlier in LoadProjectState)
+                // Videos will play normally and stop at EOF, waiting for the playlist to advance
+                // We don't need to pause them here - let them play so the user can see the preview
+               
+
+                Debug.WriteLine("MainWindow: Project state loaded successfully");
+
+                 // Update fullscreen window assignments to reflect the freshly loaded project
+                 EnsureMonitorWindows();
+ 
+                // Automatically start playlist playback so only one group runs at a time
+                await EnsurePlaylistAutostartAsync().ConfigureAwait(false);
+             }
+             catch (Exception ex)
+             {
+                 Debug.WriteLine($"MainWindow: LoadProjectState failed: {ex}");
+                 throw;
+             }
         }
 
-        private record MonitorInfo(int Width, int Height, int Left, int Top);
-        private static List<MonitorInfo> EnumerateMonitors()
+        /// <summary>
+        /// Ensures playlist playback starts automatically when playlist mode is active after loading a project.
+        /// </summary>
+        private async Task EnsurePlaylistAutostartAsync()
         {
             try
             {
-                var list = new List<MonitorInfo>();
-
-                MonitorEnumDelegate del = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
+                if (!_vm.IsPlaylistMode)
                 {
-                    try
-                    {
-                        var mi = new MONITORINFOEX();
-                        mi.cbSize = Marshal.SizeOf<MONITORINFOEX>();
-                        if (GetMonitorInfo(hMonitor, ref mi))
-                        {
-                            var w = mi.rcMonitor.Right - mi.rcMonitor.Left;
-                            var h = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
-                            var l = mi.rcMonitor.Left;
-                            var t = mi.rcMonitor.Top;
-                            list.Add(new MonitorInfo(w, h, l, t));
-                        }
-                    }
-                    catch { }
-                    return true;
-                };
+                    return;
+                }
 
-                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, del, IntPtr.Zero);
-
-                return list;
-            }
-            catch
-            {
-                return new List<MonitorInfo>();
-            }
-        }
-
-        private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
-
-        [DllImport("user32.dll", SetLastError = false)]
-        private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumDelegate lpfnEnum, IntPtr dwData);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
-
-        // P/Invoke for positioning windows
-        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct RECT
-        {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
-        }
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-        private struct MONITORINFOEX
-        {
-            public int cbSize;
-            public RECT rcMonitor;
-            public RECT rcWork;
-            public uint dwFlags;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-            public string szDevice;
-        }
-
-        #region Playlist Event Handlers
-
-        private void OnPlaylistGroupChanged(int newGroupIndex)
-        {
-            try
-            {
-                Dispatcher.InvokeAsync(() =>
+                if (_vm.PlaylistGroups == null || _vm.PlaylistGroups.Count == 0)
                 {
-                    try
-                    {
-                        // Update IsActive flag on all groups
-                        foreach (var group in _vm.PlaylistGroups)
-                        {
-                            group.IsActive = group.Order == newGroupIndex;
-                        }
+                    return;
+                }
 
-                        // Update CurrentPlaylistGroup
-                        if (newGroupIndex >= 0 && newGroupIndex < _vm.PlaylistGroups.Count)
-                        {
-                            _vm.CurrentPlaylistGroup = _vm.PlaylistGroups.FirstOrDefault(g => g.Order == newGroupIndex);
-                        }
-                        else
-                        {
-                            _vm.CurrentPlaylistGroup = null;
-                        }
+                var groups = _vm.BuildPlaylistGroupModels();
+                if (groups == null || groups.Count == 0)
+                {
+                    return;
+                }
 
-                        _vm.StatusText = $"Playing Group {newGroupIndex + 1}: {_vm.CurrentPlaylistGroup?.Name ?? "Unknown"}";
-                        Debug.WriteLine($"PlaylistGroupChanged: Now playing group {newGroupIndex}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"OnPlaylistGroupChanged: Error updating UI: {ex}");
-                    }
-                }, DispatcherPriority.Normal);
+                Debug.WriteLine("MainWindow: Auto-starting playlist playback after project load");
+                await _playlistService.StartPlaylistAsync(groups).ConfigureAwait(false);
+                _vm.SetPlaybackState(true);
+                _vm.StatusText = "Playing (Playlist Mode)";
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"OnPlaylistGroupChanged: Error: {ex}");
-            }
-        }
-
-        private void OnPlaylistCompleted()
-        {
-            try
-            {
-                Dispatcher.InvokeAsync(() =>
-                {
-                    try
-                    {
-                        _vm.StatusText = "Playlist completed - looping back to start";
-                        Debug.WriteLine("PlaylistCompleted: Playlist cycle completed");
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"OnPlaylistCompleted: Error updating UI: {ex}");
-                    }
-                }, DispatcherPriority.Normal);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"OnPlaylistCompleted: Error: {ex}");
+                Debug.WriteLine($"MainWindow: EnsurePlaylistAutostartAsync failed: {ex}");
             }
         }
 
         #endregion
+
+        // Event handlers required by XAML
+        private void Window_Loaded(object sender, RoutedEventArgs e) { }
+        
+        private void ExitMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: Exit menu clicked");
+                Close();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: ExitMenuItem_Click failed: {ex}");
+                Application.Current.Shutdown();
+            }
+        }
+        
+        private void AboutMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: About menu clicked");
+                var aboutWindow = new AboutWindow
+                {
+                    Owner = this,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner
+                };
+                aboutWindow.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: AboutMenuItem_Click failed: {ex}");
+                MessageBox.Show($"Failed to open About dialog: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+        
+        private void TreeView_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+        {
+            try
+            {
+                var selectedItem = e.NewValue;
+                Debug.WriteLine($"MainWindow: TreeView selection changed to: {selectedItem?.GetType().Name}");
+
+                // Clear current selections first
+                _vm.SelectedMeshLayer = null;
+                _vm.SelectedImportedVideo = null;
+                _vm.SelectedPlaylistGroup = null;
+
+                // Handle different selection types
+                if (selectedItem is PlaylistGroupTreeViewModel groupTree)
+                {
+                    // Find the corresponding PlaylistGroupViewModel
+                    var groupVm = _vm.PlaylistGroups.FirstOrDefault(g => g.Model.Id == groupTree.Id);
+                    if (groupVm != null)
+                    {
+                        _vm.SelectedPlaylistGroup = groupVm;
+                        Debug.WriteLine($"MainWindow: Selected playlist group: {groupVm.Name}");
+                    }
+                    
+                    // Reset mesh monitor combo when no mesh is selected
+                    PART_MeshMonitorCombo.SelectedIndex = 0;
+                }
+                else if (selectedItem is ImportedVideoTreeViewModel videoTree)
+                {
+                    // Set the selected imported video
+                    var video = videoTree.ImportedVideo;
+                    _vm.SelectedImportedVideo = video;
+                    Debug.WriteLine($"MainWindow: Selected imported video: {video.Name}");
+                    
+                    // Reset mesh monitor combo when no mesh is selected
+                    PART_MeshMonitorCombo.SelectedIndex = 0;
+                }
+                else if (selectedItem is LayerViewModel meshVm)
+                {
+                    // Set both the mesh layer AND its parent video
+                    _vm.SelectedMeshLayer = meshVm;
+                    
+                    // Find the parent imported video that contains this mesh
+                    var parentVideo = _vm.ImportedVideos.FirstOrDefault(v => v.MeshLayers.Contains(meshVm));
+                    if (parentVideo != null)
+                    {
+                        _vm.SelectedImportedVideo = parentVideo;
+                        Debug.WriteLine($"MainWindow: Selected mesh layer: {meshVm.Name} (parent: {parentVideo.Name})");
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"MainWindow: Selected mesh layer: {meshVm.Name} (no parent found)");
+                    }
+                    
+                    // Sync PART_MeshMonitorCombo with the mesh layer's target monitor
+                    var targetMonitor = meshVm.Model?.TargetMonitorIndex ?? -1;
+                    // SelectedIndex 0 = "(None)", so targetMonitor -1 maps to index 0, targetMonitor 0 maps to index 1, etc.
+                    var comboIndex = targetMonitor + 1;
+                    if (comboIndex >= 0 && comboIndex < PART_MeshMonitorCombo.Items.Count)
+                    {
+                        PART_MeshMonitorCombo.SelectedIndex = comboIndex;
+                    }
+                    else
+                    {
+                        PART_MeshMonitorCombo.SelectedIndex = 0;
+                    }
+                }
+                else
+                {
+                    // Nothing selected - reset combo
+                    PART_MeshMonitorCombo.SelectedIndex = 0;
+                }
+
+                // Update command states
+                (_vm.CreateMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (_vm.DeleteMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (_vm.CopyMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (_vm.PasteMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: TreeView_SelectedItemChanged failed: {ex}");
+            }
+        }
+        
+        private void TreeView_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            try
+            {
+                // Ensure the item under the mouse becomes selected so context menu commands operate on it
+                var original = e.OriginalSource as DependencyObject;
+                while (original != null && !(original is TreeViewItem))
+                {
+                    original = VisualTreeHelper.GetParent(original);
+                }
+
+                if (original is TreeViewItem item)
+                {
+                    item.IsSelected = true;
+                    // Allow event to continue so context menu opens
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: TreeView_PreviewMouseRightButtonDown failed: {ex}");
+            }
+        }
+
+        private void CreateMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // Invoke the view-model command to create a mesh for the currently selected imported video
+                if (_vm?.CreateMeshCommand != null && _vm.CreateMeshCommand.CanExecute(null))
+                {
+                    _vm.CreateMeshCommand.Execute(null);
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: CreateMeshCommand cannot execute or is null");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: CreateMeshMenuItem_Click failed: {ex}");
+            }
+        }
+
+        private void RenameGroupMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: RenameGroupMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"RenameGroupMenuItem_Click failed: {ex}"); }
+        }
+
+        private void DeleteGroupMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: DeleteGroupMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"DeleteGroupMenuItem_Click failed: {ex}"); }
+        }
+
+        private void MoveGroupUpMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: MoveGroupUpMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"MoveGroupUpMenuItem_Click failed: {ex}"); }
+        }
+
+        private void MoveGroupDownMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: MoveGroupDownMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"MoveGroupDownMenuItem_Click failed: {ex}"); }
+        }
+
+        private void PlayGroupNowMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: PlayGroupNowMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"PlayGroupNowMenuItem_Click failed: {ex}"); }
+        }
+
+        private void VideoContextMenu_Opened(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: VideoContextMenu_Opened"); }
+            catch (Exception ex) { Debug.WriteLine($"VideoContextMenu_Opened failed: {ex}"); }
+        }
+
+        private void DeleteSourceMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try 
+            { 
+                Debug.WriteLine("MainWindow: DeleteSourceMenuItem_Click");
+                DeleteSelectedVideo();
+            }
+            catch (Exception ex) { Debug.WriteLine($"DeleteSourceMenuItem_Click failed: {ex}"); }
+        }
+
+        private void RemoveVideoFromGroupMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try 
+            { 
+                Debug.WriteLine("MainWindow: RemoveVideoFromGroupMenuItem_Click");
+                // Get the selected video and remove it from its current group
+                if (_vm.SelectedImportedVideo != null)
+                {
+                    var video = _vm.SelectedImportedVideo;
+                    
+                    // Find the parent group and remove the video
+                    foreach (var group in _vm.PlaylistGroups)
+                    {
+                        if (group.Videos.Contains(video))
+                        {
+                            group.Videos.Remove(video);
+                            Debug.WriteLine($"MainWindow: Removed '{video.Name}' from group '{group.Name}'");
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"RemoveVideoFromGroupMenuItem_Click failed: {ex}"); }
+        }
+
+        private void CopyMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: CopyMeshMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"CopyMeshMenuItem_Click failed: {ex}"); }
+        }
+
+        private void PasteMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: PasteMeshMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"PasteMeshMenuItem_Click failed: {ex}"); }
+        }
+
+        private void HideSourceOutputMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: HideSourceOutputMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"HideSourceOutputMenuItem_Click failed: {ex}"); }
+        }
+
+        private void RenameMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try { Debug.WriteLine("MainWindow: RenameMeshMenuItem_Click - not implemented"); }
+            catch (Exception ex) { Debug.WriteLine($"RenameMeshMenuItem_Click failed: {ex}"); }
+        }
+
+        private void DeleteMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try 
+            { 
+                Debug.WriteLine("MainWindow: DeleteMeshMenuItem_Click");
+                DeleteSelectedMeshLayer();
+            }
+            catch (Exception ex) { Debug.WriteLine($"DeleteMeshMenuItem_Click failed: {ex}"); }
+        }
+
+        private void DeleteSelectedVideo()
+        {
+            try
+            {
+                if (_vm.SelectedImportedVideo == null) return;
+
+                var videoToDelete = _vm.SelectedImportedVideo;
+
+                // Stop the video first
+                _videoService.UnregisterLayerAsync(videoToDelete.Id).GetAwaiter().GetResult();
+
+                // Remove from collection
+                _vm.ImportedVideos.Remove(videoToDelete);
+
+                Debug.WriteLine($"MainWindow: Deleted video '{videoToDelete.Name}'");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: DeleteSelectedVideo failed: {ex}");
+            }
+        }
+
+        private void DeleteSelectedMeshLayer()
+        {
+            try
+            {
+                if (_vm.SelectedMeshLayer == null || _vm.SelectedImportedVideo == null) return;
+
+                var meshToDelete = _vm.SelectedMeshLayer;
+                var parentVideo = _vm.SelectedImportedVideo;
+
+                // Remove from collection
+                parentVideo.MeshLayers.Remove(meshToDelete);
+
+                Debug.WriteLine($"MainWindow: Deleted mesh layer '{meshToDelete.Name}'");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: DeleteSelectedMeshLayer failed: {ex}");
+            }
+        }
+
+        private void DeleteVideo_Click(object sender, RoutedEventArgs e)
+        {
+            DeleteSelectedVideo();
+        }
+
+        private void DeleteMeshLayer_Click(object sender, RoutedEventArgs e)
+        {
+            DeleteSelectedMeshLayer();
+        }
     }
 }

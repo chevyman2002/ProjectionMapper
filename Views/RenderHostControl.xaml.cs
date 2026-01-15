@@ -332,6 +332,24 @@ namespace ProjectionMapper.Views
             catch { }
         }
 
+        /// <summary>
+        /// When true, the backbuffer image will use Stretch.Fill to occupy the host control fully (useful for fullscreen windows).
+        /// When false, it will use the default Stretch.Uniform to preserve aspect ratio for previews.
+        /// Safe to call from any thread.
+        /// </summary>
+        public void SetFullscreenStretch(bool fullscreen)
+        {
+            if (_disposed) return;
+            if (Dispatcher.CheckAccess())
+            {
+                PART_Backbuffer.Stretch = fullscreen ? Stretch.Fill : Stretch.Uniform;
+            }
+            else
+            {
+                Dispatcher.Invoke(() => PART_Backbuffer.Stretch = fullscreen ? Stretch.Fill : Stretch.Uniform);
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

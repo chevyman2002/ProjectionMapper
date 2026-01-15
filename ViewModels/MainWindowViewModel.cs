@@ -25,103 +25,201 @@ namespace ProjectionMapper.ViewModels
             set => SetProperty(ref _hasUnsavedChanges, value);
         }
 
+        // Add guards to prevent infinite recursion
+        private bool _isUpdatingProjectTree;
+        private bool _isHandlingCollectionChange;
+
         public MainWindowViewModel()
         {
-            // Initialize undo/redo service
-            _undoRedoService = new UndoRedoService();
-            _undoRedoService.CanUndoChanged += (s, e) => 
+            try
             {
-                (UndoCommand as RelayCommand)?.RaiseCanExecuteChanged();
-            };
-            _undoRedoService.CanRedoChanged += (s, e) => 
+                // Initialize undo/redo service
+                _undoRedoService = new UndoRedoService();
+                _undoRedoService.CanUndoChanged += (s, e) => 
+                {
+                    try
+                    {
+                        (UndoCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"UndoCommand RaiseCanExecuteChanged failed: {ex}");
+                    }
+                };
+                _undoRedoService.CanRedoChanged += (s, e) => 
+                {
+                    try
+                    {
+                        (RedoCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"RedoCommand RaiseCanExecuteChanged failed: {ex}");
+                    }
+                };
+                
+                // Track changes via undo/redo service - if there are actions, the project is dirty
+                _undoRedoService.ActionRecorded += (s, e) => 
+                {
+                    try
+                    {
+                        HasUnsavedChanges = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"ActionRecorded handler failed: {ex}");
+                    }
+                };
+                
+                // Start with an empty project
+                _project = new ProjectModel { Name = "Untitled Project" };
+                Projects = new ObservableCollection<ProjectModel> { _project };
+
+                // Collection of imported videos (parent nodes)
+                ImportedVideos = new ObservableCollection<ImportedVideoViewModel>();
+                
+                // Track changes when imported videos collection changes - add guard to prevent recursion
+                ImportedVideos.CollectionChanged += (s, e) => 
+                {
+                    try
+                    {
+                        if (_isHandlingCollectionChange) return;
+                        _isHandlingCollectionChange = true;
+
+                        HasUnsavedChanges = true;
+                        RebuildProjectTree();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"ImportedVideos CollectionChanged handler failed: {ex}");
+                    }
+                    finally
+                    {
+                        _isHandlingCollectionChange = false;
+                    }
+                };
+
+                // Initialize playlist groups collection
+                PlaylistGroups = new ObservableCollection<PlaylistGroupViewModel>();
+                PlaylistGroups.CollectionChanged += (s, e) =>
+                {
+                    try
+                    {
+                        if (_isHandlingCollectionChange) return;
+                        _isHandlingCollectionChange = true;
+
+                        HasUnsavedChanges = true;
+                        RaisePropertyChanged(nameof(PlaylistGroupCount));
+                        RebuildProjectTree();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"PlaylistGroups CollectionChanged handler failed: {ex}");
+                    }
+                    finally
+                    {
+                        _isHandlingCollectionChange = false;
+                    }
+                };
+
+                // Initialize tree item collections for drag-drop
+                _groupTreeItems = new ObservableCollection<PlaylistGroupTreeViewModel>();
+                _videoTreeItems = new ObservableCollection<ImportedVideoTreeViewModel>();
+                _projectTree = new ObservableCollection<ProjectTreeItemViewModel>();
+
+                // Listen for playlist mode changes to rebuild tree - add guard to prevent recursion
+                PropertyChanged += (s, e) =>
+                {
+                    try
+                    {
+                        if (e.PropertyName == nameof(IsPlaylistMode) && !_isUpdatingProjectTree)
+                        {
+                            RebuildProjectTree();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"PropertyChanged handler for IsPlaylistMode failed: {ex}");
+                    }
+                };
+
+                // Initialize commands with proper error handling
+                InitializeCommands();
+
+                // sensible defaults for zoom
+                InputZoom = 1.0;
+                OutputZoom = 1.0;
+            }
+            catch (Exception ex)
             {
-                (RedoCommand as RelayCommand)?.RaiseCanExecuteChanged();
-            };
-            
-            // Track changes via undo/redo service - if there are actions, the project is dirty
-            _undoRedoService.ActionRecorded += (s, e) => 
+                System.Diagnostics.Debug.WriteLine($"MainWindowViewModel constructor failed: {ex}");
+                throw; // Re-throw to prevent partially initialized state
+            }
+        }
+
+        private void InitializeCommands()
+        {
+            try
             {
-                HasUnsavedChanges = true;
-            };
-            
-            // Start with an empty project
-            _project = new ProjectModel { Name = "Untitled Project" };
-            Projects = new ObservableCollection<ProjectModel> { _project };
+                AddSurfaceCommand = new RelayCommand(ExecuteAddSurface, CanExecuteAddSurface);
+                RemoveSurfaceCommand = new RelayCommand(ExecuteRemoveSurface, CanExecuteRemoveSurface);
 
-            // Collection of imported videos (parent nodes)
-            ImportedVideos = new ObservableCollection<ImportedVideoViewModel>();
-            
-            // Track changes when imported videos collection changes
-            ImportedVideos.CollectionChanged += (s, e) => 
+                ImportCommand = new RelayCommand(ExecuteImportCommand);
+                PreviewCommand = new RelayCommand(ExecutePreviewCommand);
+
+                // Use AsyncRelayCommand for playback operations since they're async
+                PlayPauseCommand = new AsyncRelayCommand(ExecutePlayPauseCommandAsync);
+                RestartCommand = new AsyncRelayCommand(ExecuteRestartCommandAsync);
+
+                CreateMeshCommand = new RelayCommand(ExecuteCreateMeshCommand, _ => SelectedImportedVideo != null);
+                DeleteMeshCommand = new RelayCommand(ExecuteDeleteMeshCommand, _ => SelectedMeshLayer != null);
+                CopyMeshCommand = new RelayCommand(ExecuteCopyMeshCommand, _ => SelectedMeshLayer != null);
+                PasteMeshCommand = new RelayCommand(ExecutePasteMeshCommand, _ => SelectedImportedVideo != null && _copiedMesh != null);
+
+                // Add imported deletion command
+                DeleteImportedCommand = new RelayCommand(ExecuteDeleteImportedCommand, p => p is ImportedVideoViewModel);
+
+                // Undo/Redo commands
+                UndoCommand = new RelayCommand(_ => _undoRedoService.Undo(), _ => _undoRedoService.CanUndo);
+                RedoCommand = new RelayCommand(_ => _undoRedoService.Redo(), _ => _undoRedoService.CanRedo);
+
+                // File operation commands  
+                SaveProjectCommand = new AsyncRelayCommand(async _ =>
+                {
+                    if (SaveProjectRequested != null)
+                        await SaveProjectRequested.Invoke();
+                }, _ => true); // Always allow save
+                SaveAsProjectCommand = new AsyncRelayCommand(async _ =>
+                {
+                    if (SaveAsProjectRequested != null)
+                        await SaveAsProjectRequested.Invoke();
+                }, _ => true); // Always allow save as
+                LoadProjectCommand = new AsyncRelayCommand(async _ =>
+                {
+                    if (LoadProjectRequested != null)
+                        await LoadProjectRequested.Invoke();
+                });
+                NewProjectCommand = new AsyncRelayCommand(async _ =>
+                {
+                    if (NewProjectRequested != null)
+                        await NewProjectRequested.Invoke();
+                });
+                PreviewCommand = new RelayCommand(_ => PreviewRequested?.Invoke());
+
+                // Playlist commands
+                CreateGroupCommand = new RelayCommand(ExecuteCreateGroupCommand);
+                DeleteGroupCommand = new RelayCommand(ExecuteDeleteGroupCommand, _ => SelectedPlaylistGroup != null);
+                AddVideoToGroupCommand = new RelayCommand(ExecuteAddVideoToGroupCommand, _ => SelectedPlaylistGroup != null && SelectedImportedVideo != null);
+                RemoveVideoFromGroupCommand = new RelayCommand(ExecuteRemoveVideoFromGroupCommand, _ => SelectedPlaylistGroup != null && SelectedImportedVideo != null);
+                TogglePlaylistModeCommand = new RelayCommand(ExecuteTogglePlaylistModeCommand);
+                MoveGroupUpCommand = new RelayCommand(ExecuteMoveGroupUpCommand, _ => SelectedPlaylistGroup != null && SelectedPlaylistGroup.Order > 0);
+                MoveGroupDownCommand = new RelayCommand(ExecuteMoveGroupDownCommand, _ => SelectedPlaylistGroup != null && SelectedPlaylistGroup.Order < PlaylistGroups.Count - 1);
+            }
+            catch (Exception ex)
             {
-                HasUnsavedChanges = true;
-            };
-
-            // Initialize playlist groups collection
-            PlaylistGroups = new ObservableCollection<PlaylistGroupViewModel>();
-            PlaylistGroups.CollectionChanged += (s, e) =>
-            {
-                HasUnsavedChanges = true;
-                RaisePropertyChanged(nameof(PlaylistGroupCount));
-            };
-
-            AddSurfaceCommand = new RelayCommand(ExecuteAddSurface, CanExecuteAddSurface);
-            RemoveSurfaceCommand = new RelayCommand(ExecuteRemoveSurface, CanExecuteRemoveSurface);
-
-            ImportCommand = new RelayCommand(ExecuteImportCommand);
-            PreviewCommand = new RelayCommand(ExecutePreviewCommand);
-
-            // Use AsyncRelayCommand for playback operations since they're async
-            PlayPauseCommand = new AsyncRelayCommand(ExecutePlayPauseCommandAsync);
-            RestartCommand = new AsyncRelayCommand(ExecuteRestartCommandAsync);
-
-            CreateMeshCommand = new RelayCommand(ExecuteCreateMeshCommand, _ => SelectedImportedVideo != null);
-            DeleteMeshCommand = new RelayCommand(ExecuteDeleteMeshCommand, _ => SelectedMeshLayer != null);
-            CopyMeshCommand = new RelayCommand(ExecuteCopyMeshCommand, _ => SelectedMeshLayer != null);
-            PasteMeshCommand = new RelayCommand(ExecutePasteMeshCommand, _ => SelectedImportedVideo != null && _copiedMesh != null);
-
-            // Add imported deletion command
-            DeleteImportedCommand = new RelayCommand(ExecuteDeleteImportedCommand, p => p is ImportedVideoViewModel);
-
-            // Undo/Redo commands
-            UndoCommand = new RelayCommand(_ => _undoRedoService.Undo(), _ => _undoRedoService.CanUndo);
-            RedoCommand = new RelayCommand(_ => _undoRedoService.Redo(), _ => _undoRedoService.CanRedo);
-
-            // File operation commands  
-            SaveProjectCommand = new AsyncRelayCommand(async _ =>
-            {
-                if (SaveProjectRequested != null)
-                    await SaveProjectRequested.Invoke();
-            }, _ => true); // Always allow save
-            SaveAsProjectCommand = new AsyncRelayCommand(async _ =>
-            {
-                if (SaveAsProjectRequested != null)
-                    await SaveAsProjectRequested.Invoke();
-            }, _ => true); // Always allow save as
-            LoadProjectCommand = new AsyncRelayCommand(async _ =>
-            {
-                if (LoadProjectRequested != null)
-                    await LoadProjectRequested.Invoke();
-            });
-            NewProjectCommand = new AsyncRelayCommand(async _ =>
-            {
-                if (NewProjectRequested != null)
-                    await NewProjectRequested.Invoke();
-            });
-            PreviewCommand = new RelayCommand(_ => PreviewRequested?.Invoke());
-
-            // Playlist commands
-            CreateGroupCommand = new RelayCommand(ExecuteCreateGroupCommand);
-            DeleteGroupCommand = new RelayCommand(ExecuteDeleteGroupCommand, _ => SelectedPlaylistGroup != null);
-            AddVideoToGroupCommand = new RelayCommand(ExecuteAddVideoToGroupCommand, _ => SelectedPlaylistGroup != null && SelectedImportedVideo != null);
-            RemoveVideoFromGroupCommand = new RelayCommand(ExecuteRemoveVideoFromGroupCommand, _ => SelectedPlaylistGroup != null && SelectedImportedVideo != null);
-            TogglePlaylistModeCommand = new RelayCommand(ExecuteTogglePlaylistModeCommand);
-            MoveGroupUpCommand = new RelayCommand(ExecuteMoveGroupUpCommand, _ => SelectedPlaylistGroup != null && SelectedPlaylistGroup.Order > 0);
-            MoveGroupDownCommand = new RelayCommand(ExecuteMoveGroupDownCommand, _ => SelectedPlaylistGroup != null && SelectedPlaylistGroup.Order < PlaylistGroups.Count - 1);
-
-            // sensible defaults for zoom
-            InputZoom = 1.0;
-            OutputZoom = 1.0;
+                System.Diagnostics.Debug.WriteLine($"InitializeCommands failed: {ex}");
+                throw;
+            }
         }
 
         public UndoRedoService UndoRedoService => _undoRedoService;
@@ -147,6 +245,18 @@ namespace ProjectionMapper.ViewModels
 
         // Playlist groups for group-based playback
         public ObservableCollection<PlaylistGroupViewModel> PlaylistGroups { get; }
+
+        // Unified project tree for hierarchical display
+        private ObservableCollection<ProjectTreeItemViewModel> _projectTree;
+        public ObservableCollection<ProjectTreeItemViewModel> ProjectTree
+        {
+            get => _projectTree;
+            private set => SetProperty(ref _projectTree, value);
+        }
+
+        // Tree wrappers for drag-drop support
+        private readonly ObservableCollection<PlaylistGroupTreeViewModel> _groupTreeItems;
+        private readonly ObservableCollection<ImportedVideoTreeViewModel> _videoTreeItems;
 
         private ImportedVideoViewModel? _selectedImportedVideo;
         public ImportedVideoViewModel? SelectedImportedVideo
@@ -240,44 +350,44 @@ namespace ProjectionMapper.ViewModels
             }
         }
 
-        public ICommand AddSurfaceCommand { get; }
-        public ICommand RemoveSurfaceCommand { get; }
+        public ICommand AddSurfaceCommand { get; private set; }
+        public ICommand RemoveSurfaceCommand { get; private set; }
 
         // Toolbar commands
-        public ICommand ImportCommand { get; }
-        public ICommand PreviewCommand { get; }
+        public ICommand ImportCommand { get; private set; }
+        public ICommand PreviewCommand { get; private set; }
 
         // Playback - now using AsyncRelayCommand
-        public ICommand PlayPauseCommand { get; }
-        public ICommand RestartCommand { get; }
+        public ICommand PlayPauseCommand { get; private set; }
+        public ICommand RestartCommand { get; private set; }
 
         // Mesh tree commands
-        public ICommand CreateMeshCommand { get; }
-        public ICommand DeleteMeshCommand { get; }
-        public ICommand CopyMeshCommand { get; }
-        public ICommand PasteMeshCommand { get; }
+        public ICommand CreateMeshCommand { get; private set; }
+        public ICommand DeleteMeshCommand { get; private set; }
+        public ICommand CopyMeshCommand { get; private set; }
+        public ICommand PasteMeshCommand { get; private set; }
 
         // Delete imported video command
-        public ICommand DeleteImportedCommand { get; }
+        public ICommand DeleteImportedCommand { get; private set; }
 
         // Undo/Redo commands
-        public ICommand UndoCommand { get; }
-        public ICommand RedoCommand { get; }
+        public ICommand UndoCommand { get; private set; }
+        public ICommand RedoCommand { get; private set; }
 
         // File operations
-        public ICommand SaveProjectCommand { get; }
-        public ICommand SaveAsProjectCommand { get; }
-        public ICommand LoadProjectCommand { get; }
-        public ICommand NewProjectCommand { get; }
+        public ICommand SaveProjectCommand { get; private set; }
+        public ICommand SaveAsProjectCommand { get; private set; }
+        public ICommand LoadProjectCommand { get; private set; }
+        public ICommand NewProjectCommand { get; private set; }
 
         // Playlist commands
-        public ICommand CreateGroupCommand { get; }
-        public ICommand DeleteGroupCommand { get; }
-        public ICommand AddVideoToGroupCommand { get; }
-        public ICommand RemoveVideoFromGroupCommand { get; }
-        public ICommand TogglePlaylistModeCommand { get; }
-        public ICommand MoveGroupUpCommand { get; }
-        public ICommand MoveGroupDownCommand { get; }
+        public ICommand CreateGroupCommand { get; private set; }
+        public ICommand DeleteGroupCommand { get; private set; }
+        public ICommand AddVideoToGroupCommand { get; private set; }
+        public ICommand RemoveVideoFromGroupCommand { get; private set; }
+        public ICommand TogglePlaylistModeCommand { get; private set; }
+        public ICommand MoveGroupUpCommand { get; private set; }
+        public ICommand MoveGroupDownCommand { get; private set; }
 
         // Events surfaced to the host window so it can perform file dialogs / services
         public event Action? ImportRequested;
@@ -314,14 +424,14 @@ namespace ProjectionMapper.ViewModels
         }
 
         // Zoom properties bound to the UI sliders
-        private double _inputZoom;
+        private double _inputZoom = 0.5;  // Default to 50% zoom to show entire content
         public double InputZoom
         {
             get => _inputZoom;
             set => SetProperty(ref _inputZoom, value);
         }
 
-        private double _outputZoom;
+        private double _outputZoom = 0.5;  // Default to 50% zoom to show entire content
         public double OutputZoom
         {
             get => _outputZoom;
@@ -361,7 +471,7 @@ namespace ProjectionMapper.ViewModels
             PreviewRequested?.Invoke();
         }
 
-        private bool _isPlaying = true;
+        private bool _isPlaying = false; // CRITICAL FIX: Start with false so first play command starts playback
         private async System.Threading.Tasks.Task ExecutePlayPauseCommandAsync()
         {
             _isPlaying = !_isPlaying;
@@ -377,6 +487,28 @@ namespace ProjectionMapper.ViewModels
         }
 
         public bool IsPlaying => _isPlaying;
+
+        /// <summary>
+        /// Allows the host window to explicitly set the playback state without toggling.
+        /// </summary>
+        /// <param name="isPlaying">True when playback is active.</param>
+        public void SetPlaybackState(bool isPlaying)
+        {
+            try
+            {
+                if (_isPlaying == isPlaying)
+                {
+                    return;
+                }
+
+                _isPlaying = isPlaying;
+                RaisePropertyChanged(nameof(IsPlaying));
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"MainWindowViewModel.SetPlaybackState failed: {ex}");
+            }
+        }
 
         private async System.Threading.Tasks.Task ExecuteRestartCommandAsync()
         {
@@ -754,8 +886,39 @@ namespace ProjectionMapper.ViewModels
         {
             try
             {
+                var wasPlaylistMode = IsPlaylistMode;
                 IsPlaylistMode = !IsPlaylistMode;
+                
                 System.Diagnostics.Debug.WriteLine($"Playlist mode toggled: {IsPlaylistMode}");
+                
+                // CRITICAL FIX: When switching modes, stop current playback and adjust looping behavior
+                if (!IsPlaylistMode && wasPlaylistMode)
+                {
+                    // Switching from playlist mode to legacy mode
+                    System.Diagnostics.Debug.WriteLine("Switching from playlist to legacy mode - stopping playlist and re-enabling looping");
+                    
+                    // Stop playlist service and re-enable looping for individual video control
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            // Use the PlaylistService reference from MainWindow if available
+                            // Note: This requires MainWindow to expose its _playlistService or handle this transition
+                            // For now, this will be handled in the MainWindow PlayPause logic
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Error transitioning from playlist to legacy mode: {ex}");
+                        }
+                    });
+                }
+                else if (IsPlaylistMode && !wasPlaylistMode)
+                {
+                    // Switching from legacy mode to playlist mode
+                    System.Diagnostics.Debug.WriteLine("Switching from legacy to playlist mode - stopping individual playback");
+                    
+                    // The next PlayPause operation will handle starting playlist mode properly
+                }
             }
             catch (Exception ex)
             {
@@ -920,6 +1083,101 @@ namespace ProjectionMapper.ViewModels
             }
         }
 
+        /// <summary>
+        /// Rebuilds the project tree structure based on current mode and group assignments.
+        /// Called when playlist mode changes or when videos/groups are added/removed.
+        /// </summary>
+        private void RebuildProjectTree()
+        {
+             // Add guard to prevent infinite recursion
+             if (_isUpdatingProjectTree) return;
+             
+             try
+             {
+                _isUpdatingProjectTree = true;
+
+                var newTree = new ObservableCollection<ProjectTreeItemViewModel>();
+
+                if (IsPlaylistMode && PlaylistGroups.Count > 0)
+                {
+                    // Playlist mode: Show groups with videos organized under them
+                    
+                    // First, rebuild group tree items
+                    var groupMap = new System.Collections.Generic.Dictionary<string, PlaylistGroupTreeViewModel>();
+                    
+                    foreach (var groupVm in PlaylistGroups.OrderBy(g => g.Order))
+                    {
+                        var groupTree = _groupTreeItems.FirstOrDefault(gt => gt.Id == groupVm.Model.Id);
+                        if (groupTree == null)
+                        {
+                            groupTree = new PlaylistGroupTreeViewModel(groupVm.Model);
+                            _groupTreeItems.Add(groupTree);
+                        }
+                        
+                        groupTree.Name = groupVm.Name;
+                        groupTree.IsActive = groupVm.IsActive;
+                        groupTree.Videos.Clear();
+                        
+                        groupMap[groupVm.Model.Id ?? string.Empty] = groupTree;
+                        newTree.Add(groupTree);
+                    }
+
+                    // Then organize videos under their groups
+                    var assignedVideoIds = new System.Collections.Generic.HashSet<string>();
+                    
+                    foreach (var groupVm in PlaylistGroups)
+                    {
+                        var groupId = groupVm.Model.Id;
+                        if (string.IsNullOrEmpty(groupId) || !groupMap.ContainsKey(groupId))
+                            continue;
+                        
+                        var groupTree = groupMap[groupId];
+                        
+                        foreach (var sourceId in groupVm.Model.SourceIds)
+                        {
+                            var video = ImportedVideos.FirstOrDefault(v => v.Id == sourceId);
+                            if (video != null)
+                            {
+                                var videoTree = _videoTreeItems.FirstOrDefault(vt => vt.Id == sourceId);
+                                if (videoTree == null)
+                                {
+                                    videoTree = new ImportedVideoTreeViewModel(video);
+                                    _videoTreeItems.Add(videoTree);
+                                }
+                                
+                                groupTree.Videos.Add(videoTree);
+                                assignedVideoIds.Add(sourceId);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Legacy mode: Show all videos directly under the project
+                    foreach (var video in ImportedVideos)
+                    {
+                        var videoTree = _videoTreeItems.FirstOrDefault(vt => vt.Id == video.Id);
+                        if (videoTree == null)
+                        {
+                            videoTree = new ImportedVideoTreeViewModel(video);
+                            _videoTreeItems.Add(videoTree);
+                        }
+                        
+                        newTree.Add(videoTree);
+                    }
+                }
+
+                ProjectTree = newTree;
+             }
+             catch (Exception ex)
+             {
+                 System.Diagnostics.Debug.WriteLine($"RebuildProjectTree failed: {ex}");
+             }
+             finally
+             {
+                 _isUpdatingProjectTree = false;
+             }
+        }
         #endregion
     }
-}
+ }

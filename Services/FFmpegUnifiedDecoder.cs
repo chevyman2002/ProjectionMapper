@@ -80,7 +80,11 @@ namespace ProjectionMapper.Services
             set
             {
                 _audioEnabled = value;
-                UpdateAudioPlayback();
+                // Only call UpdateAudioPlayback if the wave player has been initialized
+                if (_wavePlayer != null)
+                {
+                    UpdateAudioPlayback();
+                }
             }
         }
 
@@ -93,7 +97,11 @@ namespace ProjectionMapper.Services
             set
             {
                 _volume = Math.Max(0f, Math.Min(1f, value));
-                UpdateAudioPlayback();
+                // Only call UpdateAudioPlayback if the wave player has been initialized
+                if (_wavePlayer != null)
+                {
+                    UpdateAudioPlayback();
+                }
             }
         }
 
@@ -106,7 +114,45 @@ namespace ProjectionMapper.Services
             set
             {
                 _muted = value;
-                UpdateAudioPlayback();
+                // Only call UpdateAudioPlayback if the wave player has been initialized
+                if (_wavePlayer != null)
+                {
+                    UpdateAudioPlayback();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the current amount of decoded audio that is buffered and ready for playback.
+        /// This helps higher-level services decide when it is safe to enable audio without artifacts.
+        /// </summary>
+        public TimeSpan BufferedAudioDuration
+        {
+            get
+            {
+                try
+                {
+                    return _waveProvider?.BufferedDuration ?? TimeSpan.Zero;
+                }
+                catch
+                {
+                    return TimeSpan.Zero;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Clears any pending audio samples from the buffer to avoid replaying stale data when toggling playback.
+        /// </summary>
+        public void ClearAudioBuffer()
+        {
+            try
+            {
+                _waveProvider?.ClearBuffer();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"FFmpegUnifiedDecoder.ClearAudioBuffer: Failed to clear buffer: {ex}");
             }
         }
 
@@ -564,26 +610,26 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
                 {
                     if (_audioEnabled && !_muted)
                     {
-                        // Clear buffer to prevent stale audio artifacts
-                        if (_waveProvider != null)
+                        waveOut.Volume = _volume;
+
+                        // CRITICAL FIX: Start playback immediately if we have buffered audio data
+                        // Don't wait for the decode loop - this ensures audio starts when enabled
+                        if (waveOut.PlaybackState != PlaybackState.Playing && 
+                            _waveProvider != null && 
+                            _waveProvider.BufferedBytes > 4096) // Need at least some buffer
                         {
                             try
                             {
-                                _waveProvider.ClearBuffer();
-                                Debug.WriteLine("FFmpegUnifiedDecoder.UpdateAudioPlayback: Cleared audio buffer to prevent artifacts");
+                                waveOut.Play();
+                                Debug.WriteLine($"FFmpegUnifiedDecoder.UpdateAudioPlayback: Started playback immediately, buffer={_waveProvider.BufferedBytes} bytes");
                             }
                             catch (Exception ex)
                             {
-                                Debug.WriteLine($"FFmpegUnifiedDecoder.UpdateAudioPlayback: Failed to clear buffer: {ex}");
+                                Debug.WriteLine($"FFmpegUnifiedDecoder.UpdateAudioPlayback: Failed to start playback: {ex}");
                             }
                         }
 
-                        waveOut.Volume = _volume;
-
-                        // Note: Playback will auto-start from decode loop once buffer fills
-                        // We don't call Play() here to avoid race conditions with empty buffer
-                        Debug.WriteLine($"FFmpegUnifiedDecoder.UpdateAudioPlayback: Audio ENABLED, volume={_volume}, playback will auto-start once buffer fills");
-                        Debug.WriteLine($"FFmpegUnifiedDecoder.UpdateAudioPlayback: WaveOut PlaybackState={waveOut.PlaybackState}");
+                        Debug.WriteLine($"FFmpegUnifiedDecoder.UpdateAudioPlayback: Audio ENABLED, volume={_volume}, state={waveOut.PlaybackState}");
                     }
                     else
                     {

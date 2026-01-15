@@ -11,12 +11,13 @@ namespace ProjectionMapper.ViewModels
     /// Thread-safe async ICommand wrapper that prevents deadlocks and infinite recursion.
     /// Designed specifically to handle cross-thread scenarios without blocking or excessive memory usage.
     /// </summary>
-    public sealed class AsyncRelayCommand : ICommand
+    public sealed class AsyncRelayCommand : ICommand, IDisposable
     {
         private readonly Func<object?, Task> _executeAsync;
         private readonly Predicate<object?>? _canExecute;
         private int _isExecutingInt; // Use int for Interlocked operations
         private volatile bool _isRaisingCanExecuteChanged;
+        private volatile bool _isDisposed;
 
         public AsyncRelayCommand(Func<Task> executeAsync) : this(_ => executeAsync(), null) { }
 
@@ -30,20 +31,56 @@ namespace ProjectionMapper.ViewModels
             _canExecute = canExecute;
         }
 
-        public bool CanExecute(object? parameter) => _isExecutingInt == 0 && (_canExecute?.Invoke(parameter) ?? true);
+        public bool CanExecute(object? parameter) 
+        {
+            if (_isDisposed) return false;
+            
+            try
+            {
+                return _isExecutingInt == 0 && (_canExecute?.Invoke(parameter) ?? true);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"AsyncRelayCommand.CanExecute failed: {ex}");
+                return false; // Safer to return false on error
+            }
+        }
 
         public async void Execute(object? parameter)
         {
+            if (_isDisposed) return;
+
             // Thread-safe check and set - if already executing (value is 1), return immediately
             if (Interlocked.CompareExchange(ref _isExecutingInt, 1, 0) != 0)
+            {
+                Debug.WriteLine("AsyncRelayCommand.Execute: Already executing, skipping");
                 return;
+            }
 
             try
             {
                 RaiseCanExecuteChanged();
                 
+                // Additional null check and disposal check before execution
+                if (_executeAsync == null || _isDisposed)
+                {
+                    Debug.WriteLine("AsyncRelayCommand.Execute: Command is null or disposed");
+                    return;
+                }
+                
                 // Execute the command - keep on original thread context to avoid cross-thread issues
-                await _executeAsync(parameter);
+                // Use ConfigureAwait(false) to prevent potential deadlocks
+                await _executeAsync(parameter).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Expected if command is disposed during execution
+                Debug.WriteLine("AsyncRelayCommand.Execute: Command was disposed during execution");
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected if operation is cancelled
+                Debug.WriteLine("AsyncRelayCommand.Execute: Operation was cancelled");
             }
             catch (Exception ex)
             {
@@ -55,7 +92,12 @@ namespace ProjectionMapper.ViewModels
             {
                 // Thread-safe reset - set back to 0 (not executing)
                 Interlocked.Exchange(ref _isExecutingInt, 0);
-                RaiseCanExecuteChanged();
+                
+                // Only raise if not disposed
+                if (!_isDisposed)
+                {
+                    RaiseCanExecuteChanged();
+                }
             }
         }
 
@@ -63,15 +105,51 @@ namespace ProjectionMapper.ViewModels
 
         public void RaiseCanExecuteChanged()
         {
+            if (_isDisposed) return;
+            
             // Prevent recursive calls that cause infinite loops and memory leaks
-            if (_isRaisingCanExecuteChanged) return;
+            if (_isRaisingCanExecuteChanged)
+            {
+                Debug.WriteLine("AsyncRelayCommand.RaiseCanExecuteChanged: Already raising, preventing recursion");
+                return;
+            }
             
             try
             {
                 _isRaisingCanExecuteChanged = true;
                 
-                // Raise the event directly - no dispatcher marshaling to prevent deadlocks
-                CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+                // Marshal to UI thread to prevent cross-thread exceptions
+                var app = System.Windows.Application.Current;
+                if (app != null && app.Dispatcher != null && !app.Dispatcher.HasShutdownStarted && !app.Dispatcher.HasShutdownFinished)
+                {
+                    if (!app.Dispatcher.CheckAccess())
+                    {
+                        // We're on a background thread, marshal to UI thread
+                        app.Dispatcher.BeginInvoke((Action)(() =>
+                        {
+                            try
+                            {
+                                var handler = CanExecuteChanged;
+                                if (handler != null && !_isDisposed)
+                                {
+                                    handler.Invoke(this, EventArgs.Empty);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"AsyncRelayCommand.RaiseCanExecuteChanged (dispatched) failed: {ex}");
+                            }
+                        }));
+                        return;
+                    }
+                }
+                
+                // Raise the event directly - we're on the UI thread
+                var handlerDirect = CanExecuteChanged;
+                if (handlerDirect != null && !_isDisposed)
+                {
+                    handlerDirect.Invoke(this, EventArgs.Empty);
+                }
             }
             catch (Exception ex)
             {
@@ -81,6 +159,23 @@ namespace ProjectionMapper.ViewModels
             finally
             {
                 _isRaisingCanExecuteChanged = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed) return;
+            
+            _isDisposed = true;
+            
+            try
+            {
+                // Clear event handlers to prevent memory leaks
+                CanExecuteChanged = null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"AsyncRelayCommand.Dispose failed: {ex}");
             }
         }
     }

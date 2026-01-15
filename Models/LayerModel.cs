@@ -68,14 +68,14 @@ namespace ProjectionMapper.Models
         /// These control how the source (cropped or full) is mapped/warped onto the output surface.
         /// Kept independent from MeshPoints so input cropping and output mapping do not interfere.
         /// Order: TopLeft, TopRight, BottomLeft, BottomRight
-        /// Defaults to full-rect.
+        /// Defaults to a small centered rectangle (~1/5 of output area) for easier initial placement.
         /// </summary>
         public Vector2[] OutputMeshPoints { get; } = new[]
         {
-            new Vector2(0f, 0f), // TL
-            new Vector2(1f, 0f), // TR
-            new Vector2(0f, 1f), // BL
-            new Vector2(1f, 1f)  // BR
+            new Vector2(0.3f, 0.3f), // TL - centered, ~40% width/height
+            new Vector2(0.7f, 0.3f), // TR
+            new Vector2(0.3f, 0.7f), // BL
+            new Vector2(0.7f, 0.7f)  // BR
         };
 
         /// <summary>

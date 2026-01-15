@@ -23,7 +23,6 @@ All code must be tested to ensure it works as intended and does not introduce ne
 All code must not use hard-coded values that should otherwise be stored in a configuration file. All code must use configuration files for such values.
 Your responses should be broken down in pieces to avoid truncation. If your response is cut off, I will prompt you to continue.
 All code that runs on the main thread must avoid using timers, which can cause the UI to be sluggish or unresponsive.
-To avoid hitting a token limitation, write up a document (\*.md format) containing a broken down list of what you're planning to do. Reference that file throughout your response, so that you don't have to keep it all loaded in memory.
 Functions must contain try-catch block with proper error handling in place. Catch blocks cannot be empty and must have something in them, either for logging output or otherwise.
 
 DO NOT disable or circumvent any other features to try and make this work. All desired features must be fully operational at all times.

@@ -107,17 +107,20 @@ namespace ProjectionMapper.Rendering
             {
                 _cts.Cancel();
 
-                // Wait for the thread to finish via the TaskCompletionSource
+                // Wait for the thread to finish via the TaskCompletionSource with a timeout
                 if (_loopTask != null)
                 {
-                    await _loopTask.ConfigureAwait(false);
+                    // Use a timeout to prevent hanging
+                    var timeoutTask = Task.Delay(1000);
+                    var completedTask = await Task.WhenAny(_loopTask, timeoutTask).ConfigureAwait(false);
+                    
+                    if (completedTask == timeoutTask)
+                    {
+                        Debug.WriteLine("RenderLoop.StopAsync: Timeout waiting for loop task to complete");
+                    }
                 }
 
-                // Explicitly join the thread to be certain it has exited
-                if (_loopThread.IsAlive)
-                {
-                    _loopThread.Join();
-                }
+                // Don't block on Thread.Join - it can cause deadlocks during shutdown
             }
             catch (Exception ex)
             {
@@ -132,7 +135,17 @@ namespace ProjectionMapper.Rendering
 
         public void Dispose()
         {
-            _cts.Cancel();
+            try
+            {
+                _cts.Cancel();
+                
+                // Don't wait for thread to finish - just signal cancellation and dispose
+                // This prevents deadlocks during application shutdown
+                _loopTask = null;
+                _loopThread = null;
+            }
+            catch { }
+            
             try { _cts.Dispose(); } catch { }
         }
     }
