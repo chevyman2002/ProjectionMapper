@@ -8,18 +8,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends curl ca-certificates wget unzip
-
-      - name: Install .NET 9 SDK
+      - name: Setup .NET 9 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
@@ -28,10 +23,10 @@ jobs:
         run: dotnet --info
 
       - name: Restore NuGet packages
-        run: dotnet restore --verbosity minimal
+        run: dotnet restore ProjectionMapper.csproj --verbosity minimal
 
-      - name: Build solution
-        run: dotnet build ProjectionMapper.sln --configuration Release --no-restore --verbosity minimal
+      - name: Build project
+        run: dotnet build ProjectionMapper.csproj --configuration Release --no-restore --verbosity minimal
 
       - name: Run tests (if any)
         run: dotnet test --no-build --verbosity normal || true
@@ -40,5 +35,5 @@ jobs:
         if: always()
         run: |
           dotnet --info > build_log.txt || true
-          ls -la > build_ls.txt || true
+          dir /a > build_ls.txt || true
           echo "Workflow completed" > workflow_status.txt
