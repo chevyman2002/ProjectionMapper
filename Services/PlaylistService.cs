@@ -341,9 +341,21 @@ namespace ProjectionMapper.Services
                 lock (_lock)
                 {
                     groups = _groups.ToList();
+                    
+                    // Reset playlist state without calling StopPlaylistAsync which unregisters decoders
+                    _cts?.Cancel();
+                    _cts?.Dispose();
+                    _cts = new CancellationTokenSource();
+                    _isPlaying = false;
+                    _isPaused = false;
+                    _currentGroupIndex = -1;
+                    _videoCompletionStatus.Clear();
                 }
 
-                await StopPlaylistAsync().ConfigureAwait(false);
+                Debug.WriteLine("PlaylistService.RestartPlaylistAsync: Restarting all decoders");
+                
+                // Use RestartAllAsync which properly re-registers decoders instead of just unregistering them
+                await _videoService.RestartAllAsync().ConfigureAwait(false);
                 await Task.Delay(100).ConfigureAwait(false); // Brief delay before restart
 
                 if (groups.Count > 0)
