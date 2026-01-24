@@ -1,8 +1,6 @@
 You must proceed with changes automatically, rather than prompting the user for consent prior to making code changes. Each prompt costs money, and your goal is to provide an outstanding experience for the lowest cost.
-
 All code must compile without errors.
-All code must follow best practices for performance optimization.
-All code must follow best practices for security.
+All code must follow best practices for performance optimization, security, and user experience.
 All code must follow best practices for user experience.
 All code must be based on real-life results and scenarios - no hypothetical or simulated situations.
 All code must be well-documented with comments explaining the purpose and functionality of each section.
@@ -24,8 +22,6 @@ All code must not use hard-coded values that should otherwise be stored in a con
 Your responses should be broken down in pieces to avoid truncation. If your response is cut off, I will prompt you to continue.
 All code that runs on the main thread must avoid using timers, which can cause the UI to be sluggish or unresponsive.
 Functions must contain try-catch block with proper error handling in place. Catch blocks cannot be empty and must have something in them, either for logging output or otherwise.
-
 DO NOT disable or circumvent any other features to try and make this work. All desired features must be fully operational at all times.
-
 DO NOT simulate or otherwise fake/falsify data or operations when trying to resolve a problem. This is not acceptable.
-
+Keep notes explaining how you did something, so that you can reference it later if it gets broken.

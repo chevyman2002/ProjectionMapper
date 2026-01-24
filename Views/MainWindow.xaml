@@ -24,6 +24,9 @@
         <KeyBinding Key="S" Modifiers="Control" Command="{Binding SaveProjectCommand}" />
         <KeyBinding Key="S" Modifiers="Control+Shift" Command="{Binding SaveAsProjectCommand}" />
         <KeyBinding Key="F5" Command="{Binding PreviewCommand}" />
+        <KeyBinding Key="C" Modifiers="Control" Command="{Binding CopyMeshCommand}" />
+        <KeyBinding Key="V" Modifiers="Control" Command="{Binding PasteMeshCommand}" />
+        <KeyBinding Key="Delete" Command="{Binding DeleteMeshCommand}" />
     </Window.InputBindings>
 
     <DockPanel>
@@ -95,6 +98,8 @@
         <!-- Status bar -->
         <StatusBar DockPanel.Dock="Bottom">
             <TextBlock Text="{Binding StatusText}" />
+            <Separator Margin="8,0" />
+            <TextBlock Text="{Binding MeshSelectionText}" Foreground="DodgerBlue" />
         </StatusBar>
 
         <!-- Main content: left panel (unified project tree + properties), center (input/output split horizontal) -->
@@ -177,8 +182,8 @@
                                                 <!-- Dynamic submenu populated in code-behind -->
                                             </MenuItem>
                                             <Separator />
-                                            <MenuItem Header="Copy Mesh" Click="CopyMeshMenuItem_Click" />
-                                            <MenuItem Header="Paste Mesh" Click="PasteMeshMenuItem_Click" />
+                                            <MenuItem Header="Copy Mesh" Click="CopyMeshMenuItem_Click" InputGestureText="Ctrl+C" />
+                                            <MenuItem Header="Paste Mesh" Click="PasteMeshMenuItem_Click" InputGestureText="Ctrl+V" />
                                             <Separator />
                                             <MenuItem Header="Hide Source Output/Meshes" Tag="HideShowToggle" Click="HideSourceOutputMenuItem_Click" />
                                         </ContextMenu>
@@ -196,14 +201,23 @@
                             <DataTemplate DataType="{x:Type vm:LayerViewModel}">
                                 <StackPanel Orientation="Horizontal">
                                     <StackPanel.ContextMenu>
-                                        <ContextMenu>
+                                        <ContextMenu Opened="MeshContextMenu_Opened">
                                             <MenuItem Header="Rename Mesh" Click="RenameMeshMenuItem_Click" />
-                                            <MenuItem Header="Delete Mesh Layer" Click="DeleteMeshMenuItem_Click" />
+                                            <MenuItem x:Name="PART_DeleteMeshMenuItem" Header="Delete Mesh Layer" Click="DeleteMeshMenuItem_Click" />
                                             <Separator />
-                                            <MenuItem Header="Copy Mesh" Click="CopyMeshMenuItem_Click" />
-                                            <MenuItem Header="Paste Mesh" Click="PasteMeshMenuItem_Click" />
+                                            <MenuItem x:Name="PART_CopyMeshMenuItem" Header="Copy Mesh" Click="CopyMeshMenuItem_Click" InputGestureText="Ctrl+C" />
+                                            <MenuItem Header="Paste Mesh" Click="PasteMeshMenuItem_Click" InputGestureText="Ctrl+V" />
                                         </ContextMenu>
                                     </StackPanel.ContextMenu>
+                                    
+                                    <!-- Multi-selection indicator (checkmark when part of multi-selection) -->
+                                    <TextBlock Text="✓" 
+                                               Foreground="DodgerBlue" 
+                                               FontWeight="Bold"
+                                               Visibility="{Binding IsMultiSelected, Converter={StaticResource BooleanToVisibilityConverter}}" 
+                                               Margin="0,0,2,0" 
+                                               FontSize="12" 
+                                               ToolTip="Part of multi-selection" />
                                     
                                     <!-- Mesh icon -->
                                     <TextBlock Text="📐" Margin="0,0,4,0" FontSize="13" />

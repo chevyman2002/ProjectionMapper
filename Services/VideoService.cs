@@ -380,12 +380,32 @@ namespace ProjectionMapper.Services
                             var pts = mesh.OutputMeshPoints;
                             if (pts != null && pts.Length >= 4)
                             {
+                                // Fallback: Use target monitor size if available, otherwise use mesh bounds
+                                int targetW = mesh.Width;
+                                int targetH = mesh.Height;
+                                int targetX = mesh.X;
+                                int targetY = mesh.Y;
+                                
+                                // If targeting a specific monitor, try to use its dimensions
+                                if (mesh.TargetMonitorIndex >= 0)
+                                {
+                                    var monSize = _rendererManager.GetMonitorRendererSize(mesh.TargetMonitorIndex);
+                                    if (monSize.Width > 0 && monSize.Height > 0)
+                                    {
+                                        // OutputMeshPoints are normalized (0-1) for the full monitor
+                                        targetW = monSize.Width;
+                                        targetH = monSize.Height;
+                                        targetX = 0;
+                                        targetY = 0;
+                                    }
+                                }
+                                
                                 destQuad = new Point[4]
                                 {
-                                    new Point(mesh.X + pts[0].X * mesh.Width, mesh.Y + pts[0].Y * mesh.Height),
-                                    new Point(mesh.X + pts[1].X * mesh.Width, mesh.Y + pts[1].Y * mesh.Height),
-                                    new Point(mesh.X + pts[2].X * mesh.Width, mesh.Y + pts[2].Y * mesh.Height),
-                                    new Point(mesh.X + pts[3].X * mesh.Width, mesh.Y + pts[3].Y * mesh.Height)
+                                    new Point(targetX + pts[0].X * targetW, targetY + pts[0].Y * targetH),
+                                    new Point(targetX + pts[1].X * targetW, targetY + pts[1].Y * targetH),
+                                    new Point(targetX + pts[2].X * targetW, targetY + pts[2].Y * targetH),
+                                    new Point(targetX + pts[3].X * targetW, targetY + pts[3].Y * targetH)
                                 };
                             }
                             else
@@ -610,12 +630,32 @@ namespace ProjectionMapper.Services
                         var pts = mesh.OutputMeshPoints;
                         if (pts != null && pts.Length >= 4)
                         {
+                            // Fallback: Use target monitor size if available, otherwise use mesh bounds
+                            int targetW = mesh.Width;
+                            int targetH = mesh.Height;
+                            int targetX = mesh.X;
+                            int targetY = mesh.Y;
+                            
+                            // If targeting a specific monitor, try to use its dimensions
+                            if (mesh.TargetMonitorIndex >= 0)
+                            {
+                                var monSize = _rendererManager.GetMonitorRendererSize(mesh.TargetMonitorIndex);
+                                if (monSize.Width > 0 && monSize.Height > 0)
+                                {
+                                    // OutputMeshPoints are normalized (0-1) for the full monitor
+                                    targetW = monSize.Width;
+                                    targetH = monSize.Height;
+                                    targetX = 0;
+                                    targetY = 0;
+                                }
+                            }
+                            
                             destQuad = new Point[4]
                             {
-                                new Point(mesh.X + pts[0].X * mesh.Width, mesh.Y + pts[0].Y * mesh.Height),
-                                new Point(mesh.X + pts[1].X * mesh.Width, mesh.Y + pts[1].Y * mesh.Height),
-                                new Point(mesh.X + pts[2].X * mesh.Width, mesh.Y + pts[2].Y * mesh.Height),
-                                new Point(mesh.X + pts[3].X * mesh.Width, mesh.Y + pts[3].Y * mesh.Height)
+                                new Point(targetX + pts[0].X * targetW, targetY + pts[0].Y * targetH),
+                                new Point(targetX + pts[1].X * targetW, targetY + pts[1].Y * targetH),
+                                new Point(targetX + pts[2].X * targetW, targetY + pts[2].Y * targetH),
+                                new Point(targetX + pts[3].X * targetW, targetY + pts[3].Y * targetH)
                             };
                         }
                     }

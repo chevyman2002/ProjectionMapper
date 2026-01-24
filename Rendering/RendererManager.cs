@@ -8,9 +8,11 @@ using System.Numerics;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 
 namespace ProjectionMapper.Rendering
@@ -31,6 +33,16 @@ namespace ProjectionMapper.Rendering
         private readonly Dictionary<int, RenderLoop> _monitorRenderLoops = new();
         // Track monitor renderer pixel sizes (width, height)
         private readonly Dictionary<int, (int Width, int Height)> _monitorRendererSizes = new();
+
+        /// <summary>
+        /// Get the renderer size for a specific monitor. Returns (0,0) if the monitor is not registered.
+        /// </summary>
+        public (int Width, int Height) GetMonitorRendererSize(int monitorIndex)
+        {
+            if (_monitorRendererSizes.TryGetValue(monitorIndex, out var size))
+                return size;
+            return (0, 0);
+        }
 
         public RendererManager(IRenderer renderer)
         {
@@ -471,13 +483,39 @@ namespace ProjectionMapper.Rendering
         /// destRect is in renderer output coordinates (pixels).
         /// destQuad: optional quad in renderer coordinates (TopLeft, TopRight, BottomLeft, BottomRight).
         /// Submits to both the target monitor renderer AND the main renderer so output preview works.
+        /// destQuad is expected to be in TARGET MONITOR coordinates - will be scaled for main renderer.
         /// </summary>
         public void SubmitLayerFrameForMonitor(string layerId, BitmapSource? frame, Rect destRect, Point[]? destQuad, double opacity, int targetMonitorIndex)
         {
             try
             {
-                // Always submit to main renderer first so the output preview displays the content
-                _renderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+                // Get target monitor size for coordinate scaling
+                int monitorW = 0, monitorH = 0;
+                if (targetMonitorIndex >= 0 && _monitorRendererSizes.TryGetValue(targetMonitorIndex, out var monSize))
+                {
+                    monitorW = monSize.Width;
+                    monitorH = monSize.Height;
+                }
+
+                // Submit to main renderer with coordinates scaled to main renderer size
+                // destQuad is in target monitor coordinates, need to scale to main renderer coordinates
+                Point[]? mainQuad = destQuad;
+                Rect mainRect = destRect;
+                if (destQuad != null && monitorW > 0 && monitorH > 0 && OutputWidth > 0 && OutputHeight > 0)
+                {
+                    // Scale from monitor coordinates to main renderer coordinates
+                    double scaleX = (double)OutputWidth / monitorW;
+                    double scaleY = (double)OutputHeight / monitorH;
+                    mainQuad = new Point[4]
+                    {
+                        new Point(destQuad[0].X * scaleX, destQuad[0].Y * scaleY),
+                        new Point(destQuad[1].X * scaleX, destQuad[1].Y * scaleY),
+                        new Point(destQuad[2].X * scaleX, destQuad[2].Y * scaleY),
+                        new Point(destQuad[3].X * scaleX, destQuad[3].Y * scaleY)
+                    };
+                    mainRect = new Rect(destRect.X * scaleX, destRect.Y * scaleY, destRect.Width * scaleX, destRect.Height * scaleY);
+                }
+                _renderer.SubmitLayerFrame(layerId, frame, mainRect, mainQuad, opacity);
 
                 // If target monitor is unspecified (-1), we're done - only show in main preview
                 if (targetMonitorIndex == -1)
@@ -485,7 +523,7 @@ namespace ProjectionMapper.Rendering
                     return;
                 }
 
-                // Also submit to the target monitor renderer if available for fullscreen output
+                // Submit to the target monitor renderer with original coordinates (already in correct coordinate space)
                 if (_monitorRenderers.TryGetValue(targetMonitorIndex, out var monitorRenderer))
                 {
                     monitorRenderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
@@ -561,11 +599,47 @@ namespace ProjectionMapper.Rendering
             }
         }
 
+        // P/Invoke for getting monitor DPI
+        [DllImport("shcore.dll")]
+        private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        private const uint MONITOR_DEFAULTTONEAREST = 2;
+        private const int MDT_EFFECTIVE_DPI = 0;
+
+        /// <summary>
+        /// Get the DPI for a window's monitor.
+        /// Returns (96, 96) as fallback if the API call fails.
+        /// </summary>
+        private static (double dpiX, double dpiY) GetWindowDpi(IntPtr hwnd)
+        {
+            try
+            {
+                var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if (monitor != IntPtr.Zero)
+                {
+                    int hr = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, out uint dpiX, out uint dpiY);
+                    if (hr == 0 && dpiX > 0 && dpiY > 0)
+                    {
+                        return (dpiX, dpiY);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"GetWindowDpi failed: {ex}");
+            }
+            return (96, 96);
+        }
+
         /// <summary>
         /// Show a fullscreen window on the specified monitor.
         /// Creates a dedicated renderer and render loop for this monitor.
+        /// physicalWidth and physicalHeight should be the native pixel resolution of the monitor.
         /// </summary>
-        public void ShowFullScreenWindow(int monitorIndex, FullScreenOutputWindow window, int monitorWidth = 0, int monitorHeight = 0)
+        public void ShowFullScreenWindow(int monitorIndex, FullScreenOutputWindow window, int physicalWidth = 0, int physicalHeight = 0)
         {
             try
             {
@@ -603,13 +677,57 @@ namespace ProjectionMapper.Rendering
                 {
                     var monitorRenderer = new SoftwareRenderer();
 
-                    int renderW = (monitorWidth > 0) ? monitorWidth : (OutputWidth > 0 ? OutputWidth : 1920);
-                    int renderH = (monitorHeight > 0) ? monitorHeight : (OutputHeight > 0 ? OutputHeight : 1080);
+                    // Use physical dimensions for rendering - this is the native pixel count of the display
+                    int renderW = (physicalWidth > 0) ? physicalWidth : (OutputWidth > 0 ? OutputWidth : 1920);
+                    int renderH = (physicalHeight > 0) ? physicalHeight : (OutputHeight > 0 ? OutputHeight : 1080);
 
                     _monitorRendererSizes[monitorIndex] = (renderW, renderH);
 
-                    // Initialize monitor renderer
-                    monitorRenderer.InitializeAsync(renderW, renderH, CancellationToken.None).GetAwaiter().GetResult();
+                    // Try to get the DPI for this window's monitor
+                    double dpiX = 96, dpiY = 96;
+                    try
+                    {
+                        InvokeOnUi(() =>
+                        {
+                            try
+                            {
+                                var helper = new WindowInteropHelper(window);
+                                if (helper.Handle != IntPtr.Zero)
+                                {
+                                    (dpiX, dpiY) = GetWindowDpi(helper.Handle);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"ShowFullScreenWindow: Failed to get window DPI: {ex}");
+                            }
+                        });
+                    }
+                    catch { }
+
+                    // If the DPI detection returned 96 but we're using a larger physical resolution,
+                    // the monitor likely has DPI scaling. Calculate an approximate DPI based on
+                    // the assumption that most monitors run around 1920x1080 logical at 96 DPI.
+                    // This helps with coordinate mapping when physical != logical.
+                    if (dpiX == 96 && dpiY == 96 && (renderW > 1920 || renderH > 1080))
+                    {
+                        // Calculate approximate DPI scale based on how much larger the physical is
+                        // vs a typical 1920x1080 logical resolution
+                        double scaleX = (double)renderW / 1920.0;
+                        double scaleY = (double)renderH / 1080.0;
+                        double scale = Math.Max(scaleX, scaleY);
+                        if (scale > 1.0)
+                        {
+                            dpiX = 96 * scale;
+                            dpiY = 96 * scale;
+                            Debug.WriteLine($"ShowFullScreenWindow: DPI detection returned 96, estimated DPI from resolution: {dpiX:F1}x{dpiY:F1} (scale {scale:F2})");
+                        }
+                    }
+
+                    Debug.WriteLine($"ShowFullScreenWindow: Monitor {monitorIndex} DPI: {dpiX}x{dpiY}");
+
+                    // Initialize monitor renderer with the physical resolution and detected/estimated DPI
+                    monitorRenderer.InitializeAsync(renderW, renderH, dpiX, dpiY, CancellationToken.None).GetAwaiter().GetResult();
 
                     // Subscribe to its FrameReady event to update the fullscreen host
                     monitorRenderer.FrameReady += (bmp) => OnMonitorFrameReady(monitorIndex, bmp);
@@ -622,7 +740,7 @@ namespace ProjectionMapper.Rendering
                     loop.Start();
                     _monitorRenderLoops[monitorIndex] = loop;
 
-                    Debug.WriteLine($"ShowFullScreenWindow: Created renderer for monitor {monitorIndex} at {renderW}x{renderH}");
+                    Debug.WriteLine($"ShowFullScreenWindow: Created renderer for monitor {monitorIndex} at {renderW}x{renderH} @ {dpiX}x{dpiY} DPI");
                 }
                 catch (Exception ex)
                 {

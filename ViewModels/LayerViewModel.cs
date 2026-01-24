@@ -177,5 +177,21 @@ namespace ProjectionMapper.ViewModels
                 RaisePropertyChanged();
             }
         }
+
+        /// <summary>
+        /// Indicates whether this mesh layer is part of a multi-selection.
+        /// Used for visual feedback in the UI.
+        /// </summary>
+        private bool _isMultiSelected;
+        public bool IsMultiSelected
+        {
+            get => _isMultiSelected;
+            set
+            {
+                if (_isMultiSelected == value) return;
+                _isMultiSelected = value;
+                RaisePropertyChanged();
+            }
+        }
     }
 }
