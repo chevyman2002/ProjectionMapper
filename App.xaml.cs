@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System;
 using System.Runtime.ExceptionServices;
 using System.Windows.Threading;
+using System.Runtime.InteropServices;
 
 namespace ProjectionMapper
 {
@@ -13,11 +14,36 @@ namespace ProjectionMapper
     /// </summary>
     public partial class App : Application
     {
+        // P/Invoke for setting per-monitor DPI awareness (important for wireless displays)
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        // DPI_AWARENESS_CONTEXT values
+        private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
+        private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE = new IntPtr(-3);
+
         protected override void OnStartup(StartupEventArgs e)
         {
             try
             {
                 Debug.WriteLine("App: Starting application initialization");
+
+                // Set per-monitor DPI awareness for proper multi-monitor support
+                // This is critical for wireless displays which may have different DPI settings
+                try
+                {
+                    // Try V2 first (Windows 10 1703+)
+                    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+                    {
+                        // Fall back to V1
+                        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+                    }
+                    Debug.WriteLine("App: Set per-monitor DPI awareness");
+                }
+                catch (Exception dpiEx)
+                {
+                    Debug.WriteLine($"App: Failed to set DPI awareness (may already be set): {dpiEx.Message}");
+                }
 
                 // Add global exception handlers to catch startup issues
                 AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;

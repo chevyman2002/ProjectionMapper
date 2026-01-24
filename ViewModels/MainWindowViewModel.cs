@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using System.Windows.Input;
@@ -172,9 +173,9 @@ namespace ProjectionMapper.ViewModels
                 RestartCommand = new AsyncRelayCommand(ExecuteRestartCommandAsync);
 
                 CreateMeshCommand = new RelayCommand(ExecuteCreateMeshCommand, _ => SelectedImportedVideo != null);
-                DeleteMeshCommand = new RelayCommand(ExecuteDeleteMeshCommand, _ => SelectedMeshLayer != null);
-                CopyMeshCommand = new RelayCommand(ExecuteCopyMeshCommand, _ => SelectedMeshLayer != null);
-                PasteMeshCommand = new RelayCommand(ExecutePasteMeshCommand, _ => SelectedImportedVideo != null && _copiedMesh != null);
+                DeleteMeshCommand = new RelayCommand(ExecuteDeleteMeshCommand, _ => SelectedMeshLayer != null || SelectedMeshLayers.Count > 0);
+                CopyMeshCommand = new RelayCommand(ExecuteCopyMeshCommand, _ => SelectedMeshLayer != null || SelectedMeshLayers.Count > 0);
+                PasteMeshCommand = new RelayCommand(ExecutePasteMeshCommand, _ => SelectedImportedVideo != null && _copiedMeshes != null && _copiedMeshes.Count > 0);
 
                 // Add imported deletion command
                 DeleteImportedCommand = new RelayCommand(ExecuteDeleteImportedCommand, p => p is ImportedVideoViewModel);
@@ -335,8 +336,197 @@ namespace ProjectionMapper.ViewModels
         public LayerViewModel? SelectedMeshLayer
         {
             get => _selectedMeshLayer;
-            set => SetProperty(ref _selectedMeshLayer, value);
+            set
+            {
+                if (SetProperty(ref _selectedMeshLayer, value))
+                {
+                    // Update command states when selection changes
+                    (CopyMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (DeleteMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
         }
+
+        /// <summary>
+        /// Collection of currently selected mesh layers for multi-selection support.
+        /// Used for Shift+click and Ctrl+click selection in the TreeView.
+        /// </summary>
+        private ObservableCollection<LayerViewModel> _selectedMeshLayers = new ObservableCollection<LayerViewModel>();
+        public ObservableCollection<LayerViewModel> SelectedMeshLayers
+        {
+            get => _selectedMeshLayers;
+            set
+            {
+                if (SetProperty(ref _selectedMeshLayers, value))
+                {
+                    // Update command states when selection changes
+                    (CopyMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    (DeleteMeshCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                    RaisePropertyChanged(nameof(MeshSelectionText));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets text describing the current mesh selection state.
+        /// </summary>
+        public string MeshSelectionText
+        {
+            get
+            {
+                if (SelectedMeshLayers.Count > 1)
+                {
+                    return $"{SelectedMeshLayers.Count} meshes selected";
+                }
+                else if (SelectedMeshLayer != null)
+                {
+                    return $"Selected: {SelectedMeshLayer.Name}";
+                }
+                return string.Empty;
+            }
+        }
+
+
+        /// <summary>
+        /// Clears all selected mesh layers.
+        /// </summary>
+        public void ClearMeshSelection()
+        {
+            // Clear IsMultiSelected on all previously selected items
+            foreach (var mesh in SelectedMeshLayers)
+            {
+                mesh.IsMultiSelected = false;
+            }
+            SelectedMeshLayers.Clear();
+            SelectedMeshLayer = null;
+            RaisePropertyChanged(nameof(SelectedMeshLayers));
+            RaisePropertyChanged(nameof(MeshSelectionText));
+        }
+
+        /// <summary>
+        /// Adds a mesh layer to the selection (for Ctrl+click).
+        /// </summary>
+        public void AddToMeshSelection(LayerViewModel mesh)
+        {
+            if (mesh == null) return;
+            if (!SelectedMeshLayers.Contains(mesh))
+            {
+                SelectedMeshLayers.Add(mesh);
+                mesh.IsMultiSelected = SelectedMeshLayers.Count > 1;
+            }
+            // Update all items' multi-selected state
+            UpdateMultiSelectedState();
+            SelectedMeshLayer = mesh;
+            RaisePropertyChanged(nameof(SelectedMeshLayers));
+        }
+
+        /// <summary>
+        /// Removes a mesh layer from the selection (for Ctrl+click toggle).
+        /// </summary>
+        public void RemoveFromMeshSelection(LayerViewModel mesh)
+        {
+            if (mesh == null) return;
+            mesh.IsMultiSelected = false;
+            SelectedMeshLayers.Remove(mesh);
+            if (SelectedMeshLayer == mesh)
+            {
+                SelectedMeshLayer = SelectedMeshLayers.LastOrDefault();
+            }
+            // Update all items' multi-selected state
+            UpdateMultiSelectedState();
+            RaisePropertyChanged(nameof(SelectedMeshLayers));
+        }
+
+        /// <summary>
+        /// Toggles a mesh layer in the selection (for Ctrl+click).
+        /// </summary>
+        public void ToggleMeshSelection(LayerViewModel mesh)
+        {
+            if (mesh == null) return;
+            if (SelectedMeshLayers.Contains(mesh))
+            {
+                RemoveFromMeshSelection(mesh);
+            }
+            else
+            {
+                AddToMeshSelection(mesh);
+            }
+        }
+
+        /// <summary>
+        /// Selects a range of mesh layers from the anchor to the target (for Shift+click).
+        /// </summary>
+        public void SelectMeshRange(LayerViewModel anchor, LayerViewModel target, ImportedVideoViewModel? parentVideo)
+        {
+            if (anchor == null || target == null || parentVideo == null) return;
+            
+            var meshLayers = parentVideo.MeshLayers.ToList();
+            int anchorIndex = meshLayers.IndexOf(anchor);
+            int targetIndex = meshLayers.IndexOf(target);
+            
+            if (anchorIndex < 0 || targetIndex < 0) return;
+            
+            int start = Math.Min(anchorIndex, targetIndex);
+            int end = Math.Max(anchorIndex, targetIndex);
+            
+            // Clear previous selection
+            foreach (var mesh in SelectedMeshLayers)
+            {
+                mesh.IsMultiSelected = false;
+            }
+            SelectedMeshLayers.Clear();
+            
+            // Add range to selection
+            for (int i = start; i <= end; i++)
+            {
+                SelectedMeshLayers.Add(meshLayers[i]);
+            }
+            
+            // Update multi-selected state
+            UpdateMultiSelectedState();
+            SelectedMeshLayer = target;
+            RaisePropertyChanged(nameof(SelectedMeshLayers));
+        }
+
+        /// <summary>
+        /// Sets a single mesh layer as the only selection.
+        /// </summary>
+        public void SetSingleMeshSelection(LayerViewModel mesh)
+        {
+            // Clear previous selection
+            foreach (var m in SelectedMeshLayers)
+            {
+                m.IsMultiSelected = false;
+            }
+            SelectedMeshLayers.Clear();
+            
+            if (mesh != null)
+            {
+                SelectedMeshLayers.Add(mesh);
+                mesh.IsMultiSelected = false; // Single selection doesn't show multi-select indicator
+            }
+            SelectedMeshLayer = mesh;
+            RaisePropertyChanged(nameof(SelectedMeshLayers));
+            RaisePropertyChanged(nameof(MeshSelectionText));
+        }
+        
+        /// <summary>
+        /// Updates the IsMultiSelected property on all selected mesh layers.
+        /// </summary>
+        private void UpdateMultiSelectedState()
+        {
+            bool isMulti = SelectedMeshLayers.Count > 1;
+            foreach (var mesh in SelectedMeshLayers)
+            {
+                mesh.IsMultiSelected = isMulti;
+            }
+            RaisePropertyChanged(nameof(MeshSelectionText));
+        }
+
+        /// <summary>
+        /// Gets the anchor mesh layer for Shift+click range selection.
+        /// </summary>
+        public LayerViewModel? MeshSelectionAnchor { get; set; }
 
         private SurfaceModel? _selectedSurface;
         public SurfaceModel? SelectedSurface
@@ -519,7 +709,7 @@ namespace ProjectionMapper.ViewModels
             }
         }
 
-        private LayerModel? _copiedMesh;
+        private List<LayerModel>? _copiedMeshes;
 
         private string GenerateUniqueMeshName()
         {
@@ -630,22 +820,32 @@ namespace ProjectionMapper.ViewModels
 
         private void ExecuteDeleteMeshCommand(object? _)
         {
-            if (SelectedImportedVideo == null || SelectedMeshLayer == null) return;
-
-            var removed = SelectedMeshLayer;
+            if (SelectedImportedVideo == null) return;
             
-            // Record undo action for mesh deletion
-            try
+            // Support multi-selection: delete all selected mesh layers
+            var meshesToDelete = SelectedMeshLayers.Count > 0 
+                ? SelectedMeshLayers.ToList() 
+                : (SelectedMeshLayer != null ? new List<LayerViewModel> { SelectedMeshLayer } : new List<LayerViewModel>());
+            
+            if (meshesToDelete.Count == 0) return;
+
+            foreach (var removed in meshesToDelete)
             {
-                var action = new DeleteMeshAction(SelectedImportedVideo, removed, MeshLayerCreated);
-                _undoRedoService.RecordAction(action);
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"Failed to record delete mesh action: {ex}");
+                // Record undo action for mesh deletion
+                try
+                {
+                    var action = new DeleteMeshAction(SelectedImportedVideo, removed, MeshLayerCreated);
+                    _undoRedoService.RecordAction(action);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Failed to record delete mesh action: {ex}");
+                }
+
+                SelectedImportedVideo.MeshLayers.Remove(removed);
             }
 
-            SelectedImportedVideo.MeshLayers.Remove(SelectedMeshLayer);
+            System.Diagnostics.Debug.WriteLine($"MainWindowViewModel: Deleted {meshesToDelete.Count} mesh(es)");
 
             // if no remaining meshes reference the host, restore host preview behavior
             try
@@ -662,78 +862,150 @@ namespace ProjectionMapper.ViewModels
             }
             catch { }
 
-            SelectedMeshLayer = null;
+            ClearMeshSelection();
         }
 
         private void ExecuteCopyMeshCommand(object? _)
         {
-            if (SelectedMeshLayer == null) return;
-            // copy dimensions and mesh points into a temp LayerModel for paste
-            var model = new LayerModel
-            {
-                Width = SelectedMeshLayer.Width,
-                Height = SelectedMeshLayer.Height,
-                X = SelectedMeshLayer.X,
-                Y = SelectedMeshLayer.Y
-            };
+            // Support multi-selection: copy all selected mesh layers
+            var meshesToCopy = SelectedMeshLayers.Count > 0 
+                ? SelectedMeshLayers.ToList() 
+                : (SelectedMeshLayer != null ? new List<LayerViewModel> { SelectedMeshLayer } : new List<LayerViewModel>());
+            
+            if (meshesToCopy.Count == 0) return;
 
-            try
+            _copiedMeshes = new List<LayerModel>();
+            
+            foreach (var selectedMesh in meshesToCopy)
             {
-                var src = SelectedMeshLayer.Model.MeshPoints;
-                var dst = model.MeshPoints;
-                var len = Math.Min(src.Length, dst.Length);
-                for (int i = 0; i < len; ++i) dst[i] = src[i];
+                // Copy all relevant mesh properties into a temp LayerModel for paste
+                var model = new LayerModel
+                {
+                    Width = selectedMesh.Width,
+                    Height = selectedMesh.Height,
+                    X = selectedMesh.X,
+                    Y = selectedMesh.Y,
+                    TargetMonitorIndex = selectedMesh.TargetMonitorIndex,
+                    Opacity = selectedMesh.Opacity
+                };
+
+                try
+                {
+                    // Copy input mesh points
+                    var src = selectedMesh.Model.MeshPoints;
+                    var dst = model.MeshPoints;
+                    var len = Math.Min(src.Length, dst.Length);
+                    for (int i = 0; i < len; ++i) dst[i] = src[i];
+                    
+                    // Copy output mesh points (the warped quad on the output)
+                    var srcOut = selectedMesh.Model.OutputMeshPoints;
+                    var dstOut = model.OutputMeshPoints;
+                    var lenOut = Math.Min(srcOut.Length, dstOut.Length);
+                    for (int i = 0; i < lenOut; ++i) dstOut[i] = srcOut[i];
+                }
+                catch { }
+
+                _copiedMeshes.Add(model);
             }
-            catch { }
-
-            _copiedMesh = model;
+            
+            System.Diagnostics.Debug.WriteLine($"MainWindowViewModel: Copied {_copiedMeshes.Count} mesh(es)");
         }
+
 
         private void ExecutePasteMeshCommand(object? _)
         {
-            if (SelectedImportedVideo == null || _copiedMesh == null) return;
+            if (SelectedImportedVideo == null || _copiedMeshes == null || _copiedMeshes.Count == 0) return;
             var host = SelectedImportedVideo.HostLayer;
 
-            // If host exists, center pasted mesh on host; otherwise use copied coords
-            int defaultX = _copiedMesh.X, defaultY = _copiedMesh.Y, defaultW = _copiedMesh.Width, defaultH = _copiedMesh.Height;
-            if (host != null && host.Width > 0 && host.Height > 0)
+            // Paste all copied meshes
+            var pastedMeshes = new List<LayerViewModel>();
+            
+            foreach (var copiedMesh in _copiedMeshes)
             {
-                defaultW = Math.Max(1, Math.Min(_copiedMesh.Width > 0 ? _copiedMesh.Width : host.Width / 2, host.Width));
-                defaultH = Math.Max(1, Math.Min(_copiedMesh.Height > 0 ? _copiedMesh.Height : host.Height / 2, host.Height));
-                defaultX = host.X + (host.Width - defaultW) / 2;
-                defaultY = host.Y + (host.Height - defaultH) / 2;
+                // If host exists, use copied coordinates relative to the mesh
+                // otherwise use copied coords directly
+                int defaultX = copiedMesh.X, defaultY = copiedMesh.Y, defaultW = copiedMesh.Width, defaultH = copiedMesh.Height;
+                if (host != null && host.Width > 0 && host.Height > 0)
+                {
+                    defaultW = Math.Max(1, Math.Min(copiedMesh.Width > 0 ? copiedMesh.Width : host.Width / 2, host.Width));
+                    defaultH = Math.Max(1, Math.Min(copiedMesh.Height > 0 ? copiedMesh.Height : host.Height / 2, host.Height));
+                    // Keep the original position if it fits, otherwise center
+                    if (copiedMesh.X >= host.X && copiedMesh.X + defaultW <= host.X + host.Width)
+                        defaultX = copiedMesh.X;
+                    else
+                        defaultX = host.X + (host.Width - defaultW) / 2;
+                    if (copiedMesh.Y >= host.Y && copiedMesh.Y + defaultH <= host.Y + host.Height)
+                        defaultY = copiedMesh.Y;
+                    else
+                        defaultY = host.Y + (host.Height - defaultH) / 2;
+                }
+
+                var copied = new LayerModel
+                {
+                    Id = Guid.NewGuid().ToString("N"),
+                    Name = GenerateUniqueMeshName(),
+                    X = defaultX,
+                    Y = defaultY,
+                    Width = defaultW,
+                    Height = defaultH,
+                    SourceId = host?.Id,
+                    Visible = true,
+                    TargetMonitorIndex = copiedMesh.TargetMonitorIndex,
+                    Opacity = copiedMesh.Opacity
+                };
+
+                try
+                {
+                    // Copy input mesh points
+                    var src = copiedMesh.MeshPoints;
+                    var dst = copied.MeshPoints;
+                    var len = Math.Min(src.Length, dst.Length);
+                    for (int i = 0; i < len; ++i) dst[i] = src[i];
+                    
+                    // Copy output mesh points (preserve the warped quad on the output)
+                    var srcOut = copiedMesh.OutputMeshPoints;
+                    var dstOut = copied.OutputMeshPoints;
+                    var lenOut = Math.Min(srcOut.Length, dstOut.Length);
+                    for (int i = 0; i < lenOut; ++i) dstOut[i] = srcOut[i];
+                }
+                catch { }
+
+                var vm = new LayerViewModel(copied);
+                
+                // Record undo action for mesh paste (uses same action as create since behavior is identical)
+                try
+                {
+                    var action = new CreateMeshAction(SelectedImportedVideo, vm, MeshLayerCreated);
+                    _undoRedoService.RecordAction(action);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Failed to record paste mesh action: {ex}");
+                }
+                
+                SelectedImportedVideo.MeshLayers.Add(vm);
+                pastedMeshes.Add(vm);
+
+                MeshLayerCreated?.Invoke(copied);
             }
-
-            var copied = new LayerModel
+            
+            // Select all pasted meshes
+            if (pastedMeshes.Count > 0)
             {
-                Id = Guid.NewGuid().ToString("N"),
-                Name = GenerateUniqueMeshName(),
-                X = defaultX,
-                Y = defaultY,
-                Width = defaultW,
-                Height = defaultH,
-                SourceId = host?.Id,
-                Visible = true
-            };
-
-            try
-            {
-                var src = _copiedMesh.MeshPoints;
-                var dst = copied.MeshPoints;
-                var len = Math.Min(src.Length, dst.Length);
-                for (int i = 0; i < len; ++i) dst[i] = src[i];
+                SelectedMeshLayers.Clear();
+                foreach (var vm in pastedMeshes)
+                {
+                    SelectedMeshLayers.Add(vm);
+                }
+                SelectedMeshLayer = pastedMeshes.Last();
             }
-            catch { }
-
-            var vm = new LayerViewModel(copied);
-            SelectedImportedVideo.MeshLayers.Add(vm);
-            SelectedMeshLayer = vm;
-
-            MeshLayerCreated?.Invoke(copied);
+            
+            System.Diagnostics.Debug.WriteLine($"MainWindowViewModel: Pasted {pastedMeshes.Count} mesh(es)");
 
             // prevent host full-frame output to avoid duplicate
             try { if (host != null) host.PreviewOnly = true; } catch { }
         }
+
 
         private void ExecuteDeleteImportedCommand(object? param)
         {
@@ -1149,6 +1421,26 @@ namespace ProjectionMapper.ViewModels
                                 assignedVideoIds.Add(sourceId);
                             }
                         }
+                        
+                        // Refresh display text after adding videos
+                        groupTree.RefreshDisplayText();
+                    }
+                    
+                    // Add unassigned videos at the root level (below groups)
+                    foreach (var video in ImportedVideos)
+                    {
+                        if (!string.IsNullOrEmpty(video.Id) && !assignedVideoIds.Contains(video.Id))
+                        {
+                            var videoTree = _videoTreeItems.FirstOrDefault(vt => vt.Id == video.Id);
+                            if (videoTree == null)
+                            {
+                                videoTree = new ImportedVideoTreeViewModel(video);
+                                _videoTreeItems.Add(videoTree);
+                            }
+                            
+                            // Add unassigned video to the tree root
+                            newTree.Add(videoTree);
+                        }
                     }
                 }
                 else
@@ -1177,6 +1469,15 @@ namespace ProjectionMapper.ViewModels
              {
                  _isUpdatingProjectTree = false;
              }
+        }
+        
+        /// <summary>
+        /// Public method to trigger a refresh of the project tree.
+        /// Call this after modifying group membership.
+        /// </summary>
+        public void RefreshProjectTree()
+        {
+            RebuildProjectTree();
         }
         #endregion
     }

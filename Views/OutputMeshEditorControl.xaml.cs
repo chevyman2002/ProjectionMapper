@@ -808,6 +808,7 @@ namespace ProjectionMapper.Views
             catch { }
         }
 
+
         private Transform ComputePerspectiveTransform(Point tl, Point tr, Point bl, Point br)
         {
             // For a simple quad warp in WPF, we use a MatrixTransform approximation
@@ -819,7 +820,7 @@ namespace ProjectionMapper.Views
             var minX = Math.Min(Math.Min(tl.X, tr.X), Math.Min(bl.X, br.X));
             var minY = Math.Min(Math.Min(tl.Y, tr.Y), Math.Min(bl.Y, br.Y));
             var maxX = Math.Max(Math.Max(tl.X, tr.X), Math.Max(bl.X, br.X));
-            var maxY = Math.Max(Math.Max(tl.Y, tr.Y), Math.Min(bl.Y, br.Y));
+            var maxY = Math.Max(Math.Max(tl.Y, tr.Y), Math.Max(bl.Y, br.Y));
 
             var width = Math.Max(1, maxX - minX);
             var height = Math.Max(1, maxY - minY);
@@ -909,17 +910,89 @@ namespace ProjectionMapper.Views
 
                             // Build destination quad in renderer coordinates (TopLeft, TopRight, BottomLeft, BottomRight)
                             Point[]? destQuad = null;
+                            
+                            // CALCULATE QUAD LOCALLY to ensure consistency with drag logic
+                            // Prioritize Target Monitor dimensions for wired display stability
                             try
                             {
-                                // Try to map normalized output points to renderer pixel coordinates via RendererManager
-                                destQuad = RendererManager?.MapNormalizedToRendererPoints(_vm.OutputMeshPoints, _vm.Model?.TargetMonitorIndex);
+                                var targetMon = _vm.Model?.TargetMonitorIndex ?? -1;
+                                int targetW = 0, targetH = 0;
+                                
+                                if (targetMon >= 0 && RendererManager != null)
+                                {
+                                    var monSize = RendererManager.GetMonitorRendererSize(targetMon);
+                                    if (monSize.Width > 0 && monSize.Height > 0)
+                                    {
+                                        targetW = monSize.Width;
+                                        targetH = monSize.Height;
+                                    }
+                                }
+                                
+                                // If no specific monitor or size not found, fallback to HostRenderHost size or OutputWidth
+                                if (targetW == 0 && RendererManager != null)
+                                {
+                                    targetW = RendererManager.OutputWidth;
+                                    targetH = RendererManager.OutputHeight;
+                                }
+                                
+                                if (targetW > 0 && targetH > 0)
+                                {
+                                    // Map normalized points to target (monitor/renderer) dimensions directly
+                                    // Use _vm.OutputMeshPoints which contains the latest normalized points
+                                    var pts = _vm.OutputMeshPoints;
+                                    if (pts != null && pts.Length >= 4)
+                                    {
+                                        destQuad = new Point[4]
+                                        {
+                                            new Point(pts[0].X * targetW, pts[0].Y * targetH),
+                                            new Point(pts[1].X * targetW, pts[1].Y * targetH),
+                                            new Point(pts[2].X * targetW, pts[2].Y * targetH),
+                                            new Point(pts[3].X * targetW, pts[3].Y * targetH)
+                                        };
+                                    }
+                                }
                             }
-                            catch (Exception exQuad) { Debug.WriteLine($"WriteBackMeshPoints: MapNormalizedToRendererPoints failed: {exQuad}"); destQuad = null; }
+                            catch (Exception exQuad) { Debug.WriteLine($"WriteBackMeshPoints: Local quad calc failed: {exQuad}"); destQuad = null; }
 
-                            // If mapping failed (no main host frame available), fall back to host-based mapping using HostRenderHost
+                            // Fallback to MapNormalizedToRendererPoints if local calc failed (should be rare)
                             if (destQuad == null)
                             {
-                                if (HostRenderHost != null && RendererManager != null)
+                                try
+                                {
+                                    destQuad = RendererManager?.MapNormalizedToRendererPoints(_vm.OutputMeshPoints, _vm.Model?.TargetMonitorIndex);
+                                }
+                                catch { }
+                            }
+
+                            // If mapping still failed (no main host frame available), fall back to monitor-based or host-based mapping
+                            if (destQuad == null)
+                            {
+                                var targetMon = _vm.Model?.TargetMonitorIndex ?? -1;
+                                
+                                // First try: If we have a target monitor, use its size
+                                if (targetMon >= 0 && RendererManager != null)
+                                {
+                                    try
+                                    {
+                                        var monSize = RendererManager.GetMonitorRendererSize(targetMon);
+                                        if (monSize.Width > 0 && monSize.Height > 0 && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
+                                        {
+                                            var scaleX = monSize.Width / PART_Canvas.ActualWidth;
+                                            var scaleY = monSize.Height / PART_Canvas.ActualHeight;
+                                            destQuad = new Point[4]
+                                            {
+                                                new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY),
+                                                new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY),
+                                                new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY),
+                                                new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)
+                                            };
+                                        }
+                                    }
+                                    catch { destQuad = null; }
+                                }
+                                
+                                // Second try: Fall back to host-based mapping using HostRenderHost
+                                if (destQuad == null && HostRenderHost != null && RendererManager != null)
                                 {
                                     try
                                     {
@@ -943,31 +1016,50 @@ namespace ProjectionMapper.Views
 
                             var destRect = new Rect(_vm.X, _vm.Y, Math.Max(1, _vm.Width), Math.Max(1, _vm.Height));
                             // clamp destQuad to renderer bounds if possible
+                            // CRITICAL: Use TARGET MONITOR dimensions, not main renderer dimensions
                             try
                             {
-                                if (destQuad != null && RendererManager != null && RendererManager.OutputWidth > 0 && RendererManager.OutputHeight > 0)
+                                if (destQuad != null && RendererManager != null)
                                 {
-                                    for (int i = 0; i < destQuad.Length; ++i)
+                                    int clampW = RendererManager.OutputWidth;
+                                    int clampH = RendererManager.OutputHeight;
+                                    
+                                    // If targeting a specific monitor, use that monitor's size for clamping
+                                    var targetMon = _vm.Model?.TargetMonitorIndex ?? -1;
+                                    if (targetMon >= 0)
                                     {
-                                        var p = destQuad[i];
-                                        p.X = Math.Max(0, Math.Min(RendererManager.OutputWidth, p.X));
-                                        p.Y = Math.Max(0, Math.Min(RendererManager.OutputHeight, p.Y));
-                                        destQuad[i] = p;
+                                        var monSize = RendererManager.GetMonitorRendererSize(targetMon);
+                                        if (monSize.Width > 0 && monSize.Height > 0)
+                                        {
+                                            clampW = monSize.Width;
+                                            clampH = monSize.Height;
+                                        }
+                                    }
+                                    
+                                    if (clampW > 0 && clampH > 0)
+                                    {
+                                        for (int i = 0; i < destQuad.Length; ++i)
+                                        {
+                                            var p = destQuad[i];
+                                            p.X = Math.Max(0, Math.Min(clampW, p.X));
+                                            p.Y = Math.Max(0, Math.Min(clampH, p.Y));
+                                            destQuad[i] = p;
+                                        }
                                     }
                                 }
                             }
                             catch { }
                             try
                             {
-                                // Pass destQuad to RendererManager; it will pass through to the renderer which will warp if supported.
-                                RendererManager.SubmitLayerFrame(layerId, frameToSubmit, destRect, destQuad, _vm.Opacity);
+                                // Pass destQuad to RendererManager; send to BOTH main preview AND target monitor
+                                var targetMonitor = _vm.Model?.TargetMonitorIndex ?? -1;
+                                RendererManager.SubmitLayerFrameForMonitor(layerId, frameToSubmit, destRect, destQuad, _vm.Opacity, targetMonitor);
 
                                 // Also instruct RendererManager to show the mesh overlay on the output host/fullscreen for this layer
                                 try
                                 {
                                     bool showPoints = true;
                                     // respect per-layer preference if present
-                                    var targetMonitor = _vm.Model?.TargetMonitorIndex;
                                     var showOverlayPref = _vm.Model?.ShowOverlay ?? true;
                                     if (!showOverlayPref || RendererManager == null)
                                     {
@@ -994,8 +1086,33 @@ namespace ProjectionMapper.Views
                                         }
                                         else
                                         {
-                                            // fallback to host-based mapping using HostRenderHost current frame
-                                            if (HostRenderHost != null && RendererManager != null)
+                                            // fallback: Try monitor-based mapping first, then host-based mapping
+                                            Point[]? fallbackQuad = null;
+                                            
+                                            // First try: If we have a target monitor, use its size
+                                            if (targetMonitor >= 0 && RendererManager != null)
+                                            {
+                                                try
+                                                {
+                                                    var monSize = RendererManager.GetMonitorRendererSize(targetMonitor);
+                                                    if (monSize.Width > 0 && monSize.Height > 0 && PART_Canvas.ActualWidth > 0 && PART_Canvas.ActualHeight > 0)
+                                                    {
+                                                        var scaleX = monSize.Width / PART_Canvas.ActualWidth;
+                                                        var scaleY = monSize.Height / PART_Canvas.ActualHeight;
+                                                        fallbackQuad = new Point[4]
+                                                        {
+                                                            new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY),
+                                                            new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY),
+                                                            new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY),
+                                                            new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)
+                                                        };
+                                                    }
+                                                }
+                                                catch { fallbackQuad = null; }
+                                            }
+                                            
+                                            // Second try: Fall back to host-based mapping using HostRenderHost
+                                            if (fallbackQuad == null && HostRenderHost != null && RendererManager != null)
                                             {
                                                 try
                                                 {
@@ -1007,17 +1124,21 @@ namespace ProjectionMapper.Views
                                                         scaleX = cf.PixelWidth / PART_Canvas.ActualWidth;
                                                         scaleY = cf.PixelHeight / PART_Canvas.ActualHeight;
                                                     }
-                                                    var fallbackQuad = new Point[4]
+                                                    fallbackQuad = new Point[4]
                                                     {
                                                         new Point(_corners[0].X * scaleX, _corners[0].Y * scaleY),
                                                         new Point(_corners[1].X * scaleX, _corners[1].Y * scaleY),
                                                         new Point(_corners[2].X * scaleX, _corners[2].Y * scaleY),
                                                         new Point(_corners[3].X * scaleX, _corners[3].Y * scaleY)
                                                     };
-                                                    // Use RendererManager to add overlay so it's properly tracked
-                                                    try { RendererManager.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, fallbackQuad, showPoints, layerId); } catch { }
                                                 }
-                                                catch { }
+                                                catch { fallbackQuad = null; }
+                                            }
+                                            
+                                            // Use RendererManager to add overlay so it's properly tracked
+                                            if (fallbackQuad != null)
+                                            {
+                                                try { RendererManager.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, fallbackQuad, showPoints, layerId); } catch { }
                                             }
                                         }
                                     }
@@ -1035,10 +1156,11 @@ namespace ProjectionMapper.Views
                 UpdateAllMeshLayersExternalOverlays();
 
                 // Force re-render mesh layer with cached frame (important for paused videos)
-                if (_videoService != null && !string.IsNullOrEmpty(_vm.Id))
-                {
-                    _videoService.RefreshMeshLayerRendering(_vm.Id);
-                }
+                // NOTE: WriteBackMeshPoints already submitted the frame with the latest destQuad.
+                // Calling RefreshMeshLayerRendering here is redundant and potentially dangerous 
+                // if it calculates a slightly different quad (floating point jitter), causing "haywire" flickering.
+                // We should only rely on the direct submission here providing the immediate feedback.
+                // _videoService.RefreshMeshLayerRendering(_vm.Id);
             }
             catch (Exception ex) { Debug.WriteLine($"WriteBackMeshPoints top-level error: {ex}"); }
         }

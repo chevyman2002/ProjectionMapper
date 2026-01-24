@@ -4,7 +4,7 @@
         xmlns:views="clr-namespace:ProjectionMapper.Views"
         WindowStyle="None" 
         AllowsTransparency="False" 
-        WindowState="Maximized" 
+        WindowState="Normal"
         Topmost="True"
         Background="Black">
     <Grid Background="Black">

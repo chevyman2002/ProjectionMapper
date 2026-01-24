@@ -21,6 +21,8 @@ namespace ProjectionMapper.Rendering
     {
         private int _width;
         private int _height;
+        private double _dpiX = 96;
+        private double _dpiY = 96;
         private bool _initialized;
 
         // LayerId -> (frame, destRect, destQuad, opacity)
@@ -58,6 +60,21 @@ namespace ProjectionMapper.Rendering
         {
             if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width));
             _width = width; _height = height; _initialized = true;
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Initialize with specific DPI values. Use this for fullscreen windows on monitors with non-96 DPI.
+        /// </summary>
+        public Task InitializeAsync(int width, int height, double dpiX, double dpiY, CancellationToken token = default)
+        {
+            if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width));
+            _width = width; 
+            _height = height;
+            _dpiX = dpiX > 0 ? dpiX : 96;
+            _dpiY = dpiY > 0 ? dpiY : 96;
+            _initialized = true;
+            Debug.WriteLine($"SoftwareRenderer.InitializeAsync: {width}x{height} @ {_dpiX}x{_dpiY} DPI");
             return Task.CompletedTask;
         }
 
@@ -264,7 +281,8 @@ namespace ProjectionMapper.Rendering
                     }
                 }
 
-                // Render to bitmap and notify
+                // Render to bitmap and notify - always use 96 DPI since we work in pixel coordinates
+                // Using non-96 DPI would cause WPF to scale the drawing coordinates, breaking quad warping
                 var rtb = new RenderTargetBitmap(_width, _height, 96, 96, PixelFormats.Pbgra32);
                 rtb.Render(dv);
                 try { rtb.Freeze(); } catch { }
@@ -437,8 +455,8 @@ namespace ProjectionMapper.Rendering
                     }
                 });
 
-                // Create WriteableBitmap and write pixels
-                var wb = new WriteableBitmap(outW, outH, src.DpiX, src.DpiY, PixelFormats.Bgra32, null);
+                // Create WriteableBitmap and write pixels - use 96 DPI to match pixel coordinates
+                var wb = new WriteableBitmap(outW, outH, 96, 96, PixelFormats.Bgra32, null);
                 wb.WritePixels(new Int32Rect(0, 0, outW, outH), outPixels, outW * 4, 0);
                 try { wb.Freeze(); } catch { }
                 return wb;

@@ -52,7 +52,12 @@ namespace ProjectionMapper
         // P/Invoke for positioning windows
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
-        private record MonitorInfo(int Width, int Height, int Left, int Top);
+        /// <summary>
+        /// Stores both physical (native resolution) and virtual (DPI-scaled) monitor dimensions.
+        /// PhysicalWidth/Height = the actual pixel count of the display
+        /// Width/Height/Left/Top = the virtual screen coordinates (used for window positioning)
+        /// </summary>
+        private record MonitorInfo(int Width, int Height, int Left, int Top, int PhysicalWidth, int PhysicalHeight);
 
         private class MonitorItem
         {
@@ -909,7 +914,7 @@ namespace ProjectionMapper
 
         /// <summary>
         /// Creates (or reuses) a fullscreen output window for the requested monitor.
-        /// Uses the same approach as the original working implementation.
+        /// Uses raw pixel coordinates via SetWindowPos for reliable positioning on wireless displays.
         /// </summary>
         private void ShowMonitorWindow(int monitorIndex)
         {
@@ -939,31 +944,17 @@ namespace ProjectionMapper
                     return;
                 }
 
-                // Create fullscreen window and position it using monitor bounds converted to DIPs
+                // Create fullscreen window - we'll position it using raw Win32 SetWindowPos
+                // to avoid DPI scaling issues with wireless displays
                 var win = new FullScreenOutputWindow
                 {
                     WindowStyle = WindowStyle.None,
                     ResizeMode = ResizeMode.NoResize,
                     ShowInTaskbar = false,
                     Topmost = true,
-                    WindowState = WindowState.Normal
+                    WindowState = WindowState.Normal,
+                    WindowStartupLocation = WindowStartupLocation.Manual
                 };
-
-                // Convert monitor pixel boundaries to WPF DIPs
-                var source = PresentationSource.FromVisual(this);
-                double dpiX = 1.0, dpiY = 1.0;
-                if (source != null && source.CompositionTarget != null)
-                {
-                    dpiX = source.CompositionTarget.TransformFromDevice.M11;
-                    dpiY = source.CompositionTarget.TransformFromDevice.M22;
-                }
-
-                win.Left = mon.Left / dpiX;
-                win.Top = mon.Top / dpiY;
-                win.Width = mon.Width / dpiX;
-                win.Height = mon.Height / dpiX;
-
-                win.WindowStartupLocation = WindowStartupLocation.Manual;
 
                 win.Closed += FullScreenWindow_Closed;
                 win.Tag = monitorIndex;
@@ -975,40 +966,47 @@ namespace ProjectionMapper
                     var hwnd = helper.EnsureHandle();
 
                     const int GWL_STYLE = -16;
+                    const int GWL_EXSTYLE = -20;
                     const int WS_POPUP = unchecked((int)0x80000000);
+                    const int WS_EX_TOPMOST = 0x00000008;
+                    const uint SWP_FRAMECHANGED = 0x0020;
+                    const uint SWP_NOACTIVATE = 0x0010;
 
-                    Debug.WriteLine($"MainWindow: Calling SetWindowPos for monitor {monitorIndex} -> rect {mon.Left},{mon.Top} {mon.Width}x{mon.Height}");
-                    bool ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, SWP_SHOWWINDOW);
+
+                    // Set window style to popup for borderless fullscreen
+                    var prevStyle = GetWindowLong(hwnd, GWL_STYLE);
+                    SetWindowLong(hwnd, GWL_STYLE, (prevStyle | WS_POPUP) & ~0x00C00000); // Remove WS_CAPTION
+
+                    Debug.WriteLine($"MainWindow: Calling SetWindowPos for monitor {monitorIndex} -> virtual rect {mon.Left},{mon.Top} {mon.Width}x{mon.Height}, physical: {mon.PhysicalWidth}x{mon.PhysicalHeight}");
+                    
+                    // Use SetWindowPos with virtual screen coordinates (what Windows expects)
+                    bool ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, 
+                        SWP_SHOWWINDOW | SWP_FRAMECHANGED);
                     var err = Marshal.GetLastWin32Error();
                     Debug.WriteLine($"MainWindow: SetWindowPos returned {ok}, GetLastError={err}");
 
                     if (!ok)
                     {
-                        try
-                        {
-                            var prev = GetWindowLong(hwnd, GWL_STYLE);
-                            SetWindowLong(hwnd, GWL_STYLE, prev | WS_POPUP);
-                            ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, SWP_SHOWWINDOW);
-                            err = Marshal.GetLastWin32Error();
-                            Debug.WriteLine($"MainWindow: Retry SetWindowPos returned {ok}, GetLastError={err}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"MainWindow: Retry SetWindowPos exception: {ex}");
-                        }
+                        // Retry with different flags
+                        ok = SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, 
+                            SWP_SHOWWINDOW | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+                        err = Marshal.GetLastWin32Error();
+                        Debug.WriteLine($"MainWindow: Retry SetWindowPos returned {ok}, GetLastError={err}");
                     }
 
-                    // Show the window AFTER native positioning
+                    // Show the window AFTER native positioning - do NOT use WindowState.Maximized
+                    // as it will override our SetWindowPos positioning
                     win.Show();
 
                     _activeMonitorWindows[monitorIndex] = win;
 
-                    // Initialize the fullscreen renderer for this monitor
-                    _rendererManager.ShowFullScreenWindow(monitorIndex, win, mon.Width, mon.Height);
+                    // Initialize the fullscreen renderer for this monitor using PHYSICAL pixel dimensions
+                    // This ensures the renderer outputs at the native resolution for crisp display
+                    _rendererManager.ShowFullScreenWindow(monitorIndex, win, mon.PhysicalWidth, mon.PhysicalHeight);
                     _rendererManager.AttachHost(monitorIndex, win);
 
-                    // Set to maximized to ensure true fullscreen
-                    win.WindowState = WindowState.Maximized;
+                    // Ensure window stays on top and at correct position after showing
+                    SetWindowPos(hwnd, HWND_TOPMOST, mon.Left, mon.Top, mon.Width, mon.Height, SWP_SHOWWINDOW);
 
                     Debug.WriteLine($"MainWindow: ShowMonitorWindow success for monitor {monitorIndex}");
                 }
@@ -1017,10 +1015,14 @@ namespace ProjectionMapper
                     Debug.WriteLine($"MainWindow: ShowMonitorWindow placement/show failed: {ex}");
                     try
                     {
-                        win.WindowState = WindowState.Maximized;
+                        // Fallback: use WPF properties but still use physical dimensions for renderer
+                        win.Left = mon.Left;
+                        win.Top = mon.Top;
+                        win.Width = mon.Width;
+                        win.Height = mon.Height;
                         win.Show();
                         _activeMonitorWindows[monitorIndex] = win;
-                        _rendererManager.ShowFullScreenWindow(monitorIndex, win, mon.Width, mon.Height);
+                        _rendererManager.ShowFullScreenWindow(monitorIndex, win, mon.PhysicalWidth, mon.PhysicalHeight);
                         _rendererManager.AttachHost(monitorIndex, win);
                     }
                     catch (Exception ex2)
@@ -1235,9 +1237,48 @@ namespace ProjectionMapper
         [DllImport("user32.dll", CharSet = CharSet.Ansi)]
         private static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
 
+        // Additional P/Invoke for reliable monitor enumeration
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
+        }
+
+        private delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        private const uint MONITOR_DEFAULTTONEAREST = 2;
+        private const uint MONITORINFOF_PRIMARY = 1;
+
+
+
+
+
         /// <summary>
         /// Enumerates connected monitors and populates the monitor dropdown.
-        /// Uses EnumDisplaySettings to obtain the physical pixel resolution to avoid DPI scaling artifacts.
+        /// Uses EnumDisplayMonitors for reliable physical pixel bounds, especially for wireless displays.
         /// </summary>
         private void EnumerateMonitors()
         {
@@ -1247,74 +1288,110 @@ namespace ProjectionMapper
                 _monitors.Clear();
                 _monitorItems.Clear();
 
-                // Use Windows Forms to enumerate display devices, but query EnumDisplaySettings
-                System.Windows.Forms.Screen[]? screens = null;
-                try
-                {
-                    screens = System.Windows.Forms.Screen.AllScreens;
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"MainWindow: Screen.AllScreens failed (display may be disconnecting): {ex}");
-                    return;
-                }
-
-                if (screens == null || screens.Length == 0)
-                {
-                    Debug.WriteLine("MainWindow: No screens found");
-                    return;
-                }
-
-                for (int i = 0; i < screens.Length; i++)
+                // Collect monitor info using EnumDisplayMonitors for accurate physical coordinates
+                var monitorList = new List<(IntPtr hMonitor, RECT bounds, string deviceName, bool isPrimary)>();
+                
+                MonitorEnumProc callback = (IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData) =>
                 {
                     try
                     {
-                        var screen = screens[i];
-                        if (screen == null) continue;
-
-                        int physW = screen.Bounds.Width;
-                        int physH = screen.Bounds.Height;
-
-                        try
+                        var mi = new MONITORINFOEX();
+                        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+                        if (GetMonitorInfo(hMonitor, ref mi))
                         {
-                            // Query current display mode for the device name to get true physical pixels
-                            var dm = new DEVMODE();
-                            dm.dmDeviceName = new string('\0', 32);
-                            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
-
-                            if (EnumDisplaySettings(screen.DeviceName, ENUM_CURRENT_SETTINGS, ref dm))
-                            {
-                                // Use dmPelsWidth/dmPelsHeight which reflect the actual mode in pixels
-                                if (dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0)
-                                {
-                                    physW = dm.dmPelsWidth;
-                                    physH = dm.dmPelsHeight;
-                                }
-                            }
+                            bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+                            monitorList.Add((hMonitor, mi.rcMonitor, mi.szDevice, isPrimary));
+                            Debug.WriteLine($"MainWindow: EnumDisplayMonitors found device '{mi.szDevice}' at ({mi.rcMonitor.Left},{mi.rcMonitor.Top}) size {mi.rcMonitor.Right - mi.rcMonitor.Left}x{mi.rcMonitor.Bottom - mi.rcMonitor.Top} Primary={isPrimary}");
                         }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"MainWindow: EnumDisplaySettings failed for {screen.DeviceName}: {ex}");
-                        }
-
-                        var bounds = screen.Bounds;
-
-                        _monitors.Add(new MonitorInfo(physW, physH, bounds.Left, bounds.Top));
-
-                        var isPrimary = screen.Primary ? " (Primary)" : "";
-                        var monitorItem = new MonitorItem
-                        {
-                            Index = i,
-                            Name = $"Display {i + 1}: {physW}x{physH}{isPrimary}"
-                        };
-                        _monitorItems.Add(monitorItem);
-
-                        Debug.WriteLine($"MainWindow: Found monitor {i}: {monitorItem.Name} at ({bounds.Left}, {bounds.Top})");
                     }
                     catch (Exception ex)
                     {
-                        Debug.WriteLine($"MainWindow: Failed to enumerate monitor {i}: {ex}");
+                        Debug.WriteLine($"MainWindow: EnumDisplayMonitors callback failed: {ex}");
                     }
+                    return true; // continue enumeration
+                };
+
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero);
+
+                // Sort monitors: primary first, then by Left position
+                monitorList = monitorList
+                    .OrderByDescending(m => m.isPrimary)
+                    .ThenBy(m => m.bounds.Left)
+                    .ThenBy(m => m.bounds.Top)
+                    .ToList();
+
+                for (int i = 0; i < monitorList.Count; i++)
+                {
+                    var (hMonitor, bounds, deviceName, isPrimary) = monitorList[i];
+                    
+                    // EnumDisplayMonitors returns the virtual screen coordinates (DPI-scaled)
+                    // These are used for window positioning with SetWindowPos
+                    int virtualW = bounds.Right - bounds.Left;
+                    int virtualH = bounds.Bottom - bounds.Top;
+                    int virtualLeft = bounds.Left;
+                    int virtualTop = bounds.Top;
+                    
+                    // Physical dimensions default to virtual (will be updated if DPI scaling detected)
+                    int physicalW = virtualW;
+                    int physicalH = virtualH;
+
+                    try
+                    {
+                        // Query current display mode to get the actual physical resolution
+                        var dm = new DEVMODE();
+                        dm.dmDeviceName = new string('\0', 32);
+                        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+
+                        if (!string.IsNullOrEmpty(deviceName) && EnumDisplaySettings(deviceName, ENUM_CURRENT_SETTINGS, ref dm))
+                        {
+                            if (dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0)
+                            {
+                                // For displays with DPI scaling:
+                                // - EnumDisplayMonitors gives us virtual/scaled coordinates (e.g., 2880x1620 at 150% DPI)
+                                // - EnumDisplaySettings gives us the logical resolution (e.g., 1920x1080)
+                                // 
+                                // If the display settings resolution differs from virtual bounds,
+                                // it indicates DPI scaling is in effect. In this case:
+                                // - Use virtual bounds for window positioning (SetWindowPos uses virtual coords)
+                                // - Use LARGER of the two for rendering (the physical pixel count)
+                                //
+                                // When virtual > display settings: physical = virtual (150% scaling)
+                                // When virtual == display settings: no scaling
+                                if (virtualW > dm.dmPelsWidth || virtualH > dm.dmPelsHeight)
+                                {
+                                    // DPI scaling detected: virtual bounds are larger than display settings
+                                    // The virtual bounds represent the physical pixel dimensions
+                                    physicalW = virtualW;
+                                    physicalH = virtualH;
+                                    Debug.WriteLine($"MainWindow: DPI scaling detected for '{deviceName}': physical {physicalW}x{physicalH}, logical {dm.dmPelsWidth}x{dm.dmPelsHeight}");
+                                }
+                                else
+                                {
+                                    // No scaling or display settings >= virtual - use display settings as physical
+                                    physicalW = dm.dmPelsWidth;
+                                    physicalH = dm.dmPelsHeight;
+                                }
+                                Debug.WriteLine($"MainWindow: EnumDisplaySettings for '{deviceName}': display mode {dm.dmPelsWidth}x{dm.dmPelsHeight} at ({dm.dmPositionX},{dm.dmPositionY})");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"MainWindow: EnumDisplaySettings failed for {deviceName}: {ex}");
+                    }
+
+                    // Store both virtual (for positioning) and physical (for rendering) dimensions
+                    _monitors.Add(new MonitorInfo(virtualW, virtualH, virtualLeft, virtualTop, physicalW, physicalH));
+
+                    var isPrimaryStr = isPrimary ? " (Primary)" : "";
+                    var monitorItem = new MonitorItem
+                    {
+                        Index = i,
+                        Name = $"Display {i + 1}: {physicalW}x{physicalH}{isPrimaryStr}"
+                    };
+                    _monitorItems.Add(monitorItem);
+
+                    Debug.WriteLine($"MainWindow: Found monitor {i}: {monitorItem.Name} at ({virtualLeft}, {virtualTop}), physical: {physicalW}x{physicalH}");
                 }
 
                 // Populate PART_MeshMonitorCombo (for mesh layers)
@@ -1662,55 +1739,45 @@ namespace ProjectionMapper
                 var selectedItem = e.NewValue;
                 Debug.WriteLine($"MainWindow: TreeView selection changed to: {selectedItem?.GetType().Name}");
 
-                // Clear current selections first
-                _vm.SelectedMeshLayer = null;
-                _vm.SelectedImportedVideo = null;
-                _vm.SelectedPlaylistGroup = null;
+                // Get current modifier keys for multi-selection
+                var isCtrlPressed = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
+                var isShiftPressed = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
 
-                // Handle different selection types
-                if (selectedItem is PlaylistGroupTreeViewModel groupTree)
+                // Handle mesh layer selection with multi-select support
+                if (selectedItem is LayerViewModel meshVm)
                 {
-                    // Find the corresponding PlaylistGroupViewModel
-                    var groupVm = _vm.PlaylistGroups.FirstOrDefault(g => g.Model.Id == groupTree.Id);
-                    if (groupVm != null)
-                    {
-                        _vm.SelectedPlaylistGroup = groupVm;
-                        Debug.WriteLine($"MainWindow: Selected playlist group: {groupVm.Name}");
-                    }
-                    
-                    // Reset mesh monitor combo when no mesh is selected
-                    PART_MeshMonitorCombo.SelectedIndex = 0;
-                }
-                else if (selectedItem is ImportedVideoTreeViewModel videoTree)
-                {
-                    // Set the selected imported video
-                    var video = videoTree.ImportedVideo;
-                    _vm.SelectedImportedVideo = video;
-                    Debug.WriteLine($"MainWindow: Selected imported video: {video.Name}");
-                    
-                    // Reset mesh monitor combo when no mesh is selected
-                    PART_MeshMonitorCombo.SelectedIndex = 0;
-                }
-                else if (selectedItem is LayerViewModel meshVm)
-                {
-                    // Set both the mesh layer AND its parent video
-                    _vm.SelectedMeshLayer = meshVm;
-                    
                     // Find the parent imported video that contains this mesh
                     var parentVideo = _vm.ImportedVideos.FirstOrDefault(v => v.MeshLayers.Contains(meshVm));
-                    if (parentVideo != null)
+                    
+                    if (isCtrlPressed)
                     {
-                        _vm.SelectedImportedVideo = parentVideo;
-                        Debug.WriteLine($"MainWindow: Selected mesh layer: {meshVm.Name} (parent: {parentVideo.Name})");
+                        // Ctrl+click: toggle this mesh in selection
+                        _vm.ToggleMeshSelection(meshVm);
+                        Debug.WriteLine($"MainWindow: Ctrl+click toggled mesh '{meshVm.Name}' (selection count: {_vm.SelectedMeshLayers.Count})");
+                    }
+                    else if (isShiftPressed && _vm.MeshSelectionAnchor != null && parentVideo != null)
+                    {
+                        // Shift+click: select range from anchor to this mesh
+                        _vm.SelectMeshRange(_vm.MeshSelectionAnchor, meshVm, parentVideo);
+                        Debug.WriteLine($"MainWindow: Shift+click selected range (selection count: {_vm.SelectedMeshLayers.Count})");
                     }
                     else
                     {
-                        Debug.WriteLine($"MainWindow: Selected mesh layer: {meshVm.Name} (no parent found)");
+                        // Normal click: single selection, also set anchor for future Shift+clicks
+                        _vm.SetSingleMeshSelection(meshVm);
+                        _vm.MeshSelectionAnchor = meshVm;
+                        Debug.WriteLine($"MainWindow: Selected mesh layer: {meshVm.Name} (parent: {parentVideo?.Name ?? "unknown"})");
                     }
+                    
+                    // Set parent video
+                    if (parentVideo != null)
+                    {
+                        _vm.SelectedImportedVideo = parentVideo;
+                    }
+                    _vm.SelectedPlaylistGroup = null;
                     
                     // Sync PART_MeshMonitorCombo with the mesh layer's target monitor
                     var targetMonitor = meshVm.Model?.TargetMonitorIndex ?? -1;
-                    // SelectedIndex 0 = "(None)", so targetMonitor -1 maps to index 0, targetMonitor 0 maps to index 1, etc.
                     var comboIndex = targetMonitor + 1;
                     if (comboIndex >= 0 && comboIndex < PART_MeshMonitorCombo.Items.Count)
                     {
@@ -1723,8 +1790,41 @@ namespace ProjectionMapper
                 }
                 else
                 {
-                    // Nothing selected - reset combo
-                    PART_MeshMonitorCombo.SelectedIndex = 0;
+                    // Not a mesh layer - clear multi-selection and handle normally
+                    _vm.ClearMeshSelection();
+                    _vm.MeshSelectionAnchor = null;
+                    _vm.SelectedMeshLayer = null;
+                    _vm.SelectedImportedVideo = null;
+                    _vm.SelectedPlaylistGroup = null;
+
+                    if (selectedItem is PlaylistGroupTreeViewModel groupTree)
+                    {
+                        // Find the corresponding PlaylistGroupViewModel
+                        var groupVm = _vm.PlaylistGroups.FirstOrDefault(g => g.Model.Id == groupTree.Id);
+                        if (groupVm != null)
+                        {
+                            _vm.SelectedPlaylistGroup = groupVm;
+                            Debug.WriteLine($"MainWindow: Selected playlist group: {groupVm.Name}");
+                        }
+                        
+                        // Reset mesh monitor combo when no mesh is selected
+                        PART_MeshMonitorCombo.SelectedIndex = 0;
+                    }
+                    else if (selectedItem is ImportedVideoTreeViewModel videoTree)
+                    {
+                        // Set the selected imported video
+                        var video = videoTree.ImportedVideo;
+                        _vm.SelectedImportedVideo = video;
+                        Debug.WriteLine($"MainWindow: Selected imported video: {video.Name}");
+                        
+                        // Reset mesh monitor combo when no mesh is selected
+                        PART_MeshMonitorCombo.SelectedIndex = 0;
+                    }
+                    else
+                    {
+                        // Nothing selected - reset combo
+                        PART_MeshMonitorCombo.SelectedIndex = 0;
+                    }
                 }
 
                 // Update command states
@@ -1784,38 +1884,460 @@ namespace ProjectionMapper
 
         private void RenameGroupMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: RenameGroupMenuItem_Click - not implemented"); }
-            catch (Exception ex) { Debug.WriteLine($"RenameGroupMenuItem_Click failed: {ex}"); }
+            try
+            {
+                if (_vm.SelectedPlaylistGroup == null)
+                {
+                    Debug.WriteLine("MainWindow: RenameGroupMenuItem_Click - no group selected");
+                    return;
+                }
+
+                var currentName = _vm.SelectedPlaylistGroup.Name;
+                
+                // Create a simple input dialog using standard WPF dialogs
+                var dialog = new Window
+                {
+                    Title = "Rename Group",
+                    Width = 350,
+                    Height = 150,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Owner = this,
+                    ResizeMode = ResizeMode.NoResize
+                };
+
+                var grid = new Grid();
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.Margin = new Thickness(16);
+
+                var label = new TextBlock { Text = "Enter new group name:", Margin = new Thickness(0, 0, 0, 8) };
+                Grid.SetRow(label, 0);
+                grid.Children.Add(label);
+
+                var textBox = new System.Windows.Controls.TextBox { Text = currentName, Margin = new Thickness(0, 0, 0, 16) };
+                textBox.SelectAll();
+                Grid.SetRow(textBox, 1);
+                grid.Children.Add(textBox);
+
+                var buttonPanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
+                Grid.SetRow(buttonPanel, 2);
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+                var okButton = new System.Windows.Controls.Button { Content = "OK", Width = 75, Margin = new Thickness(0, 0, 8, 0), IsDefault = true };
+                okButton.Click += (s, args) => { dialog.DialogResult = true; dialog.Close(); };
+                buttonPanel.Children.Add(okButton);
+
+                var cancelButton = new System.Windows.Controls.Button { Content = "Cancel", Width = 75, IsCancel = true };
+                cancelButton.Click += (s, args) => { dialog.DialogResult = false; dialog.Close(); };
+                buttonPanel.Children.Add(cancelButton);
+
+                grid.Children.Add(buttonPanel);
+                dialog.Content = grid;
+
+                // Focus the text box when dialog opens
+                dialog.Loaded += (s, args) => { textBox.Focus(); textBox.SelectAll(); };
+
+                if (dialog.ShowDialog() == true && !string.IsNullOrWhiteSpace(textBox.Text))
+                {
+                    var newName = textBox.Text.Trim();
+                    if (newName != currentName)
+                    {
+                        // Update the ViewModel's name (this updates the Model as well)
+                        _vm.SelectedPlaylistGroup.Name = newName;
+                        
+                        // Also update the underlying model directly to ensure sync
+                        _vm.SelectedPlaylistGroup.Model.Name = newName;
+                        
+                        // Find and update the corresponding tree view item
+                        var treeItem = _vm.ProjectTree
+                            .OfType<PlaylistGroupTreeViewModel>()
+                            .FirstOrDefault(g => g.Id == _vm.SelectedPlaylistGroup.Id);
+                        
+                        if (treeItem != null)
+                        {
+                            treeItem.Name = newName;
+                            treeItem.RefreshDisplayText();
+                        }
+                        
+                        _vm.MarkProjectDirty();
+                        Debug.WriteLine($"MainWindow: Renamed group from '{currentName}' to '{newName}'");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RenameGroupMenuItem_Click failed: {ex}");
+            }
         }
 
         private void DeleteGroupMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: DeleteGroupMenuItem_Click - not implemented"); }
-            catch (Exception ex) { Debug.WriteLine($"DeleteGroupMenuItem_Click failed: {ex}"); }
+            try
+            {
+                if (_vm?.DeleteGroupCommand != null && _vm.DeleteGroupCommand.CanExecute(null))
+                {
+                    var groupName = _vm.SelectedPlaylistGroup?.Name ?? "(unknown)";
+                    
+                    // Confirm deletion
+                    var result = MessageBox.Show(
+                        $"Are you sure you want to delete the group '{groupName}'?\n\nThis action cannot be undone.",
+                        "Delete Group",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+                    
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        _vm.DeleteGroupCommand.Execute(null);
+                        Debug.WriteLine($"MainWindow: Deleted group '{groupName}'");
+                    }
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: DeleteGroupCommand cannot execute or is null");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"DeleteGroupMenuItem_Click failed: {ex}");
+            }
         }
 
         private void MoveGroupUpMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: MoveGroupUpMenuItem_Click - not implemented"); }
-            catch (Exception ex) { Debug.WriteLine($"MoveGroupUpMenuItem_Click failed: {ex}"); }
+            try
+            {
+                if (_vm?.MoveGroupUpCommand != null && _vm.MoveGroupUpCommand.CanExecute(null))
+                {
+                    _vm.MoveGroupUpCommand.Execute(null);
+                    Debug.WriteLine($"MainWindow: Moved group '{_vm.SelectedPlaylistGroup?.Name}' up");
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: MoveGroupUpCommand cannot execute or is null (group may already be at top)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MoveGroupUpMenuItem_Click failed: {ex}");
+            }
         }
 
         private void MoveGroupDownMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: MoveGroupDownMenuItem_Click - not implemented"); }
-            catch (Exception ex) { Debug.WriteLine($"MoveGroupDownMenuItem_Click failed: {ex}"); }
+            try
+            {
+                if (_vm?.MoveGroupDownCommand != null && _vm.MoveGroupDownCommand.CanExecute(null))
+                {
+                    _vm.MoveGroupDownCommand.Execute(null);
+                    Debug.WriteLine($"MainWindow: Moved group '{_vm.SelectedPlaylistGroup?.Name}' down");
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: MoveGroupDownCommand cannot execute or is null (group may already be at bottom)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MoveGroupDownMenuItem_Click failed: {ex}");
+            }
         }
 
-        private void PlayGroupNowMenuItem_Click(object sender, RoutedEventArgs e)
+        private async void PlayGroupNowMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: PlayGroupNowMenuItem_Click - not implemented"); }
-            catch (Exception ex) { Debug.WriteLine($"PlayGroupNowMenuItem_Click failed: {ex}"); }
+            try
+            {
+                if (_vm.SelectedPlaylistGroup == null)
+                {
+                    Debug.WriteLine("MainWindow: PlayGroupNowMenuItem_Click - no group selected");
+                    return;
+                }
+
+                var groupIndex = _vm.PlaylistGroups.IndexOf(_vm.SelectedPlaylistGroup);
+                if (groupIndex < 0)
+                {
+                    Debug.WriteLine("MainWindow: PlayGroupNowMenuItem_Click - selected group not found in collection");
+                    return;
+                }
+
+                // Make sure playlist mode is enabled
+                if (!_vm.IsPlaylistMode)
+                {
+                    _vm.IsPlaylistMode = true;
+                    UpdateLoopingMode(true);
+                }
+
+                // Load groups into playlist service and start playing
+                var groupModels = _vm.PlaylistGroups.Select(g => g.Model).ToList();
+                await _playlistService.StartPlaylistAsync(groupModels);
+                
+                // Jump to the selected group if not already the first one
+                if (groupIndex > 0)
+                {
+                    await _playlistService.JumpToGroupAsync(groupIndex);
+                }
+                
+                _vm.SetPlaybackState(true);
+
+                Debug.WriteLine($"MainWindow: Started playing group '{_vm.SelectedPlaylistGroup.Name}' (index {groupIndex})");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PlayGroupNowMenuItem_Click failed: {ex}");
+            }
+        }
+
+        private void MeshContextMenu_Opened(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: MeshContextMenu_Opened");
+                
+                if (sender is not ContextMenu contextMenu)
+                {
+                    return;
+                }
+                
+                // Get selection count for updating menu item headers
+                var selectedCount = _vm.SelectedMeshLayers.Count > 0 
+                    ? _vm.SelectedMeshLayers.Count 
+                    : (_vm.SelectedMeshLayer != null ? 1 : 0);
+                
+                // Update headers based on selection count
+                foreach (var item in contextMenu.Items)
+                {
+                    if (item is MenuItem menuItem)
+                    {
+                        var header = menuItem.Header?.ToString() ?? "";
+                        
+                        if (header.StartsWith("Copy Mesh"))
+                        {
+                            menuItem.Header = selectedCount > 1 
+                                ? $"Copy {selectedCount} Meshes" 
+                                : "Copy Mesh";
+                        }
+                        else if (header.StartsWith("Delete Mesh"))
+                        {
+                            menuItem.Header = selectedCount > 1 
+                                ? $"Delete {selectedCount} Mesh Layers" 
+                                : "Delete Mesh Layer";
+                        }
+                    }
+                }
+                
+                Debug.WriteLine($"MainWindow: Mesh context menu opened with {selectedCount} mesh(es) selected");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MeshContextMenu_Opened failed: {ex}");
+            }
         }
 
         private void VideoContextMenu_Opened(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: VideoContextMenu_Opened"); }
-            catch (Exception ex) { Debug.WriteLine($"VideoContextMenu_Opened failed: {ex}"); }
+            try
+            {
+                Debug.WriteLine("MainWindow: VideoContextMenu_Opened");
+                
+                if (sender is not ContextMenu contextMenu)
+                {
+                    return;
+                }
+                
+                // Find the "Add to Group" menu item
+                MenuItem? addToGroupItem = null;
+                MenuItem? removeFromGroupItem = null;
+                
+                foreach (var item in contextMenu.Items)
+                {
+                    if (item is MenuItem menuItem)
+                    {
+                        if (menuItem.Header?.ToString() == "Add to Group")
+                        {
+                            addToGroupItem = menuItem;
+                        }
+                        else if (menuItem.Header?.ToString() == "Remove from Group")
+                        {
+                            removeFromGroupItem = menuItem;
+                        }
+                    }
+                }
+                
+                // Get the selected video from the tree view
+                var selectedVideoTree = PART_ProjectTree.SelectedItem as ImportedVideoTreeViewModel;
+                var selectedVideo = selectedVideoTree?.ImportedVideo ?? _vm.SelectedImportedVideo;
+                
+                // Determine if the video is currently in a group
+                bool isInGroup = false;
+                PlaylistGroupViewModel? currentGroup = null;
+                
+                if (selectedVideo != null)
+                {
+                    foreach (var group in _vm.PlaylistGroups)
+                    {
+                        if (group.Model.SourceIds.Contains(selectedVideo.Id))
+                        {
+                            isInGroup = true;
+                            currentGroup = group;
+                            break;
+                        }
+                    }
+                }
+                
+                // Configure "Remove from Group" visibility
+                if (removeFromGroupItem != null)
+                {
+                    removeFromGroupItem.Visibility = isInGroup ? Visibility.Visible : Visibility.Collapsed;
+                    if (isInGroup && currentGroup != null)
+                    {
+                        removeFromGroupItem.Header = $"Remove from '{currentGroup.Name}'";
+                    }
+                }
+                
+                // Populate "Add to Group" submenu with available groups
+                if (addToGroupItem != null)
+                {
+                    addToGroupItem.Items.Clear();
+                    
+                    if (_vm.PlaylistGroups.Count == 0)
+                    {
+                        var noGroupsItem = new MenuItem { Header = "(No groups available)", IsEnabled = false };
+                        addToGroupItem.Items.Add(noGroupsItem);
+                    }
+                    else
+                    {
+                        foreach (var group in _vm.PlaylistGroups.OrderBy(g => g.Order))
+                        {
+                            // Skip the current group if the video is already in it
+                            bool alreadyInThisGroup = group.Model.SourceIds.Contains(selectedVideo?.Id ?? string.Empty);
+                            
+                            var groupMenuItem = new MenuItem
+                            {
+                                Header = alreadyInThisGroup ? $"{group.Name} (already added)" : group.Name,
+                                Tag = group,
+                                IsEnabled = !alreadyInThisGroup
+                            };
+                            
+                            groupMenuItem.Click += AddVideoToGroupSubmenuItem_Click;
+                            addToGroupItem.Items.Add(groupMenuItem);
+                        }
+                        
+                        // Add separator and "New Group..." option
+                        addToGroupItem.Items.Add(new Separator());
+                        var newGroupItem = new MenuItem { Header = "New Group..." };
+                        newGroupItem.Click += AddVideoToNewGroup_Click;
+                        addToGroupItem.Items.Add(newGroupItem);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"VideoContextMenu_Opened failed: {ex}");
+            }
+        }
+        
+        private void AddVideoToGroupSubmenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is not MenuItem menuItem || menuItem.Tag is not PlaylistGroupViewModel targetGroup)
+                {
+                    Debug.WriteLine("MainWindow: AddVideoToGroupSubmenuItem_Click - invalid sender or tag");
+                    return;
+                }
+                
+                // Get the selected video
+                var selectedVideoTree = PART_ProjectTree.SelectedItem as ImportedVideoTreeViewModel;
+                var selectedVideo = selectedVideoTree?.ImportedVideo ?? _vm.SelectedImportedVideo;
+                
+                if (selectedVideo == null)
+                {
+                    Debug.WriteLine("MainWindow: AddVideoToGroupSubmenuItem_Click - no video selected");
+                    return;
+                }
+                
+                // Remove from any existing group first (video can only be in one group)
+                RemoveVideoFromAllGroups(selectedVideo);
+                
+                // Add to the target group
+                if (!targetGroup.Model.SourceIds.Contains(selectedVideo.Id))
+                {
+                    targetGroup.Model.SourceIds.Add(selectedVideo.Id);
+                    targetGroup.Videos.Add(selectedVideo);
+                    targetGroup.RefreshVideoCount();
+                }
+                
+                _vm.MarkProjectDirty();
+                _vm.RefreshProjectTree();
+                Debug.WriteLine($"MainWindow: Added video '{selectedVideo.Name}' to group '{targetGroup.Name}'");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"AddVideoToGroupSubmenuItem_Click failed: {ex}");
+            }
+        }
+        
+        private void AddVideoToNewGroup_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // Get the selected video
+                var selectedVideoTree = PART_ProjectTree.SelectedItem as ImportedVideoTreeViewModel;
+                var selectedVideo = selectedVideoTree?.ImportedVideo ?? _vm.SelectedImportedVideo;
+                
+                if (selectedVideo == null)
+                {
+                    Debug.WriteLine("MainWindow: AddVideoToNewGroup_Click - no video selected");
+                    return;
+                }
+                
+                // Remove from any existing group first (video can only be in one group)
+                RemoveVideoFromAllGroups(selectedVideo);
+                
+                // Create a new group
+                if (_vm.CreateGroupCommand.CanExecute(null))
+                {
+                    _vm.CreateGroupCommand.Execute(null);
+                }
+                
+                // Add the video to the newly created group (should be the selected one now)
+                if (_vm.SelectedPlaylistGroup != null)
+                {
+                    if (!_vm.SelectedPlaylistGroup.Model.SourceIds.Contains(selectedVideo.Id))
+                    {
+                        _vm.SelectedPlaylistGroup.Model.SourceIds.Add(selectedVideo.Id);
+                        _vm.SelectedPlaylistGroup.Videos.Add(selectedVideo);
+                        _vm.SelectedPlaylistGroup.RefreshVideoCount();
+                    }
+                    
+                    _vm.MarkProjectDirty();
+                    _vm.RefreshProjectTree();
+                    Debug.WriteLine($"MainWindow: Created new group '{_vm.SelectedPlaylistGroup.Name}' and added video '{selectedVideo.Name}'");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"AddVideoToNewGroup_Click failed: {ex}");
+            }
+        }
+        
+        /// <summary>
+        /// Helper method to remove a video from all playlist groups.
+        /// Videos can only be in one group at a time.
+        /// </summary>
+        private void RemoveVideoFromAllGroups(ImportedVideoViewModel video)
+        {
+            if (video == null) return;
+            
+            foreach (var group in _vm.PlaylistGroups)
+            {
+                if (group.Model.SourceIds.Contains(video.Id))
+                {
+                    group.Model.SourceIds.Remove(video.Id);
+                    group.Videos.Remove(video);
+                    group.RefreshVideoCount();
+                    Debug.WriteLine($"MainWindow: Removed video '{video.Name}' from group '{group.Name}'");
+                }
+            }
         }
 
         private void DeleteSourceMenuItem_Click(object sender, RoutedEventArgs e)
@@ -1833,47 +2355,146 @@ namespace ProjectionMapper
             try 
             { 
                 Debug.WriteLine("MainWindow: RemoveVideoFromGroupMenuItem_Click");
-                // Get the selected video and remove it from its current group
-                if (_vm.SelectedImportedVideo != null)
+                
+                // Get the selected video from the tree view (more reliable than _vm.SelectedImportedVideo)
+                var selectedVideoTree = PART_ProjectTree.SelectedItem as ImportedVideoTreeViewModel;
+                var video = selectedVideoTree?.ImportedVideo ?? _vm.SelectedImportedVideo;
+                
+                if (video == null)
                 {
-                    var video = _vm.SelectedImportedVideo;
-                    
-                    // Find the parent group and remove the video
-                    foreach (var group in _vm.PlaylistGroups)
-                    {
-                        if (group.Videos.Contains(video))
-                        {
-                            group.Videos.Remove(video);
-                            Debug.WriteLine($"MainWindow: Removed '{video.Name}' from group '{group.Name}'");
-                            break;
-                        }
-                    }
+                    Debug.WriteLine("MainWindow: RemoveVideoFromGroupMenuItem_Click - no video selected");
+                    return;
                 }
+                
+                // Remove the video from all groups (should only be in one, but check all to be safe)
+                RemoveVideoFromAllGroups(video);
+                
+                _vm.MarkProjectDirty();
+                _vm.RefreshProjectTree();
+                Debug.WriteLine($"MainWindow: Removed '{video.Name}' from all groups");
             }
             catch (Exception ex) { Debug.WriteLine($"RemoveVideoFromGroupMenuItem_Click failed: {ex}"); }
         }
 
         private void CopyMeshMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: CopyMeshMenuItem_Click - not implemented"); }
+            try 
+            { 
+                var selectedCount = _vm.SelectedMeshLayers.Count > 0 ? _vm.SelectedMeshLayers.Count : (_vm.SelectedMeshLayer != null ? 1 : 0);
+                Debug.WriteLine($"MainWindow: CopyMeshMenuItem_Click ({selectedCount} mesh(es) selected)");
+                if (_vm.CopyMeshCommand?.CanExecute(null) == true)
+                {
+                    _vm.CopyMeshCommand.Execute(null);
+                    Debug.WriteLine($"MainWindow: {selectedCount} mesh(es) copied successfully");
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: CopyMeshCommand cannot execute (no mesh selected?)");
+                }
+            }
             catch (Exception ex) { Debug.WriteLine($"CopyMeshMenuItem_Click failed: {ex}"); }
         }
 
         private void PasteMeshMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: PasteMeshMenuItem_Click - not implemented"); }
+            try 
+            { 
+                Debug.WriteLine("MainWindow: PasteMeshMenuItem_Click");
+                if (_vm.PasteMeshCommand?.CanExecute(null) == true)
+                {
+                    _vm.PasteMeshCommand.Execute(null);
+                    Debug.WriteLine("MainWindow: Mesh(es) pasted successfully");
+                    _vm.MarkProjectDirty();
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: PasteMeshCommand cannot execute (no video selected or no mesh copied?)");
+                }
+            }
             catch (Exception ex) { Debug.WriteLine($"PasteMeshMenuItem_Click failed: {ex}"); }
         }
 
         private void HideSourceOutputMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: HideSourceOutputMenuItem_Click - not implemented"); }
+            try 
+            { 
+                Debug.WriteLine("MainWindow: HideSourceOutputMenuItem_Click");
+                if (_vm.SelectedImportedVideo?.HostLayer != null)
+                {
+                    _vm.SelectedImportedVideo.HostLayer.PreviewOnly = !_vm.SelectedImportedVideo.HostLayer.PreviewOnly;
+                    Debug.WriteLine($"MainWindow: Source output visibility toggled to PreviewOnly={_vm.SelectedImportedVideo.HostLayer.PreviewOnly}");
+                    _vm.MarkProjectDirty();
+                }
+            }
             catch (Exception ex) { Debug.WriteLine($"HideSourceOutputMenuItem_Click failed: {ex}"); }
         }
 
         private void RenameMeshMenuItem_Click(object sender, RoutedEventArgs e)
         {
-            try { Debug.WriteLine("MainWindow: RenameMeshMenuItem_Click - not implemented"); }
+            try 
+            { 
+                Debug.WriteLine("MainWindow: RenameMeshMenuItem_Click");
+                if (_vm.SelectedMeshLayer == null)
+                {
+                    Debug.WriteLine("MainWindow: No mesh layer selected");
+                    return;
+                }
+
+                var currentName = _vm.SelectedMeshLayer.Name;
+                
+                // Create a simple input dialog
+                var dialog = new Window
+                {
+                    Title = "Rename Mesh Layer",
+                    Width = 350,
+                    Height = 150,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Owner = this,
+                    ResizeMode = ResizeMode.NoResize
+                };
+
+                var grid = new Grid();
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.Margin = new Thickness(16);
+
+                var label = new TextBlock { Text = "Enter new mesh layer name:", Margin = new Thickness(0, 0, 0, 8) };
+                Grid.SetRow(label, 0);
+                grid.Children.Add(label);
+
+                var textBox = new System.Windows.Controls.TextBox { Text = currentName, Margin = new Thickness(0, 0, 0, 16) };
+                textBox.SelectAll();
+                Grid.SetRow(textBox, 1);
+                grid.Children.Add(textBox);
+
+                var buttonPanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
+                Grid.SetRow(buttonPanel, 2);
+
+                var okButton = new System.Windows.Controls.Button { Content = "OK", Width = 75, Margin = new Thickness(0, 0, 8, 0), IsDefault = true };
+                okButton.Click += (s, args) => { dialog.DialogResult = true; dialog.Close(); };
+                buttonPanel.Children.Add(okButton);
+
+                var cancelButton = new System.Windows.Controls.Button { Content = "Cancel", Width = 75, IsCancel = true };
+                cancelButton.Click += (s, args) => { dialog.DialogResult = false; dialog.Close(); };
+                buttonPanel.Children.Add(cancelButton);
+
+                grid.Children.Add(buttonPanel);
+                dialog.Content = grid;
+
+                dialog.Loaded += (s, args) => { textBox.Focus(); textBox.SelectAll(); };
+
+                if (dialog.ShowDialog() == true && !string.IsNullOrWhiteSpace(textBox.Text))
+                {
+                    var newName = textBox.Text.Trim();
+                    if (newName != currentName)
+                    {
+                        _vm.SelectedMeshLayer.Name = newName;
+                        _vm.MarkProjectDirty();
+                        Debug.WriteLine($"MainWindow: Renamed mesh layer from '{currentName}' to '{newName}'");
+                    }
+                }
+            }
             catch (Exception ex) { Debug.WriteLine($"RenameMeshMenuItem_Click failed: {ex}"); }
         }
 
@@ -1913,15 +2534,18 @@ namespace ProjectionMapper
         {
             try
             {
-                if (_vm.SelectedMeshLayer == null || _vm.SelectedImportedVideo == null) return;
-
-                var meshToDelete = _vm.SelectedMeshLayer;
-                var parentVideo = _vm.SelectedImportedVideo;
-
-                // Remove from collection
-                parentVideo.MeshLayers.Remove(meshToDelete);
-
-                Debug.WriteLine($"MainWindow: Deleted mesh layer '{meshToDelete.Name}'");
+                // Use the ViewModel's delete command which supports multi-selection
+                if (_vm.DeleteMeshCommand?.CanExecute(null) == true)
+                {
+                    var count = _vm.SelectedMeshLayers.Count > 0 
+                        ? _vm.SelectedMeshLayers.Count 
+                        : (_vm.SelectedMeshLayer != null ? 1 : 0);
+                    
+                    _vm.DeleteMeshCommand.Execute(null);
+                    _vm.MarkProjectDirty();
+                    
+                    Debug.WriteLine($"MainWindow: Deleted {count} mesh layer(s)");
+                }
             }
             catch (Exception ex)
             {

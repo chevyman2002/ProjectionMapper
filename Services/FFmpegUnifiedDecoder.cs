@@ -360,37 +360,52 @@ if (_playbackTimer != null)
 
 var psi = new ProcessStartInfo
     {
-  FileName = _ffmpegPath!,
+        FileName = _ffmpegPath!,
         Arguments = videoArgs,
- UseShellExecute = false,
+        UseShellExecute = false,
         RedirectStandardOutput = true,
-                RedirectStandardError = true,
-         CreateNoWindow = true
-   };
+        RedirectStandardError = true,
+        CreateNoWindow = true
+    };
 
     _process = Process.Start(psi);
-            if (_process == null) throw new InvalidOperationException("Failed to start ffmpeg process.");
+    if (_process == null) throw new InvalidOperationException("Failed to start ffmpeg process.");
 
-       // Start separate FFmpeg process for audio (synchronized using -re)
-     var audioTask = StartAudioDecoding(seekPos);
+    // Capture process and cancellation token in local variables to prevent race conditions
+    // when Dispose() is called from another thread during playback
+    var localProcess = _process;
+    var localCts = _cts;
+    if (localCts == null) throw new InvalidOperationException("Cancellation token source is null.");
 
-            // Start stderr reading for FPS detection
-     var stderrTask = Task.Run(() => ReadStderr(_process.StandardError, _cts.Token), _cts.Token);
+    // Verify streams are available before proceeding
+    var stdout = localProcess.StandardOutput?.BaseStream;
+    var stderr = localProcess.StandardError;
+    if (stdout == null)
+    {
+        Debug.WriteLine("FFmpegUnifiedDecoder: StandardOutput.BaseStream is null, cannot read video frames.");
+        throw new InvalidOperationException("FFmpeg process StandardOutput stream is null.");
+    }
 
-            try
-            {
-            // Read video frames from stdout
-     await ReadVideoFrames(_process.StandardOutput.BaseStream!, _cts.Token);
-            }
-     finally
-  {
-     CleanupProcess();
+    // Start separate FFmpeg process for audio (synchronized using -re)
+    var audioTask = StartAudioDecoding(seekPos);
 
-  // Wait for tasks to complete
- try { await audioTask; } catch { }
- try { await stderrTask; } catch { }
-  }
-     }
+    // Start stderr reading for FPS detection
+    var stderrTask = Task.Run(() => ReadStderr(stderr, localCts.Token), localCts.Token);
+
+    try
+    {
+        // Read video frames from stdout
+        await ReadVideoFrames(stdout, localCts.Token);
+    }
+    finally
+    {
+        CleanupProcess();
+
+        // Wait for tasks to complete
+        try { await audioTask; } catch { }
+        try { await stderrTask; } catch { }
+    }
+}
 
    private async Task StartAudioDecoding(TimeSpan seekPosition)
         {
