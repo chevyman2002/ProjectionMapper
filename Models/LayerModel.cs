@@ -79,11 +79,6 @@ namespace ProjectionMapper.Models
         };
 
         /// <summary>
-        /// Rotation in degrees to apply to the source when rendering. Rotation is clockwise around the layer center.
-        /// </summary>
-        public double RotationDegrees { get; set; } = 0.0;
-
-        /// <summary>
         /// When true, decoded frames for this layer are intended only for isolated preview and should not be
         /// submitted to the main renderer for composition (i.e. they should not appear in the output preview).
         /// </summary>

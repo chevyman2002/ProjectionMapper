@@ -75,7 +75,6 @@ namespace ProjectionMapper.Models
         public int Height { get; set; }
         public double Opacity { get; set; } = 1.0;
         public bool Visible { get; set; } = true;
-        public double RotationDegrees { get; set; } = 0.0;
         public int TargetMonitorIndex { get; set; } = -1;
         public bool ShowOverlay { get; set; } = true;
         
