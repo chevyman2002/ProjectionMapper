@@ -226,10 +226,12 @@ namespace ProjectionMapper.Services
 
                 if (currentGroup != null)
                 {
-                    Debug.WriteLine($"PlaylistService.PauseCurrentGroupAsync: Pausing group {currentGroup.Name} ({currentGroup.SourceIds.Count} videos)");
+                    // Filter to only active videos (those with registered decoders)
+                    var activeSourceIds = _videoService.GetActiveLayerIds(currentGroup.SourceIds);
+                    Debug.WriteLine($"PlaylistService.PauseCurrentGroupAsync: Pausing group {currentGroup.Name} ({activeSourceIds.Count} active videos)");
                     
-                    // Pause all videos in the current group
-                    var pauseTasks = currentGroup.SourceIds
+                    // Pause all active videos in the current group
+                    var pauseTasks = activeSourceIds
                         .Where(id => !string.IsNullOrEmpty(id))
                         .Select(id => _videoService.PauseLayerAsync(id));
                     
@@ -267,10 +269,12 @@ namespace ProjectionMapper.Services
 
                 if (currentGroup != null)
                 {
-                    Debug.WriteLine($"PlaylistService.ResumeCurrentGroupAsync: Resuming group {currentGroup.Name} ({currentGroup.SourceIds.Count} videos)");
+                    // Filter to only active videos (those with registered decoders)
+                    var activeSourceIds = _videoService.GetActiveLayerIds(currentGroup.SourceIds);
+                    Debug.WriteLine($"PlaylistService.ResumeCurrentGroupAsync: Resuming group {currentGroup.Name} ({activeSourceIds.Count} active videos)");
                     
-                    // Resume all videos in the current group
-                    var resumeTasks = currentGroup.SourceIds
+                    // Resume all active videos in the current group
+                    var resumeTasks = activeSourceIds
                         .Where(id => !string.IsNullOrEmpty(id))
                         .Select(id => _videoService.ResumeLayerAsync(id));
                     
@@ -518,6 +522,21 @@ namespace ProjectionMapper.Services
 
                 Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Starting group '{currentGroup.Name}' (index {_currentGroupIndex}) with {currentGroup.SourceIds.Count} videos");
 
+                // CRITICAL FIX: Filter source IDs to only include videos that have registered decoders
+                // This prevents tracking completion for videos that were deleted or never loaded
+                var activeSourceIds = _videoService.GetActiveLayerIds(currentGroup.SourceIds);
+                if (activeSourceIds.Count == 0)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: No active videos in group '{currentGroup.Name}', skipping to next group");
+                    await AdvanceToNextGroupAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                if (activeSourceIds.Count < currentGroup.SourceIds.Count)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: WARNING - Only {activeSourceIds.Count} of {currentGroup.SourceIds.Count} videos have registered decoders");
+                }
+
                 // CRITICAL FIX: Stop audio for ALL videos first to prevent simultaneous audio playback
                 try
                 {
@@ -535,11 +554,13 @@ namespace ProjectionMapper.Services
                     Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error stopping all audio: {ex}");
                 }
 
-                // Hide all videos except those in the current group
-                await _videoService.HideAllExceptGroupAsync(currentGroup.SourceIds).ConfigureAwait(false);
+                // Hide all videos except those in the current group (use active IDs only)
+                await _videoService.HideAllExceptGroupAsync(activeSourceIds).ConfigureAwait(false);
 
-                // Initialize completion tracking for all videos in the group
-                foreach (var sourceId in currentGroup.SourceIds)
+                // CRITICAL FIX: Initialize completion tracking ONLY for videos that have decoders
+                // This prevents the group from never completing due to missing/deleted videos
+                _videoCompletionStatus.Clear();
+                foreach (var sourceId in activeSourceIds)
                 {
                     if (!string.IsNullOrEmpty(sourceId))
                     {
@@ -565,8 +586,8 @@ namespace ProjectionMapper.Services
                     Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error disabling looping: {ex}");
                 }
 
-                // Start all videos in the group
-                await _videoService.StartGroupVideosAsync(currentGroup.SourceIds).ConfigureAwait(false);
+                // Start all videos in the group (use active IDs only)
+                await _videoService.StartGroupVideosAsync(activeSourceIds).ConfigureAwait(false);
 
                 // CRITICAL FIX: After starting videos, disable looping again in case new decoders were created
                 try
@@ -584,14 +605,14 @@ namespace ProjectionMapper.Services
                 try
                 {
                     var preferredAudioLayerId = GetPreferredAudioSourceId(currentGroup);
-                    if (!string.IsNullOrEmpty(preferredAudioLayerId))
+                    if (!string.IsNullOrEmpty(preferredAudioLayerId) && activeSourceIds.Contains(preferredAudioLayerId))
                     {
                         Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Enabling audio for preferred layer {preferredAudioLayerId}");
                         _videoService.StartAudioForLayer(preferredAudioLayerId);
                     }
                     else
                     {
-                        Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: No preferred audio layer found for this group (PlayAudio=false for all)");
+                        Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: No preferred audio layer found for this group (PlayAudio=false for all or preferred layer not active)");
                     }
                 }
                 catch (Exception ex)
@@ -600,7 +621,7 @@ namespace ProjectionMapper.Services
                 }
 
                 GroupChanged?.Invoke(_currentGroupIndex);
-                Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Group '{currentGroup.Name}' started successfully");
+                Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Group '{currentGroup.Name}' started with {activeSourceIds.Count} active videos");
             }
             catch (Exception ex)
             {
@@ -698,29 +719,31 @@ namespace ProjectionMapper.Services
                     isPaused = _isPaused;
                     currentGroup = CurrentGroup;
                     
-                    if (currentGroup == null || !currentGroup.SourceIds.Contains(layerId))
+                    // Check if this video is being tracked for completion (only active videos are tracked)
+                    if (!_videoCompletionStatus.ContainsKey(layerId))
                     {
-                        // This video is not in the current group, ignore
-                        Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' not in current group, ignoring");
+                        // This video is not being tracked (either not in current group or has no decoder)
+                        Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' not being tracked for completion, ignoring");
                         return;
                     }
 
                     // Mark this video as completed
                     _videoCompletionStatus[layerId] = true;
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' completed in group '{currentGroup.Name}' ({_videoCompletionStatus.Count(kvp => kvp.Value)} of {currentGroup.SourceIds.Count} completed)");
-
-                    // Check if all videos in the group have completed
-                    var videosInGroup = currentGroup.SourceIds.Where(id => !string.IsNullOrEmpty(id)).ToList();
-                    var completedVideos = videosInGroup.Where(id => _videoCompletionStatus.TryGetValue(id, out var completed) && completed).ToList();
                     
-                    allCompleted = completedVideos.Count == videosInGroup.Count;
+                    // Count only videos that are being tracked (have decoders)
+                    var trackedVideos = _videoCompletionStatus.Keys.ToList();
+                    var completedVideos = trackedVideos.Where(id => _videoCompletionStatus.TryGetValue(id, out var completed) && completed).ToList();
                     
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Group completion status: {completedVideos.Count}/{videosInGroup.Count} videos completed (allCompleted={allCompleted})");
+                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' completed in group '{currentGroup?.Name}' ({completedVideos.Count} of {trackedVideos.Count} tracked videos completed)");
+                    
+                    allCompleted = completedVideos.Count == trackedVideos.Count && trackedVideos.Count > 0;
+                    
+                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Group completion status: {completedVideos.Count}/{trackedVideos.Count} videos completed (allCompleted={allCompleted})");
                 }
 
                 if (allCompleted && !isPaused)
                 {
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: All videos in group '{currentGroup?.Name}' completed, advancing to next group");
+                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: All tracked videos in group '{currentGroup?.Name}' completed, advancing to next group");
                     
                     // Advance to next group asynchronously
                     // Using Task.Run to avoid blocking the caller, with proper error handling

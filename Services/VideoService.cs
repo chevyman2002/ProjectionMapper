@@ -1250,6 +1250,39 @@ namespace ProjectionMapper.Services
         }
 
         /// <summary>
+        /// Checks if a layer has a registered decoder.
+        /// </summary>
+        /// <param name="layerId">The layer ID to check.</param>
+        /// <returns>True if the layer has a decoder, false otherwise.</returns>
+        public bool HasDecoder(string layerId)
+        {
+            if (string.IsNullOrEmpty(layerId)) return false;
+            return _decoders.ContainsKey(layerId);
+        }
+
+        /// <summary>
+        /// Gets the IDs of layers from the provided list that have registered decoders.
+        /// Used to filter playlist group source IDs to only include videos that actually exist.
+        /// </summary>
+        /// <param name="layerIds">The list of layer IDs to filter.</param>
+        /// <returns>A list containing only the layer IDs that have registered decoders.</returns>
+        public System.Collections.Generic.List<string> GetActiveLayerIds(System.Collections.Generic.List<string> layerIds)
+        {
+            if (layerIds == null || layerIds.Count == 0)
+                return new System.Collections.Generic.List<string>();
+
+            var activeIds = new System.Collections.Generic.List<string>();
+            foreach (var id in layerIds)
+            {
+                if (!string.IsNullOrEmpty(id) && _decoders.ContainsKey(id))
+                {
+                    activeIds.Add(id);
+                }
+            }
+            return activeIds;
+        }
+
+        /// <summary>
         /// Tries to get the last frame for a layer.
         /// </summary>
         /// <param name="layerId">The layer ID.</param>
