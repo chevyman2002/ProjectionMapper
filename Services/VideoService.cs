@@ -271,17 +271,7 @@ namespace ProjectionMapper.Services
 
             BitmapSource bmpToSubmit = sourceFrozen;
 
-            try
-            {
-                if (Math.Abs(layer.RotationDegrees) > 1e-6 && sourceFrozen != null)
-                {
-                    bmpToSubmit = RotateBitmap(sourceFrozen, layer.RotationDegrees);
-                }
-            }
-            catch
-            {
-                bmpToSubmit = sourceFrozen;
-            }
+            // Rotation disabled: submit decoded frames without applying any rotation.
 
             try { if (!bmpToSubmit.IsFrozen) try { bmpToSubmit.Freeze(); } catch { } } catch { }
 
@@ -707,25 +697,7 @@ namespace ProjectionMapper.Services
             try { return _meshLayers.Values.ToArray(); } catch { return Array.Empty<LayerModel>(); }
         }
 
-        private static BitmapSource RotateBitmap(BitmapSource src, double degrees)
-        {
-            if (src == null) return src;
-            var deg = degrees % 360.0;
-            if (deg < 0) deg += 360.0;
-            if (Math.Abs(deg) < 1e-6) return src;
-
-            try
-            {
-                var rt = new RotateTransform(deg);
-                var tb = new TransformedBitmap(src, rt);
-                try { tb.Freeze(); } catch { }
-                return tb;
-            }
-            catch
-            {
-                return src;
-            }
-        }
+        // Rotation removed: no helper to rotate bitmaps exists anymore.
 
         public async Task UnregisterLayerAsync(string layerId)
         {

@@ -1483,7 +1483,6 @@ namespace ProjectionMapper
                             Height = mesh.Height,
                             Opacity = mesh.Opacity,
                             Visible = mesh.Visible,
-                            RotationDegrees = mesh.RotationDegrees,
                             // Access TargetMonitorIndex through the Model property
                             TargetMonitorIndex = mesh.Model.TargetMonitorIndex,
                             ShowOverlay = mesh.ShowOverlay
@@ -1606,7 +1605,6 @@ namespace ProjectionMapper
                             Height = meshData.Height,
                             Opacity = meshData.Opacity,
                             Visible = meshData.Visible,
-                            RotationDegrees = meshData.RotationDegrees,
                             TargetMonitorIndex = meshData.TargetMonitorIndex,
                             ShowOverlay = meshData.ShowOverlay
                         };

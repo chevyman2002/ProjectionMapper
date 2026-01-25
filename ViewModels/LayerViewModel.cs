@@ -145,16 +145,7 @@ namespace ProjectionMapper.ViewModels
             RaisePropertyChanged(nameof(OutputMeshPoints));
         }
 
-        public double RotationDegrees
-        {
-            get => _model.RotationDegrees;
-            set
-            {
-                if (Math.Abs(_model.RotationDegrees - value) < 1e-6) return;
-                _model.RotationDegrees = value;
-                RaisePropertyChanged();
-            }
-        }
+        // Rotation support removed: rotation is no longer exposed or applied.
 
         public bool ShowOverlay
         {
