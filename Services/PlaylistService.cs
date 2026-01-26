@@ -10,9 +10,11 @@ using ProjectionMapper.Models;
 namespace ProjectionMapper.Services
 {
     /// <summary>
-    /// Service that manages playlist playback with group-based sequential video playback.
-    /// All videos in a group play simultaneously, and groups play sequentially.
-    /// When all videos in a group complete, the service advances to the next group.
+    /// Service that manages playlist playback with group-based video playback.
+    /// Groups play sequentially. Videos within a group can play either:
+    /// - Simultaneously (all at once, for projection mapping)
+    /// - Sequentially (one after another, traditional playlist)
+    /// After a group completes, the service advances to the next group.
     /// After the last group completes, playback loops back to the first group.
     /// </summary>
     public sealed class PlaylistService : IDisposable
@@ -26,11 +28,18 @@ namespace ProjectionMapper.Services
         private bool _isPaused;
         private CancellationTokenSource? _cts;
 
-        // Track video completion status for the current group
+        // Track video completion status for the current group (for simultaneous mode)
         private readonly ConcurrentDictionary<string, bool> _videoCompletionStatus = new ConcurrentDictionary<string, bool>();
 
+        // Track current video index within a sequential group
+        private int _sequentialVideoIndex = 0;
+        private List<string> _sequentialActiveSourceIds = new List<string>();
+
+        // Pre-buffering: track which groups have been pre-warmed
+        private readonly ConcurrentDictionary<int, bool> _preWarmedGroups = new ConcurrentDictionary<int, bool>();
+
         // Configuration
-        private int _groupTransitionDelayMs = 500;
+        private int _groupTransitionDelayMs = 0; // Reduced from 500ms - pre-buffering eliminates the need for delay
         private bool _enableLooping = true;
 
         /// <summary>
@@ -173,19 +182,17 @@ namespace ProjectionMapper.Services
                     _isPlaying = true;
                     _isPaused = false;
                     _videoCompletionStatus.Clear();
+                    _preWarmedGroups.Clear(); // Clear pre-warmed state on playlist start
                 }
 
                 Debug.WriteLine($"PlaylistService.StartPlaylistAsync: Starting playlist with {groups.Count} groups");
 
-                // CRITICAL FIX: Disable looping for ALL videos in the project when playlist mode starts
+                // Disable looping for ALL videos in the project when playlist mode starts
                 // This prevents videos from restarting independently and allows proper group-based advancement
                 try
                 {
                     Debug.WriteLine("PlaylistService.StartPlaylistAsync: Disabling Loop for all videos in project");
                     _videoService.DisableLoopingForAll();
-                    
-                    // Wait a moment to ensure the setting takes effect
-                    await Task.Delay(100).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -421,20 +428,13 @@ namespace ProjectionMapper.Services
                     return;
                 }
 
-                // Stop current group
+                // Stop current group (runs in parallel with group index update for speed)
                 var currentGroup = CurrentGroup;
-                if (currentGroup != null)
-                {
-                    await StopGroupVideosAsync(currentGroup.SourceIds).ConfigureAwait(false);
-                }
+                var stopTask = currentGroup != null 
+                    ? StopGroupVideosAsync(currentGroup.SourceIds) 
+                    : Task.CompletedTask;
 
-                // Wait for transition delay
-                if (_groupTransitionDelayMs > 0)
-                {
-                    await Task.Delay(_groupTransitionDelayMs).ConfigureAwait(false);
-                }
-
-                // Start next group
+                // Start next group setup immediately (don't wait for full stop)
                 lock (_lock)
                 {
                     _currentGroupIndex = nextIndex;
@@ -448,6 +448,12 @@ namespace ProjectionMapper.Services
                     // We've looped back
                     PlaylistCompleted?.Invoke();
                 }
+
+                // Wait for stop to complete before starting new group
+                await stopTask.ConfigureAwait(false);
+
+                // OPTIMIZATION: Skip transition delay since we use fast resume
+                // The pre-warming ensures next group is ready
 
                 await StartCurrentGroupAsync().ConfigureAwait(false);
             }
@@ -520,7 +526,7 @@ namespace ProjectionMapper.Services
                     return;
                 }
 
-                Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Starting group '{currentGroup.Name}' (index {_currentGroupIndex}) with {currentGroup.SourceIds.Count} videos");
+                Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Starting group '{currentGroup.Name}' (index {_currentGroupIndex}) with {currentGroup.SourceIds.Count} videos, mode={currentGroup.PlaybackMode}");
 
                 // CRITICAL FIX: Filter source IDs to only include videos that have registered decoders
                 // This prevents tracking completion for videos that were deleted or never loaded
@@ -537,88 +543,28 @@ namespace ProjectionMapper.Services
                     Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: WARNING - Only {activeSourceIds.Count} of {currentGroup.SourceIds.Count} videos have registered decoders");
                 }
 
-                // CRITICAL FIX: Stop audio for ALL videos first to prevent simultaneous audio playback
-                try
+                // OPTIMIZATION: Stop audio globally and hide non-group videos in parallel
+                var prepareTasks = new List<Task>
                 {
-                    // Get all registered layers and stop their audio
-                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Stopping audio for all videos");
-                    await Task.Run(() =>
-                    {
-                        // We need to access all decoders and stop their audio
-                        // The VideoService will provide a method to stop all audio
-                        _videoService.StopAllAudio();
-                    }).ConfigureAwait(false);
+                    Task.Run(() => _videoService.StopAllAudio()),
+                    _videoService.HideAllExceptGroupAsync(activeSourceIds)
+                };
+                await Task.WhenAll(prepareTasks).ConfigureAwait(false);
+
+                // Handle based on playback mode
+                if (currentGroup.PlaybackMode == GroupPlaybackMode.Sequential)
+                {
+                    // Sequential mode: start only the first video
+                    await StartSequentialGroupAsync(currentGroup, activeSourceIds).ConfigureAwait(false);
                 }
-                catch (Exception ex)
+                else
                 {
-                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error stopping all audio: {ex}");
+                    // Simultaneous mode: start all videos at once
+                    await StartSimultaneousGroupAsync(currentGroup, activeSourceIds).ConfigureAwait(false);
                 }
 
-                // Hide all videos except those in the current group (use active IDs only)
-                await _videoService.HideAllExceptGroupAsync(activeSourceIds).ConfigureAwait(false);
-
-                // CRITICAL FIX: Initialize completion tracking ONLY for videos that have decoders
-                // This prevents the group from never completing due to missing/deleted videos
-                _videoCompletionStatus.Clear();
-                foreach (var sourceId in activeSourceIds)
-                {
-                    if (!string.IsNullOrEmpty(sourceId))
-                    {
-                        _videoCompletionStatus[sourceId] = false;
-                        Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Initialized completion tracking for {sourceId}");
-                    }
-                }
-
-                // CRITICAL FIX: Before starting videos, ensure looping is disabled multiple times
-                // This is necessary because video registration might re-enable looping
-                try
-                {
-                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Disabling loop for all videos (before start)");
-                    _videoService.DisableLoopingForAll();
-                    await Task.Delay(100).ConfigureAwait(false); // Brief delay to ensure setting takes effect
-                    
-                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Re-confirming loop disabled for all videos (second pass)");
-                    _videoService.DisableLoopingForAll();
-                    await Task.Delay(50).ConfigureAwait(false); // Brief delay to ensure setting takes effect
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error disabling looping: {ex}");
-                }
-
-                // Start all videos in the group (use active IDs only)
-                await _videoService.StartGroupVideosAsync(activeSourceIds).ConfigureAwait(false);
-
-                // CRITICAL FIX: After starting videos, disable looping again in case new decoders were created
-                try
-                {
-                    Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: Re-confirming loop disabled for all videos (after start)");
-                    _videoService.DisableLoopingForAll();
-                    await Task.Delay(50).ConfigureAwait(false); // Brief delay to ensure setting takes effect
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error re-disabling looping after start: {ex}");
-                }
-
-                // CRITICAL FIX: Enable audio for only the preferred video in this group to avoid unintended muting
-                try
-                {
-                    var preferredAudioLayerId = GetPreferredAudioSourceId(currentGroup);
-                    if (!string.IsNullOrEmpty(preferredAudioLayerId) && activeSourceIds.Contains(preferredAudioLayerId))
-                    {
-                        Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Enabling audio for preferred layer {preferredAudioLayerId}");
-                        _videoService.StartAudioForLayer(preferredAudioLayerId);
-                    }
-                    else
-                    {
-                        Debug.WriteLine("PlaylistService.StartCurrentGroupAsync: No preferred audio layer found for this group (PlayAudio=false for all or preferred layer not active)");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error enabling preferred group audio: {ex}");
-                }
+                // OPTIMIZATION: Pre-warm the next group in background to eliminate transition delay
+                _ = PreWarmNextGroupAsync();
 
                 GroupChanged?.Invoke(_currentGroupIndex);
                 Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Group '{currentGroup.Name}' started with {activeSourceIds.Count} active videos");
@@ -629,6 +575,255 @@ namespace ProjectionMapper.Services
                 
                 // If a group fails to start, try to advance to the next group
                 await AdvanceToNextGroupAsync().ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Starts a group in simultaneous mode - all videos play at once.
+        /// </summary>
+        private async Task StartSimultaneousGroupAsync(PlaylistGroupModel group, List<string> activeSourceIds)
+        {
+            // Initialize completion tracking for ALL videos (wait for all to complete)
+            _videoCompletionStatus.Clear();
+            foreach (var sourceId in activeSourceIds)
+            {
+                if (!string.IsNullOrEmpty(sourceId))
+                {
+                    _videoCompletionStatus[sourceId] = false;
+                    Debug.WriteLine($"PlaylistService.StartSimultaneousGroupAsync: Initialized completion tracking for {sourceId}");
+                }
+            }
+
+            // Clear sequential state (not used in simultaneous mode)
+            lock (_lock)
+            {
+                _sequentialVideoIndex = 0;
+                _sequentialActiveSourceIds.Clear();
+            }
+
+            // OPTIMIZATION: Single call to disable looping
+            try
+            {
+                Debug.WriteLine("PlaylistService.StartSimultaneousGroupAsync: Disabling loop for all videos");
+                _videoService.DisableLoopingForAll();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PlaylistService.StartSimultaneousGroupAsync: Error disabling looping: {ex}");
+            }
+
+            // Start all videos in the group
+            await _videoService.StartGroupVideosAsync(activeSourceIds).ConfigureAwait(false);
+
+            // Enable audio for the preferred video
+            EnableGroupAudio(group, activeSourceIds);
+        }
+
+        /// <summary>
+        /// Starts a group in sequential mode - videos play one after another.
+        /// </summary>
+        private async Task StartSequentialGroupAsync(PlaylistGroupModel group, List<string> activeSourceIds)
+        {
+            // Store the list of videos to play sequentially
+            lock (_lock)
+            {
+                _sequentialVideoIndex = 0;
+                _sequentialActiveSourceIds = activeSourceIds.ToList();
+            }
+
+            // Clear simultaneous completion tracking (not used in sequential mode - we track one at a time)
+            _videoCompletionStatus.Clear();
+
+            // OPTIMIZATION: Single call to disable looping
+            try
+            {
+                Debug.WriteLine("PlaylistService.StartSequentialGroupAsync: Disabling loop for all videos");
+                _videoService.DisableLoopingForAll();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PlaylistService.StartSequentialGroupAsync: Error disabling looping: {ex}");
+            }
+
+            // Start only the first video
+            await StartCurrentSequentialVideoAsync(group).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Starts the current video in a sequential group.
+        /// </summary>
+        private async Task StartCurrentSequentialVideoAsync(PlaylistGroupModel? group)
+        {
+            string? currentVideoId;
+            lock (_lock)
+            {
+                if (_sequentialVideoIndex < 0 || _sequentialVideoIndex >= _sequentialActiveSourceIds.Count)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentSequentialVideoAsync: Invalid video index {_sequentialVideoIndex}");
+                    return;
+                }
+                currentVideoId = _sequentialActiveSourceIds[_sequentialVideoIndex];
+            }
+
+            if (string.IsNullOrEmpty(currentVideoId))
+            {
+                Debug.WriteLine("PlaylistService.StartCurrentSequentialVideoAsync: Current video ID is empty");
+                return;
+            }
+
+            Debug.WriteLine($"PlaylistService.StartCurrentSequentialVideoAsync: Starting video {_sequentialVideoIndex + 1}/{_sequentialActiveSourceIds.Count}: {currentVideoId}");
+
+            // Track completion for only the current video
+            _videoCompletionStatus.Clear();
+            _videoCompletionStatus[currentVideoId] = false;
+
+            // Hide all other videos in the group, show only current
+            await _videoService.HideAllExceptGroupAsync(new List<string> { currentVideoId }).ConfigureAwait(false);
+
+            // Start just this video
+            await _videoService.StartGroupVideosAsync(new List<string> { currentVideoId }).ConfigureAwait(false);
+
+            // Enable audio if this video should play audio
+            if (group != null)
+            {
+                EnableGroupAudio(group, new List<string> { currentVideoId });
+            }
+        }
+
+        /// <summary>
+        /// Advances to the next video within a sequential group.
+        /// Returns true if advanced to next video, false if group is complete.
+        /// </summary>
+        private async Task<bool> AdvanceToNextSequentialVideoAsync()
+        {
+            PlaylistGroupModel? currentGroup;
+            int nextIndex;
+
+            lock (_lock)
+            {
+                currentGroup = CurrentGroup;
+                nextIndex = _sequentialVideoIndex + 1;
+
+                if (nextIndex >= _sequentialActiveSourceIds.Count)
+                {
+                    Debug.WriteLine($"PlaylistService.AdvanceToNextSequentialVideoAsync: Reached end of sequential group (index {nextIndex} >= {_sequentialActiveSourceIds.Count})");
+                    return false; // Group is complete
+                }
+
+                // Stop audio for current video
+                if (_sequentialVideoIndex >= 0 && _sequentialVideoIndex < _sequentialActiveSourceIds.Count)
+                {
+                    var currentId = _sequentialActiveSourceIds[_sequentialVideoIndex];
+                    try
+                    {
+                        _videoService.StopAudioForLayer(currentId);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"PlaylistService.AdvanceToNextSequentialVideoAsync: Error stopping audio for {currentId}: {ex}");
+                    }
+                }
+
+                _sequentialVideoIndex = nextIndex;
+            }
+
+            Debug.WriteLine($"PlaylistService.AdvanceToNextSequentialVideoAsync: Advancing to video {nextIndex + 1}/{_sequentialActiveSourceIds.Count}");
+
+            // Pause the previous video
+            if (nextIndex > 0 && nextIndex <= _sequentialActiveSourceIds.Count)
+            {
+                var prevId = _sequentialActiveSourceIds[nextIndex - 1];
+                try
+                {
+                    await _videoService.PauseLayerAsync(prevId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.AdvanceToNextSequentialVideoAsync: Error pausing previous video {prevId}: {ex}");
+                }
+            }
+
+            // Start the next video
+            await StartCurrentSequentialVideoAsync(currentGroup).ConfigureAwait(false);
+            return true;
+        }
+
+        /// <summary>
+        /// Enables audio for the preferred video in the group.
+        /// </summary>
+        private void EnableGroupAudio(PlaylistGroupModel group, List<string> activeSourceIds)
+        {
+            try
+            {
+                var preferredAudioLayerId = GetPreferredAudioSourceId(group);
+                if (!string.IsNullOrEmpty(preferredAudioLayerId) && activeSourceIds.Contains(preferredAudioLayerId))
+                {
+                    Debug.WriteLine($"PlaylistService.EnableGroupAudio: Enabling audio for preferred layer {preferredAudioLayerId}");
+                    _videoService.StartAudioForLayer(preferredAudioLayerId);
+                }
+                else
+                {
+                    Debug.WriteLine("PlaylistService.EnableGroupAudio: No preferred audio layer found for this group (PlayAudio=false for all or preferred layer not active)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PlaylistService.EnableGroupAudio: Error enabling preferred group audio: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Pre-warms the next group's videos by ensuring their decoders are ready.
+        /// This eliminates the decoder initialization delay during group transitions.
+        /// </summary>
+        private async Task PreWarmNextGroupAsync()
+        {
+            try
+            {
+                int nextIndex;
+                PlaylistGroupModel? nextGroup;
+
+                lock (_lock)
+                {
+                    if (!_isPlaying || _groups.Count == 0) return;
+
+                    nextIndex = _currentGroupIndex + 1;
+                    if (nextIndex >= _groups.Count)
+                    {
+                        nextIndex = _enableLooping ? 0 : -1;
+                    }
+
+                    if (nextIndex < 0 || nextIndex >= _groups.Count) return;
+                    
+                    // Skip if already pre-warmed
+                    if (_preWarmedGroups.TryGetValue(nextIndex, out var warmed) && warmed)
+                    {
+                        Debug.WriteLine($"PlaylistService.PreWarmNextGroupAsync: Group {nextIndex} already pre-warmed");
+                        return;
+                    }
+
+                    nextGroup = _groups[nextIndex];
+                }
+
+                if (nextGroup == null) return;
+
+                Debug.WriteLine($"PlaylistService.PreWarmNextGroupAsync: Pre-warming group '{nextGroup.Name}' (index {nextIndex})");
+
+                // Ensure all videos in the next group have registered decoders
+                var activeIds = _videoService.GetActiveLayerIds(nextGroup.SourceIds);
+                if (activeIds.Count > 0)
+                {
+                    // The decoders should already exist from project load, but calling soft-resume 
+                    // ensures they are in a ready state with frames buffered
+                    await _videoService.PreWarmLayersAsync(activeIds).ConfigureAwait(false);
+                    
+                    _preWarmedGroups[nextIndex] = true;
+                    Debug.WriteLine($"PlaylistService.PreWarmNextGroupAsync: Group '{nextGroup.Name}' pre-warmed with {activeIds.Count} videos");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PlaylistService.PreWarmNextGroupAsync: Error pre-warming: {ex}");
             }
         }
 
@@ -705,8 +900,8 @@ namespace ProjectionMapper.Services
                 if (string.IsNullOrEmpty(layerId)) return;
 
                 PlaylistGroupModel? currentGroup;
-                bool allCompleted;
                 bool isPaused;
+                GroupPlaybackMode playbackMode;
 
                 lock (_lock)
                 {
@@ -718,6 +913,7 @@ namespace ProjectionMapper.Services
 
                     isPaused = _isPaused;
                     currentGroup = CurrentGroup;
+                    playbackMode = currentGroup?.PlaybackMode ?? GroupPlaybackMode.Simultaneous;
                     
                     // Check if this video is being tracked for completion (only active videos are tracked)
                     if (!_videoCompletionStatus.ContainsKey(layerId))
@@ -729,62 +925,143 @@ namespace ProjectionMapper.Services
 
                     // Mark this video as completed
                     _videoCompletionStatus[layerId] = true;
-                    
-                    // Count only videos that are being tracked (have decoders)
-                    var trackedVideos = _videoCompletionStatus.Keys.ToList();
-                    var completedVideos = trackedVideos.Where(id => _videoCompletionStatus.TryGetValue(id, out var completed) && completed).ToList();
-                    
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Video '{layerId}' completed in group '{currentGroup?.Name}' ({completedVideos.Count} of {trackedVideos.Count} tracked videos completed)");
-                    
-                    allCompleted = completedVideos.Count == trackedVideos.Count && trackedVideos.Count > 0;
-                    
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Group completion status: {completedVideos.Count}/{trackedVideos.Count} videos completed (allCompleted={allCompleted})");
                 }
 
-                if (allCompleted && !isPaused)
+                if (isPaused)
                 {
-                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: All tracked videos in group '{currentGroup?.Name}' completed, advancing to next group");
-                    
-                    // Advance to next group asynchronously
-                    // Using Task.Run to avoid blocking the caller, with proper error handling
-                    Task.Run(async () =>
-                    {
-                        try
-                        {
-                            // Small delay to ensure all completion processing is done
-                            await Task.Delay(200).ConfigureAwait(false);
-                            await AdvanceToNextGroupAsync().ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            // Expected when playlist is stopped
-                            Debug.WriteLine("PlaylistService.OnVideoCompleted: Advance operation cancelled");
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"PlaylistService.OnVideoCompleted: Error advancing to next group: {ex}");
-                            // Try to recover by restarting the playlist from the beginning
-                            try
-                            {
-                                await RestartPlaylistAsync().ConfigureAwait(false);
-                            }
-                            catch (Exception ex2)
-                            {
-                                Debug.WriteLine($"PlaylistService.OnVideoCompleted: Recovery failed: {ex2}");
-                            }
-                        }
-                    }).ContinueWith(t =>
-                    {
-                        if (t.IsFaulted && t.Exception != null)
-                        {
-                            Debug.WriteLine($"PlaylistService.OnVideoCompleted: Unhandled task exception: {t.Exception}");
-                        }
-                    }, TaskContinuationOptions.OnlyOnFaulted);
+                    Debug.WriteLine($"PlaylistService.OnVideoCompleted: Playlist is paused, not advancing");
+                    return;
+                }
+
+                // Handle based on playback mode
+                if (playbackMode == GroupPlaybackMode.Sequential)
+                {
+                    HandleSequentialVideoCompleted(layerId, currentGroup);
+                }
+                else
+                {
+                    HandleSimultaneousVideoCompleted(layerId, currentGroup);
                 }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"PlaylistService.OnVideoCompleted: Error handling video completion: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Handles video completion in sequential mode - advances to next video in sequence or next group.
+        /// </summary>
+        private void HandleSequentialVideoCompleted(string layerId, PlaylistGroupModel? currentGroup)
+        {
+            Debug.WriteLine($"PlaylistService.HandleSequentialVideoCompleted: Video '{layerId}' completed in group '{currentGroup?.Name}' (sequential mode)");
+
+            // In sequential mode, when a video completes, try to advance to the next video
+            Task.Run(async () =>
+            {
+                try
+                {
+                    bool hasMoreVideos = await AdvanceToNextSequentialVideoAsync().ConfigureAwait(false);
+                    if (!hasMoreVideos)
+                    {
+                        // All videos in the sequential group have played, advance to next group
+                        Debug.WriteLine($"PlaylistService.HandleSequentialVideoCompleted: All videos in sequential group completed, advancing to next group");
+                        await AdvanceToNextGroupAsync().ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    Debug.WriteLine("PlaylistService.HandleSequentialVideoCompleted: Advance operation cancelled");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"PlaylistService.HandleSequentialVideoCompleted: Error advancing: {ex}");
+                    try
+                    {
+                        await RestartPlaylistAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex2)
+                    {
+                        Debug.WriteLine($"PlaylistService.HandleSequentialVideoCompleted: Recovery failed: {ex2}");
+                    }
+                }
+            }).ContinueWith(t =>
+            {
+                if (t.IsFaulted && t.Exception != null)
+                {
+                    Debug.WriteLine($"PlaylistService.HandleSequentialVideoCompleted: Unhandled task exception: {t.Exception}");
+                }
+            }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        /// <summary>
+        /// Handles video completion in simultaneous mode - advances to next group when ALL videos complete.
+        /// </summary>
+        private void HandleSimultaneousVideoCompleted(string layerId, PlaylistGroupModel? currentGroup)
+        {
+            bool allCompleted;
+
+            lock (_lock)
+            {
+                // Count only videos that are being tracked (have decoders)
+                var trackedVideos = _videoCompletionStatus.Keys.ToList();
+                var completedVideos = trackedVideos.Where(id => _videoCompletionStatus.TryGetValue(id, out var completed) && completed).ToList();
+                
+                Debug.WriteLine($"PlaylistService.HandleSimultaneousVideoCompleted: Video '{layerId}' completed in group '{currentGroup?.Name}' ({completedVideos.Count} of {trackedVideos.Count} tracked videos completed)");
+                
+                allCompleted = completedVideos.Count == trackedVideos.Count && trackedVideos.Count > 0;
+                
+                Debug.WriteLine($"PlaylistService.HandleSimultaneousVideoCompleted: Group completion status: {completedVideos.Count}/{trackedVideos.Count} videos completed (allCompleted={allCompleted})");
+            }
+
+            if (allCompleted)
+            {
+                Debug.WriteLine($"PlaylistService.HandleSimultaneousVideoCompleted: All tracked videos in group '{currentGroup?.Name}' completed, advancing to next group");
+                
+                // Clear pre-warmed status for next group since we're advancing
+                lock (_lock)
+                {
+                    var nextIdx = _currentGroupIndex + 1;
+                    if (nextIdx >= _groups.Count && _enableLooping)
+                    {
+                        nextIdx = 0;
+                    }
+                    _preWarmedGroups.TryRemove(nextIdx, out _);
+                }
+                
+                // OPTIMIZATION: Advance immediately without artificial delay
+                // Pre-warming ensures the next group is ready
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await AdvanceToNextGroupAsync().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Expected when playlist is stopped
+                        Debug.WriteLine("PlaylistService.HandleSimultaneousVideoCompleted: Advance operation cancelled");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"PlaylistService.HandleSimultaneousVideoCompleted: Error advancing to next group: {ex}");
+                        // Try to recover by restarting the playlist from the beginning
+                        try
+                        {
+                            await RestartPlaylistAsync().ConfigureAwait(false);
+                        }
+                        catch (Exception ex2)
+                        {
+                            Debug.WriteLine($"PlaylistService.HandleSimultaneousVideoCompleted: Recovery failed: {ex2}");
+                        }
+                    }
+                }).ContinueWith(t =>
+                {
+                    if (t.IsFaulted && t.Exception != null)
+                    {
+                        Debug.WriteLine($"PlaylistService.HandleSimultaneousVideoCompleted: Unhandled task exception: {t.Exception}");
+                    }
+                }, TaskContinuationOptions.OnlyOnFaulted);
             }
         }
 

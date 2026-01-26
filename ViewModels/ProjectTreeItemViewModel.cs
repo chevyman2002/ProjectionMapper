@@ -98,10 +98,39 @@ namespace ProjectionMapper.ViewModels
         /// </summary>
         public int VideoCount => Videos.Count;
 
+
         /// <summary>
         /// Display text showing video count.
         /// </summary>
         public string DisplayText => $"{Name} ({VideoCount} video{(VideoCount != 1 ? "s" : "")})";
+
+        /// <summary>
+        /// Gets or sets how videos within this group are played.
+        /// </summary>
+        public GroupPlaybackMode PlaybackMode
+        {
+            get => _model.PlaybackMode;
+            set
+            {
+                if (_model.PlaybackMode != value)
+                {
+                    _model.PlaybackMode = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(IsSequentialMode));
+                    RaisePropertyChanged(nameof(IsSimultaneousMode));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets whether the group is in sequential playback mode.
+        /// </summary>
+        public bool IsSequentialMode => _model.PlaybackMode == GroupPlaybackMode.Sequential;
+
+        /// <summary>
+        /// Gets whether the group is in simultaneous playback mode.
+        /// </summary>
+        public bool IsSimultaneousMode => _model.PlaybackMode == GroupPlaybackMode.Simultaneous;
 
         /// <summary>
         /// Refreshes the display text when video count changes.

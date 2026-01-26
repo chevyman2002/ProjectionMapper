@@ -758,32 +758,33 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
           return 0.0;
   }
 
-   private void CleanupProcess()
-        {
-  try
+    private void CleanupProcess()
     {
-                if (_process != null)
-                {
-       try
-          {
-             if (!_process.HasExited)
-     {
-   // Send SIGTERM first (graceful exit)
-   _process.Kill();
-          _process.WaitForExit(1000);
-             }
-        }
-          catch { }
-
-      _process.Dispose();
-            _process = null;
-     }
-      }
-         catch (Exception ex)
+        try
+        {
+            // Thread-safe capture of the process reference to avoid race conditions
+            var process = Interlocked.Exchange(ref _process, null);
+            if (process != null)
             {
-      Debug.WriteLine($"FFmpegUnifiedDecoder: Process cleanup failed: {ex}");
-      }
- }
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        // Send SIGTERM first (graceful exit)
+                        process.Kill();
+                        process.WaitForExit(1000);
+                    }
+                }
+                catch { }
+
+                process.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"FFmpegUnifiedDecoder: Process cleanup failed: {ex}");
+        }
+    }
 
         public void Dispose()
         {
