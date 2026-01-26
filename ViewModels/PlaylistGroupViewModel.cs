@@ -62,6 +62,34 @@ namespace ProjectionMapper.ViewModels
         }
 
         /// <summary>
+        /// Gets or sets how videos within this group are played.
+        /// Sequential: videos play one after another (traditional playlist).
+        /// Simultaneous: all videos play at once (projection mapping).
+        /// </summary>
+        public GroupPlaybackMode PlaybackMode
+        {
+            get => _model.PlaybackMode;
+            set
+            {
+                if (_model.PlaybackMode == value) return;
+                _model.PlaybackMode = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(IsSequentialMode));
+                RaisePropertyChanged(nameof(IsSimultaneousMode));
+            }
+        }
+
+        /// <summary>
+        /// Gets whether the group is in sequential playback mode.
+        /// </summary>
+        public bool IsSequentialMode => _model.PlaybackMode == GroupPlaybackMode.Sequential;
+
+        /// <summary>
+        /// Gets whether the group is in simultaneous playback mode.
+        /// </summary>
+        public bool IsSimultaneousMode => _model.PlaybackMode == GroupPlaybackMode.Simultaneous;
+
+        /// <summary>
         /// Observable collection of videos in this group for UI binding.
         /// This is populated from the SourceIds in the model.
         /// </summary>

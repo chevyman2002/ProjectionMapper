@@ -147,6 +147,17 @@
                                             <MenuItem Header="Move Up" Click="MoveGroupUpMenuItem_Click" />
                                             <MenuItem Header="Move Down" Click="MoveGroupDownMenuItem_Click" />
                                             <Separator />
+                                            <MenuItem Header="Playback Mode">
+                                                <MenuItem Header="Sequential (One at a Time)" 
+                                                          Click="SequentialModeMenuItem_Click"
+                                                          IsCheckable="True"
+                                                          IsChecked="{Binding IsSequentialMode, Mode=OneWay}" />
+                                                <MenuItem Header="Simultaneous (All at Once)" 
+                                                          Click="SimultaneousModeMenuItem_Click"
+                                                          IsCheckable="True"
+                                                          IsChecked="{Binding IsSimultaneousMode, Mode=OneWay}" />
+                                            </MenuItem>
+                                            <Separator />
                                             <MenuItem Header="Play This Group Now" Click="PlayGroupNowMenuItem_Click" />
                                         </ContextMenu>
                                     </StackPanel.ContextMenu>

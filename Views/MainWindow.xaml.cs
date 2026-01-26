@@ -2084,6 +2084,44 @@ namespace ProjectionMapper
             }
         }
 
+        private void SequentialModeMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (_vm.SelectedPlaylistGroup == null)
+                {
+                    Debug.WriteLine("MainWindow: SequentialModeMenuItem_Click - no group selected");
+                    return;
+                }
+
+                _vm.SelectedPlaylistGroup.PlaybackMode = GroupPlaybackMode.Sequential;
+                Debug.WriteLine($"MainWindow: Set group '{_vm.SelectedPlaylistGroup.Name}' to Sequential playback mode");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"SequentialModeMenuItem_Click failed: {ex}");
+            }
+        }
+
+        private void SimultaneousModeMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (_vm.SelectedPlaylistGroup == null)
+                {
+                    Debug.WriteLine("MainWindow: SimultaneousModeMenuItem_Click - no group selected");
+                    return;
+                }
+
+                _vm.SelectedPlaylistGroup.PlaybackMode = GroupPlaybackMode.Simultaneous;
+                Debug.WriteLine($"MainWindow: Set group '{_vm.SelectedPlaylistGroup.Name}' to Simultaneous playback mode");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"SimultaneousModeMenuItem_Click failed: {ex}");
+            }
+        }
+
         private void MeshContextMenu_Opened(object sender, RoutedEventArgs e)
         {
             try
