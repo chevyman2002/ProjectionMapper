@@ -581,22 +581,47 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
         {
             try
             {
+                // Validate audio format before proceeding
+                if (_audioFormat == null)
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Audio format is null, skipping audio initialization");
+                    return;
+                }
+
                 // Create wave provider with buffer
-                _waveProvider = new BufferedWaveProvider(_audioFormat)
+                var waveProvider = new BufferedWaveProvider(_audioFormat)
                 {
                     BufferDuration = TimeSpan.FromMilliseconds(750),
                     DiscardOnBufferOverflow = true,
                     ReadFully = true
                 };
 
+                if (waveProvider == null)
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create BufferedWaveProvider");
+                    return;
+                }
+
                 // Create wave player
-                _wavePlayer = new WaveOutEvent
+                var wavePlayer = new WaveOutEvent
                 {
                     DesiredLatency = 120,
                     NumberOfBuffers = 3
                 };
 
-                _wavePlayer.Init(_waveProvider);
+                if (wavePlayer == null)
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create WaveOutEvent");
+                    return;
+                }
+
+                // Initialize the wave player with the provider - this can fail if no audio device is available
+                wavePlayer.Init(waveProvider);
+
+                // Only assign to fields after successful initialization
+                _waveProvider = waveProvider;
+                _wavePlayer = wavePlayer;
+
                 UpdateAudioPlayback();
 
                 // CRITICAL: Only start playback if audio is already enabled
@@ -613,7 +638,15 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex}");
+                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex.Message}");
+                // Clean up partially initialized audio components
+                try
+                {
+                    _wavePlayer?.Dispose();
+                }
+                catch { }
+                _wavePlayer = null;
+                _waveProvider = null;
             }
         }
 
@@ -802,7 +835,7 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
          {
           if (_wavePlayer != null)
        {
-  _wavePlayer.Stop();
+            try { _wavePlayer.Stop(); } catch { }
         _wavePlayer.Dispose();
    _wavePlayer = null;
           }
