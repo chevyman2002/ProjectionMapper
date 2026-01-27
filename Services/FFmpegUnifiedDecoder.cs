@@ -32,7 +32,7 @@ namespace ProjectionMapper.Services
         // Video events
         public event Action<BitmapSource>? FrameDecoded;
         public event Action<BitmapSource, TimeSpan>? FrameDecodedWithTimestamp;
-        
+
         /// <summary>
         /// Event raised when the video reaches EOF (end of file).
         /// This event is fired once per playback cycle (before looping, if enabled).
@@ -46,9 +46,9 @@ namespace ProjectionMapper.Services
 
         // Position tracking for pause/resume with loop support
         private TimeSpan _currentPosition = TimeSpan.Zero;
-      private Stopwatch? _playbackTimer;
+        private Stopwatch? _playbackTimer;
         private readonly object _positionLock = new();
-        
+
         // Video duration for loop-aware position tracking
         private TimeSpan _videoDuration = TimeSpan.Zero;
 
@@ -57,8 +57,8 @@ namespace ProjectionMapper.Services
 
         /// <summary>
         /// When true, the decoder will automatically restart when EOF is reached.
-      /// </summary>
-      public bool Loop { get; set; }
+        /// </summary>
+        public bool Loop { get; set; }
 
         /// <summary>
         /// Gets whether the video has reached its end (EOF).
@@ -219,334 +219,334 @@ namespace ProjectionMapper.Services
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
             // CRITICAL: Probe video duration for loop-aware position tracking
-  try
+            try
             {
-     var duration = TryProbeDuration(_inputPath, _ffmpegPath);
-       if (duration > TimeSpan.Zero)
-     {
-    _videoDuration = duration;
-      Debug.WriteLine($"FFmpegUnifiedDecoder: Video duration detected: {duration.TotalSeconds:F2}s");
-           }
-      else
- {
-        Debug.WriteLine("FFmpegUnifiedDecoder: Could not detect video duration - loop position tracking may be inaccurate");
- }
-        }
+                var duration = TryProbeDuration(_inputPath, _ffmpegPath);
+                if (duration > TimeSpan.Zero)
+                {
+                    _videoDuration = duration;
+                    Debug.WriteLine($"FFmpegUnifiedDecoder: Video duration detected: {duration.TotalSeconds:F2}s");
+                }
+                else
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Could not detect video duration - loop position tracking may be inaccurate");
+                }
+            }
             catch (Exception ex)
             {
                 Debug.WriteLine($"FFmpegUnifiedDecoder: Duration probe failed: {ex}");
             }
 
             // Try to probe framerate up-front
-      try
+            try
             {
-          var fps = TryProbeFps(_inputPath, _ffmpegPath);
-  if (fps > 0) Interlocked.Exchange(ref _capturedFps, fps);
-          }
-          catch { }
+                var fps = TryProbeFps(_inputPath, _ffmpegPath);
+                if (fps > 0) Interlocked.Exchange(ref _capturedFps, fps);
+            }
+            catch { }
 
-         // Initialize audio components
-         InitializeAudio();
+            // Initialize audio components
+            InitializeAudio();
 
             // Start playback timer
-     lock (_positionLock)
+            lock (_positionLock)
             {
- _playbackTimer = Stopwatch.StartNew();
-         }
+                _playbackTimer = Stopwatch.StartNew();
+            }
 
-       try
+            try
             {
-       do
-   {
-       if (_cts.IsCancellationRequested) break;
+                do
+                {
+                    if (_cts.IsCancellationRequested) break;
 
-        // Reset the IsAtEnd flag when starting a new session
-        _isAtEnd = false;
+                    // Reset the IsAtEnd flag when starting a new session
+                    _isAtEnd = false;
 
-        await StartSingleDecodingSession();
+                    await StartSingleDecodingSession();
 
-        // Mark video as completed when the session ends (EOF reached)
-        _isAtEnd = true;
-        Debug.WriteLine("FFmpegUnifiedDecoder: Video reached end of file");
+                    // Mark video as completed when the session ends (EOF reached)
+                    _isAtEnd = true;
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Video reached end of file");
 
-        // Fire the VideoEnded event to notify listeners
-        try
-        {
-            VideoEnded?.Invoke();
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"FFmpegUnifiedDecoder: Error invoking VideoEnded event: {ex}");
-        }
+                    // Fire the VideoEnded event to notify listeners
+                    try
+                    {
+                        VideoEnded?.Invoke();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"FFmpegUnifiedDecoder: Error invoking VideoEnded event: {ex}");
+                    }
 
-   // If not looping, exit
-     if (!Loop) break;
+                    // If not looping, exit
+                    if (!Loop) break;
 
-   // CRITICAL: Reset position to 0 for next loop iteration
-       lock (_positionLock)
-       {
-         _currentPosition = TimeSpan.Zero;
-           if (_playbackTimer != null)
-           {
-           _playbackTimer.Restart();
-          }
-  Debug.WriteLine("FFmpegUnifiedDecoder: Loop iteration complete, position reset to 0");
-       }
+                    // CRITICAL: Reset position to 0 for next loop iteration
+                    lock (_positionLock)
+                    {
+                        _currentPosition = TimeSpan.Zero;
+                        if (_playbackTimer != null)
+                        {
+                            _playbackTimer.Restart();
+                        }
+                        Debug.WriteLine("FFmpegUnifiedDecoder: Loop iteration complete, position reset to 0");
+                    }
 
-   // Small delay before restarting
-     await Task.Delay(100, _cts.Token).ConfigureAwait(false);
+                    // Small delay before restarting
+                    await Task.Delay(100, _cts.Token).ConfigureAwait(false);
 
-          } while (!_cts.Token.IsCancellationRequested);
- }
-     finally
-      {
-         // Save position before cleanup
-        lock (_positionLock)
-    {
-if (_playbackTimer != null)
-         {
-              _currentPosition += _playbackTimer.Elapsed;
-            _playbackTimer.Stop();
-              _playbackTimer = null;
-      }
-    }
+                } while (!_cts.Token.IsCancellationRequested);
+            }
+            finally
+            {
+                // Save position before cleanup
+                lock (_positionLock)
+                {
+                    if (_playbackTimer != null)
+                    {
+                        _currentPosition += _playbackTimer.Elapsed;
+                        _playbackTimer.Stop();
+                        _playbackTimer = null;
+                    }
+                }
 
-           CleanupProcess();
+                CleanupProcess();
             }
         }
 
-    private async Task StartSingleDecodingSession()
+        private async Task StartSingleDecodingSession()
         {
-         // Get current seek position
+            // Get current seek position
             TimeSpan seekPos;
             lock (_positionLock)
             {
-       seekPos = _currentPosition;
-           
-       // CRITICAL: Clamp seek position to video duration to prevent seeking past end
-             if (_videoDuration > TimeSpan.Zero && seekPos >= _videoDuration)
-       {
-           seekPos = TimeSpan.Zero;
-               _currentPosition = TimeSpan.Zero;
-   if (_playbackTimer != null)
-   {
- _playbackTimer.Restart();
-     }
-              Debug.WriteLine("FFmpegUnifiedDecoder: Seek position clamped to 0 (was >= duration)");
-            }
+                seekPos = _currentPosition;
+
+                // CRITICAL: Clamp seek position to video duration to prevent seeking past end
+                if (_videoDuration > TimeSpan.Zero && seekPos >= _videoDuration)
+                {
+                    seekPos = TimeSpan.Zero;
+                    _currentPosition = TimeSpan.Zero;
+                    if (_playbackTimer != null)
+                    {
+                        _playbackTimer.Restart();
+                    }
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Seek position clamped to 0 (was >= duration)");
+                }
             }
 
             // CRITICAL: Clear audio buffer at start of each session to prevent loop artifacts
-    if (_waveProvider != null)
-      {
-  try
-      {
-     _waveProvider.ClearBuffer();
-    Debug.WriteLine("FFmpegUnifiedDecoder.StartSingleDecodingSession: Cleared audio buffer to prevent loop artifacts");
-       }
-      catch (Exception ex)
-       {
-   Debug.WriteLine($"FFmpegUnifiedDecoder.StartSingleDecodingSession: Failed to clear buffer: {ex}");
-      }
-   }
+            if (_waveProvider != null)
+            {
+                try
+                {
+                    _waveProvider.ClearBuffer();
+                    Debug.WriteLine("FFmpegUnifiedDecoder.StartSingleDecodingSession: Cleared audio buffer to prevent loop artifacts");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"FFmpegUnifiedDecoder.StartSingleDecodingSession: Failed to clear buffer: {ex}");
+                }
+            }
 
-        // Use FFmpeg to output video to stdout as raw BGRA frames
-         // Use -re for real-time playback to maintain natural timing
+            // Use FFmpeg to output video to stdout as raw BGRA frames
+            // Use -re for real-time playback to maintain natural timing
             // NOTE: We do NOT use -stream_loop because it breaks position tracking
-  // Instead we handle looping ourselves by restarting the process
+            // Instead we handle looping ourselves by restarting the process
             string seekArg = seekPos.TotalSeconds > 0.1 ? $"-ss {seekPos.TotalSeconds:F3}" : "";
-  var videoArgs = $"-hide_banner -loglevel info {seekArg} -re -i \"{_inputPath}\" " +
-     $"-f rawvideo -pix_fmt bgra -vf scale={_width}:{_height} -an pipe:1";
+            var videoArgs = $"-hide_banner -loglevel info {seekArg} -re -i \"{_inputPath}\" " +
+               $"-f rawvideo -pix_fmt bgra -vf scale={_width}:{_height} -an pipe:1";
 
-var psi = new ProcessStartInfo
-    {
-        FileName = _ffmpegPath!,
-        Arguments = videoArgs,
-        UseShellExecute = false,
-        RedirectStandardOutput = true,
-        RedirectStandardError = true,
-        CreateNoWindow = true
-    };
+            var psi = new ProcessStartInfo
+            {
+                FileName = _ffmpegPath!,
+                Arguments = videoArgs,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
 
-    _process = Process.Start(psi);
-    if (_process == null) throw new InvalidOperationException("Failed to start ffmpeg process.");
+            _process = Process.Start(psi);
+            if (_process == null) throw new InvalidOperationException("Failed to start ffmpeg process.");
 
-    // Capture process and cancellation token in local variables to prevent race conditions
-    // when Dispose() is called from another thread during playback
-    var localProcess = _process;
-    var localCts = _cts;
-    if (localCts == null) throw new InvalidOperationException("Cancellation token source is null.");
+            // Capture process and cancellation token in local variables to prevent race conditions
+            // when Dispose() is called from another thread during playback
+            var localProcess = _process;
+            var localCts = _cts;
+            if (localCts == null) throw new InvalidOperationException("Cancellation token source is null.");
 
-    // Verify streams are available before proceeding
-    var stdout = localProcess.StandardOutput?.BaseStream;
-    var stderr = localProcess.StandardError;
-    if (stdout == null)
-    {
-        Debug.WriteLine("FFmpegUnifiedDecoder: StandardOutput.BaseStream is null, cannot read video frames.");
-        throw new InvalidOperationException("FFmpeg process StandardOutput stream is null.");
-    }
+            // Verify streams are available before proceeding
+            var stdout = localProcess.StandardOutput?.BaseStream;
+            var stderr = localProcess.StandardError;
+            if (stdout == null)
+            {
+                Debug.WriteLine("FFmpegUnifiedDecoder: StandardOutput.BaseStream is null, cannot read video frames.");
+                throw new InvalidOperationException("FFmpeg process StandardOutput stream is null.");
+            }
 
-    // Start separate FFmpeg process for audio (synchronized using -re)
-    var audioTask = StartAudioDecoding(seekPos);
+            // Start separate FFmpeg process for audio (synchronized using -re)
+            var audioTask = StartAudioDecoding(seekPos);
 
-    // Start stderr reading for FPS detection
-    var stderrTask = Task.Run(() => ReadStderr(stderr, localCts.Token), localCts.Token);
+            // Start stderr reading for FPS detection
+            var stderrTask = Task.Run(() => ReadStderr(stderr, localCts.Token), localCts.Token);
 
-    try
-    {
-        // Read video frames from stdout
-        await ReadVideoFrames(stdout, localCts.Token);
-    }
-    finally
-    {
-        CleanupProcess();
+            try
+            {
+                // Read video frames from stdout
+                await ReadVideoFrames(stdout, localCts.Token);
+            }
+            finally
+            {
+                CleanupProcess();
 
-        // Wait for tasks to complete
-        try { await audioTask; } catch { }
-        try { await stderrTask; } catch { }
-    }
-}
-
-   private async Task StartAudioDecoding(TimeSpan seekPosition)
-        {
-   try
-  {
-        // Create separate FFmpeg process for audio that runs in sync with video
-      // NOTE: We do NOT use -stream_loop here either
-    string seekArg = seekPosition.TotalSeconds > 0.1 ? $"-ss {seekPosition.TotalSeconds:F3}" : "";
-     var audioArgs = $"-hide_banner -loglevel error {seekArg} -re -i \"{_inputPath}\" " +
-                 $"-f s16le -acodec pcm_s16le -ac 2 -ar 44100 -vn pipe:1";
-
-       var audioPsi = new ProcessStartInfo
-    {
-    FileName = _ffmpegPath!,
-  Arguments = audioArgs,
- UseShellExecute = false,
-    RedirectStandardOutput = true,
-   RedirectStandardError = false,
- CreateNoWindow = true
- };
-
-       using var audioProcess = Process.Start(audioPsi);
-       if (audioProcess == null) return;
-
-var buffer = new byte[8192];
-    var audioStream = audioProcess.StandardOutput.BaseStream;
-
-     while (!_cts.Token.IsCancellationRequested && !audioProcess.HasExited)
-        {
-   try
-       {
-   var bytesRead = await audioStream.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
-      
- if (bytesRead > 0 && _waveProvider != null)
-   {
-         try
-    {
-_waveProvider.AddSamples(buffer, 0, bytesRead);
-
-      // CRITICAL: Auto-start playback when buffer has enough data
-            // This runs in the decode loop thread, ensuring perfect timing
-  if (_audioEnabled && _wavePlayer is WaveOutEvent waveOut && 
-     waveOut.PlaybackState != PlaybackState.Playing && 
-   _waveProvider.BufferedBytes > 8192) // Wait for at least ~185ms of audio buffered
-         {
- try
-   {
-       waveOut.Play();
-   Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-started playback (buffer has {_waveProvider.BufferedBytes} bytes)");
-       }
-      catch (Exception ex)
-       {
-         Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-start failed: {ex}");
-       }
-       }
-       }
-   catch (Exception ex)
- {
-  Debug.WriteLine($"FFmpegUnifiedDecoder: Audio buffer add failed: {ex}");
-    }
-           }
-   else if (bytesRead == 0)
-    {
-  // EOF reached - exit cleanly to allow restart
-      Debug.WriteLine("FFmpegUnifiedDecoder.StartAudioDecoding: Audio EOF reached");
-       break;
- }
-  }
-        catch (OperationCanceledException) { break; }
-       catch (Exception ex)
- {
- Debug.WriteLine($"FFmpegUnifiedDecoder: Audio read error: {ex}");
-   await Task.Delay(50, _cts.Token);
- }
-     }
-
-       // Clean up audio process
- try
-       {
-   if (!audioProcess.HasExited)
-{
-       audioProcess.Kill(true);
-       }
-      }
- catch { }
-    }
-  catch (Exception ex)
-  {
-        Debug.WriteLine($"FFmpegUnifiedDecoder: Audio decoding failed: {ex}");
-         }
+                // Wait for tasks to complete
+                try { await audioTask; } catch { }
+                try { await stderrTask; } catch { }
+            }
         }
 
-   private async Task ReadVideoFrames(Stream stdout, CancellationToken cancellationToken)
+        private async Task StartAudioDecoding(TimeSpan seekPosition)
+        {
+            try
+            {
+                // Create separate FFmpeg process for audio that runs in sync with video
+                // NOTE: We do NOT use -stream_loop here either
+                string seekArg = seekPosition.TotalSeconds > 0.1 ? $"-ss {seekPosition.TotalSeconds:F3}" : "";
+                var audioArgs = $"-hide_banner -loglevel error {seekArg} -re -i \"{_inputPath}\" " +
+                            $"-f s16le -acodec pcm_s16le -ac 2 -ar 44100 -vn pipe:1";
+
+                var audioPsi = new ProcessStartInfo
+                {
+                    FileName = _ffmpegPath!,
+                    Arguments = audioArgs,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = false,
+                    CreateNoWindow = true
+                };
+
+                using var audioProcess = Process.Start(audioPsi);
+                if (audioProcess == null) return;
+
+                var buffer = new byte[8192];
+                var audioStream = audioProcess.StandardOutput.BaseStream;
+
+                while (!_cts.Token.IsCancellationRequested && !audioProcess.HasExited)
+                {
+                    try
+                    {
+                        var bytesRead = await audioStream.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
+
+                        if (bytesRead > 0 && _waveProvider != null)
+                        {
+                            try
+                            {
+                                _waveProvider.AddSamples(buffer, 0, bytesRead);
+
+                                // CRITICAL: Auto-start playback when buffer has enough data
+                                // This runs in the decode loop thread, ensuring perfect timing
+                                if (_audioEnabled && _wavePlayer is WaveOutEvent waveOut &&
+                                   waveOut.PlaybackState != PlaybackState.Playing &&
+                                 _waveProvider.BufferedBytes > 8192) // Wait for at least ~185ms of audio buffered
+                                {
+                                    try
+                                    {
+                                        waveOut.Play();
+                                        Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-started playback (buffer has {_waveProvider.BufferedBytes} bytes)");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-start failed: {ex}");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio buffer add failed: {ex}");
+                            }
+                        }
+                        else if (bytesRead == 0)
+                        {
+                            // EOF reached - exit cleanly to allow restart
+                            Debug.WriteLine("FFmpegUnifiedDecoder.StartAudioDecoding: Audio EOF reached");
+                            break;
+                        }
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"FFmpegUnifiedDecoder: Audio read error: {ex}");
+                        await Task.Delay(50, _cts.Token);
+                    }
+                }
+
+                // Clean up audio process
+                try
+                {
+                    if (!audioProcess.HasExited)
+                    {
+                        audioProcess.Kill(true);
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio decoding failed: {ex}");
+            }
+        }
+
+        private async Task ReadVideoFrames(Stream stdout, CancellationToken cancellationToken)
         {
             var frameSize = _width * _height * 4;
             var buffer = new byte[frameSize];
-         var sw = Stopwatch.StartNew();
+            var sw = Stopwatch.StartNew();
 
-      try
-      {
-       while (!cancellationToken.IsCancellationRequested)
-      {
-      int read = 0;
-        while (read < frameSize)
-   {
-     var chunk = await stdout.ReadAsync(buffer, read, frameSize - read, cancellationToken).ConfigureAwait(false);
-              if (chunk == 0) 
-    {
-    // EOF reached - return to allow outer loop to restart if Loop is enabled
-     return;
-       }
-       read += chunk;
-  }
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    int read = 0;
+                    while (read < frameSize)
+                    {
+                        var chunk = await stdout.ReadAsync(buffer, read, frameSize - read, cancellationToken).ConfigureAwait(false);
+                        if (chunk == 0)
+                        {
+                            // EOF reached - return to allow outer loop to restart if Loop is enabled
+                            return;
+                        }
+                        read += chunk;
+                    }
 
-  if (read < frameSize) 
-   {
-      // Incomplete frame read - likely at EOF
-       return;
-   }
+                    if (read < frameSize)
+                    {
+                        // Incomplete frame read - likely at EOF
+                        return;
+                    }
 
-    // Create BitmapSource from buffer (BGRA32)
-    var stride = _width * 4;
-          var bmp = BitmapSource.Create(_width, _height, 96, 96, PixelFormats.Bgra32, null, buffer, stride);
-         bmp.Freeze();
+                    // Create BitmapSource from buffer (BGRA32)
+                    var stride = _width * 4;
+                    var bmp = BitmapSource.Create(_width, _height, 96, 96, PixelFormats.Bgra32, null, buffer, stride);
+                    bmp.Freeze();
 
-          // Compute presentation timestamp
-    var pts = sw.Elapsed;
+                    // Compute presentation timestamp
+                    var pts = sw.Elapsed;
 
-    // Deliver frame events
-         FrameDecoded?.Invoke(bmp);
-             FrameDecodedWithTimestamp?.Invoke(bmp, pts);
+                    // Deliver frame events
+                    FrameDecoded?.Invoke(bmp);
+                    FrameDecodedWithTimestamp?.Invoke(bmp, pts);
 
-          // Note: We rely on FFmpeg's -re flag for pacing, so no additional throttling needed
+                    // Note: We rely on FFmpeg's -re flag for pacing, so no additional throttling needed
+                }
             }
-         }
-  catch (OperationCanceledException) { }
-         catch (Exception ex)
-         {
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
                 Debug.WriteLine($"FFmpegUnifiedDecoder: Video reading failed: {ex}");
             }
-  }
+        }
 
         private async Task ReadStderr(StreamReader stderr, CancellationToken cancellationToken)
         {
@@ -581,22 +581,50 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
         {
             try
             {
+                // Validate audio format before proceeding
+                if (_audioFormat == null)
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Audio format is null, skipping audio initialization");
+                    return;
+                }
+
                 // Create wave provider with buffer
                 _waveProvider = new BufferedWaveProvider(_audioFormat)
+                var waveProvider = new BufferedWaveProvider(_audioFormat)
                 {
                     BufferDuration = TimeSpan.FromMilliseconds(750),
                     DiscardOnBufferOverflow = true,
                     ReadFully = true
                 };
 
+                if (waveProvider == null)
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create BufferedWaveProvider");
+                    return;
+                }
+
                 // Create wave player
                 _wavePlayer = new WaveOutEvent
+                var wavePlayer = new WaveOutEvent
                 {
                     DesiredLatency = 120,
                     NumberOfBuffers = 3
                 };
 
                 _wavePlayer.Init(_waveProvider);
+                if (wavePlayer == null)
+                {
+                    Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create WaveOutEvent");
+                    return;
+                }
+
+                // Initialize the wave player with the provider - this can fail if no audio device is available
+                wavePlayer.Init(waveProvider);
+
+                // Only assign to fields after successful initialization
+                _waveProvider = waveProvider;
+                _wavePlayer = wavePlayer;
+
                 UpdateAudioPlayback();
 
                 // CRITICAL: Only start playback if audio is already enabled
@@ -614,6 +642,15 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
             catch (Exception ex)
             {
                 Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex}");
+                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex.Message}");
+                // Clean up partially initialized audio components
+                try
+                {
+                    _wavePlayer?.Dispose();
+                }
+                catch { }
+                _wavePlayer = null;
+                _waveProvider = null;
             }
         }
 
@@ -629,8 +666,8 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
 
                         // CRITICAL FIX: Start playback immediately if we have buffered audio data
                         // Don't wait for the decode loop - this ensures audio starts when enabled
-                        if (waveOut.PlaybackState != PlaybackState.Playing && 
-                            _waveProvider != null && 
+                        if (waveOut.PlaybackState != PlaybackState.Playing &&
+                            _waveProvider != null &&
                             _waveProvider.BufferedBytes > 4096) // Need at least some buffer
                         {
                             try
@@ -680,144 +717,145 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
 
         private static TimeSpan TryProbeDuration(string path, string? ffmpegPath)
         {
-   try
-         {
-    // Use ffprobe to get duration
-       var ffprobe = (ffmpegPath ?? "ffmpeg").Replace("ffmpeg", "ffprobe");
-         var psi = new ProcessStartInfo
-       {
-         FileName = ffprobe,
-                    Arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{path}\"",
-            UseShellExecute = false,
-     RedirectStandardOutput = true,
-   RedirectStandardError = true,
-   CreateNoWindow = true
-        };
-
-      using var proc = Process.Start(psi);
-         if (proc != null)
+            try
+            {
+                // Use ffprobe to get duration
+                var ffprobe = (ffmpegPath ?? "ffmpeg").Replace("ffmpeg", "ffprobe");
+                var psi = new ProcessStartInfo
                 {
-           var output = proc.StandardOutput.ReadToEnd();
-         proc.WaitForExit(1000);
- if (!string.IsNullOrEmpty(output))
-     {
-      var durationStr = output.Trim();
-       if (double.TryParse(durationStr, out var durationSeconds) && durationSeconds > 0)
-           {
-   return TimeSpan.FromSeconds(durationSeconds);
-              }
-           }
-  }
-    }
-         catch { }
+                    FileName = ffprobe,
+                    Arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{path}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
 
-       return TimeSpan.Zero;
-        }
-
-        private static double TryProbeFps(string path, string? ffmpegPath)
-      {
-   try
-          {
-            // Try ffprobe first
-         var ffprobe = (ffmpegPath ?? "ffmpeg").Replace("ffmpeg", "ffprobe");
-              var psi = new ProcessStartInfo
-       {
-        FileName = ffprobe,
-       Arguments = $"-v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 \"{path}\"",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-    RedirectStandardError = true,
-   CreateNoWindow = true
-    };
-
-     using var proc = Process.Start(psi);
-      if (proc != null)
-      {
-       var outp = proc.StandardOutput.ReadToEnd();
-        proc.WaitForExit(1000);
-         if (!string.IsNullOrEmpty(outp))
-        {
-    var txt = outp.Trim();
-   if (txt.Contains('/'))
-           {
-        var parts = txt.Split('/');
-              if (parts.Length == 2 && double.TryParse(parts[0], out var numer) && double.TryParse(parts[1], out var denom) && denom > 0)
-     {
-   return Math.Round(numer / denom, 4);
-              }
-  }
-    else if (double.TryParse(txt, out var fps) && fps > 0)
-        {
-  return Math.Round(fps, 4);
-       }
-  }
- }
+                using var proc = Process.Start(psi);
+                if (proc != null)
+                {
+                    var output = proc.StandardOutput.ReadToEnd();
+                    proc.WaitForExit(1000);
+                    if (!string.IsNullOrEmpty(output))
+                    {
+                        var durationStr = output.Trim();
+                        if (double.TryParse(durationStr, out var durationSeconds) && durationSeconds > 0)
+                        {
+                            return TimeSpan.FromSeconds(durationSeconds);
+                        }
+                    }
+                }
             }
             catch { }
 
-          return 0.0;
-  }
+            return TimeSpan.Zero;
+        }
 
-    private void CleanupProcess()
-    {
-        try
+        private static double TryProbeFps(string path, string? ffmpegPath)
         {
-            // Thread-safe capture of the process reference to avoid race conditions
-            var process = Interlocked.Exchange(ref _process, null);
-            if (process != null)
+            try
             {
-                try
+                // Try ffprobe first
+                var ffprobe = (ffmpegPath ?? "ffmpeg").Replace("ffmpeg", "ffprobe");
+                var psi = new ProcessStartInfo
                 {
-                    if (!process.HasExited)
+                    FileName = ffprobe,
+                    Arguments = $"-v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 \"{path}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var proc = Process.Start(psi);
+                if (proc != null)
+                {
+                    var outp = proc.StandardOutput.ReadToEnd();
+                    proc.WaitForExit(1000);
+                    if (!string.IsNullOrEmpty(outp))
                     {
-                        // Send SIGTERM first (graceful exit)
-                        process.Kill();
-                        process.WaitForExit(1000);
+                        var txt = outp.Trim();
+                        if (txt.Contains('/'))
+                        {
+                            var parts = txt.Split('/');
+                            if (parts.Length == 2 && double.TryParse(parts[0], out var numer) && double.TryParse(parts[1], out var denom) && denom > 0)
+                            {
+                                return Math.Round(numer / denom, 4);
+                            }
+                        }
+                        else if (double.TryParse(txt, out var fps) && fps > 0)
+                        {
+                            return Math.Round(fps, 4);
+                        }
                     }
                 }
-                catch { }
+            }
+            catch { }
 
-                process.Dispose();
+            return 0.0;
+        }
+
+        private void CleanupProcess()
+        {
+            try
+            {
+                // Thread-safe capture of the process reference to avoid race conditions
+                var process = Interlocked.Exchange(ref _process, null);
+                if (process != null)
+                {
+                    try
+                    {
+                        if (!process.HasExited)
+                        {
+                            // Send SIGTERM first (graceful exit)
+                            process.Kill();
+                            process.WaitForExit(1000);
+                        }
+                    }
+                    catch { }
+
+                    process.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"FFmpegUnifiedDecoder: Process cleanup failed: {ex}");
             }
         }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"FFmpegUnifiedDecoder: Process cleanup failed: {ex}");
-        }
-    }
 
         public void Dispose()
         {
-       // Stop any ongoing decoding
+            // Stop any ongoing decoding
             _cts?.Cancel();
 
             // Wait briefly to allow tasks to observe cancellation
-        try { Thread.Sleep(50); } catch { }
+            try { Thread.Sleep(50); } catch { }
 
-  // Final cleanup
- CleanupProcess();
+            // Final cleanup
+            CleanupProcess();
 
-   // Dispose audio components
+            // Dispose audio components
             try
-         {
-          if (_wavePlayer != null)
-       {
-  _wavePlayer.Stop();
-        _wavePlayer.Dispose();
-   _wavePlayer = null;
-          }
-     }
-  catch { }
-
-         try
-       {
-     if (_waveProvider != null)
-     {
- _waveProvider.ClearBuffer();
-       _waveProvider = null;
-       }
+            {
+                if (_wavePlayer != null)
+                {
+                    _wavePlayer.Stop();
+                    try { _wavePlayer.Stop(); } catch { }
+                    _wavePlayer.Dispose();
+                    _wavePlayer = null;
+                }
             }
-   catch { }
+            catch { }
+
+            try
+            {
+                if (_waveProvider != null)
+                {
+                    _waveProvider.ClearBuffer();
+                    _waveProvider = null;
+                }
+            }
+            catch { }
         }
     }
 }
