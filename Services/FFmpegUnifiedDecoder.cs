@@ -28,6 +28,16 @@ namespace ProjectionMapper.Services
         private IWavePlayer? _wavePlayer;
         private BufferedWaveProvider? _waveProvider;
         private readonly WaveFormat _audioFormat = new(44100, 16, 2); // 44.1kHz, 16-bit, stereo
+        private readonly object _audioLock = new(); // Lock for thread-safe audio operations
+
+        // Disposal flag to prevent event invocation after cleanup
+        private volatile bool _disposed = false;
+
+        /// <summary>
+        /// Gets whether this decoder has been disposed.
+        /// External code should check this before accessing any properties to avoid access violations.
+        /// </summary>
+        public bool IsDisposed => _disposed;
 
         // Video events
         public event Action<BitmapSource>? FrameDecoded;
@@ -79,11 +89,16 @@ namespace ProjectionMapper.Services
             get => _audioEnabled;
             set
             {
+                // CRITICAL: Skip if disposed to prevent access violations
+                if (_disposed) return;
                 _audioEnabled = value;
                 // Only call UpdateAudioPlayback if the wave player has been initialized
-                if (_wavePlayer != null)
+                lock (_audioLock)
                 {
-                    UpdateAudioPlayback();
+                    if (_wavePlayer != null && !_disposed)
+                    {
+                        UpdateAudioPlaybackLocked();
+                    }
                 }
             }
         }
@@ -96,11 +111,16 @@ namespace ProjectionMapper.Services
             get => _volume;
             set
             {
+                // CRITICAL: Skip if disposed to prevent access violations
+                if (_disposed) return;
                 _volume = Math.Max(0f, Math.Min(1f, value));
                 // Only call UpdateAudioPlayback if the wave player has been initialized
-                if (_wavePlayer != null)
+                lock (_audioLock)
                 {
-                    UpdateAudioPlayback();
+                    if (_wavePlayer != null && !_disposed)
+                    {
+                        UpdateAudioPlaybackLocked();
+                    }
                 }
             }
         }
@@ -113,11 +133,16 @@ namespace ProjectionMapper.Services
             get => _muted;
             set
             {
+                // CRITICAL: Skip if disposed to prevent access violations
+                if (_disposed) return;
                 _muted = value;
                 // Only call UpdateAudioPlayback if the wave player has been initialized
-                if (_wavePlayer != null)
+                lock (_audioLock)
                 {
-                    UpdateAudioPlayback();
+                    if (_wavePlayer != null && !_disposed)
+                    {
+                        UpdateAudioPlaybackLocked();
+                    }
                 }
             }
         }
@@ -130,13 +155,19 @@ namespace ProjectionMapper.Services
         {
             get
             {
-                try
+                // CRITICAL: Return zero if disposed to prevent access violations
+                if (_disposed) return TimeSpan.Zero;
+                lock (_audioLock)
                 {
-                    return _waveProvider?.BufferedDuration ?? TimeSpan.Zero;
-                }
-                catch
-                {
-                    return TimeSpan.Zero;
+                    try
+                    {
+                        if (_disposed) return TimeSpan.Zero;
+                        return _waveProvider?.BufferedDuration ?? TimeSpan.Zero;
+                    }
+                    catch
+                    {
+                        return TimeSpan.Zero;
+                    }
                 }
             }
         }
@@ -146,13 +177,19 @@ namespace ProjectionMapper.Services
         /// </summary>
         public void ClearAudioBuffer()
         {
-            try
+            // CRITICAL: Skip if disposed to prevent access violations
+            if (_disposed) return;
+            lock (_audioLock)
             {
-                _waveProvider?.ClearBuffer();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"FFmpegUnifiedDecoder.ClearAudioBuffer: Failed to clear buffer: {ex}");
+                try
+                {
+                    if (_disposed) return;
+                    _waveProvider?.ClearBuffer();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"FFmpegUnifiedDecoder.ClearAudioBuffer: Failed to clear buffer: {ex}");
+                }
             }
         }
 
@@ -258,7 +295,7 @@ namespace ProjectionMapper.Services
             {
                 do
                 {
-                    if (_cts.IsCancellationRequested) break;
+                    if (_cts.IsCancellationRequested || _disposed) break;
 
                     // Reset the IsAtEnd flag when starting a new session
                     _isAtEnd = false;
@@ -269,14 +306,17 @@ namespace ProjectionMapper.Services
                     _isAtEnd = true;
                     Debug.WriteLine("FFmpegUnifiedDecoder: Video reached end of file");
 
-                    // Fire the VideoEnded event to notify listeners
-                    try
+                    // Fire the VideoEnded event to notify listeners (but not if disposed)
+                    if (!_disposed)
                     {
-                        VideoEnded?.Invoke();
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"FFmpegUnifiedDecoder: Error invoking VideoEnded event: {ex}");
+                        try
+                        {
+                            VideoEnded?.Invoke();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"FFmpegUnifiedDecoder: Error invoking VideoEnded event: {ex}");
+                        }
                     }
 
                     // If not looping, exit
@@ -323,6 +363,7 @@ namespace ProjectionMapper.Services
             {
                 seekPos = _currentPosition;
 
+
                 // CRITICAL: Clamp seek position to video duration to prevent seeking past end
                 if (_videoDuration > TimeSpan.Zero && seekPos >= _videoDuration)
                 {
@@ -337,16 +378,19 @@ namespace ProjectionMapper.Services
             }
 
             // CRITICAL: Clear audio buffer at start of each session to prevent loop artifacts
-            if (_waveProvider != null)
+            lock (_audioLock)
             {
-                try
+                if (_waveProvider != null)
                 {
-                    _waveProvider.ClearBuffer();
-                    Debug.WriteLine("FFmpegUnifiedDecoder.StartSingleDecodingSession: Cleared audio buffer to prevent loop artifacts");
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"FFmpegUnifiedDecoder.StartSingleDecodingSession: Failed to clear buffer: {ex}");
+                    try
+                    {
+                        _waveProvider.ClearBuffer();
+                        Debug.WriteLine("FFmpegUnifiedDecoder.StartSingleDecodingSession: Cleared audio buffer to prevent loop artifacts");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"FFmpegUnifiedDecoder.StartSingleDecodingSession: Failed to clear buffer: {ex}");
+                    }
                 }
             }
 
@@ -433,38 +477,44 @@ namespace ProjectionMapper.Services
                 var buffer = new byte[8192];
                 var audioStream = audioProcess.StandardOutput.BaseStream;
 
-                while (!_cts.Token.IsCancellationRequested && !audioProcess.HasExited)
+                while (!_cts.Token.IsCancellationRequested && !audioProcess.HasExited && !_disposed)
                 {
                     try
                     {
                         var bytesRead = await audioStream.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
 
-                        if (bytesRead > 0 && _waveProvider != null)
+                        if (bytesRead > 0 && !_disposed)
                         {
-                            try
+                            lock (_audioLock)
                             {
-                                _waveProvider.AddSamples(buffer, 0, bytesRead);
-
-                                // CRITICAL: Auto-start playback when buffer has enough data
-                                // This runs in the decode loop thread, ensuring perfect timing
-                                if (_audioEnabled && _wavePlayer is WaveOutEvent waveOut &&
-                                   waveOut.PlaybackState != PlaybackState.Playing &&
-                                 _waveProvider.BufferedBytes > 8192) // Wait for at least ~185ms of audio buffered
+                                if (_waveProvider != null && !_disposed)
                                 {
                                     try
                                     {
-                                        waveOut.Play();
-                                        Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-started playback (buffer has {_waveProvider.BufferedBytes} bytes)");
+                                        _waveProvider.AddSamples(buffer, 0, bytesRead);
+
+                                        // CRITICAL: Auto-start playback when buffer has enough data
+                                        // This runs in the decode loop thread, ensuring perfect timing
+                                        if (_audioEnabled && _wavePlayer is WaveOutEvent waveOut &&
+                                           waveOut.PlaybackState != PlaybackState.Playing &&
+                                           _waveProvider.BufferedBytes > 8192) // Wait for at least ~185ms of audio buffered
+                                        {
+                                            try
+                                            {
+                                                waveOut.Play();
+                                                Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-started playback (buffer has {_waveProvider.BufferedBytes} bytes)");
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-start failed: {ex}");
+                                            }
+                                        }
                                     }
                                     catch (Exception ex)
                                     {
-                                        Debug.WriteLine($"FFmpegUnifiedDecoder.StartAudioDecoding: Auto-start failed: {ex}");
+                                        Debug.WriteLine($"FFmpegUnifiedDecoder: Audio buffer add failed: {ex}");
                                     }
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio buffer add failed: {ex}");
                             }
                         }
                         else if (bytesRead == 0)
@@ -506,10 +556,10 @@ namespace ProjectionMapper.Services
 
             try
             {
-                while (!cancellationToken.IsCancellationRequested)
+                while (!cancellationToken.IsCancellationRequested && !_disposed)
                 {
                     int read = 0;
-                    while (read < frameSize)
+                    while (read < frameSize && !_disposed)
                     {
                         var chunk = await stdout.ReadAsync(buffer, read, frameSize - read, cancellationToken).ConfigureAwait(false);
                         if (chunk == 0)
@@ -526,6 +576,9 @@ namespace ProjectionMapper.Services
                         return;
                     }
 
+                    // Skip event delivery if disposed
+                    if (_disposed) return;
+
                     // Create BitmapSource from buffer (BGRA32)
                     var stride = _width * 4;
                     var bmp = BitmapSource.Create(_width, _height, 96, 96, PixelFormats.Bgra32, null, buffer, stride);
@@ -534,9 +587,19 @@ namespace ProjectionMapper.Services
                     // Compute presentation timestamp
                     var pts = sw.Elapsed;
 
-                    // Deliver frame events
-                    FrameDecoded?.Invoke(bmp);
-                    FrameDecodedWithTimestamp?.Invoke(bmp, pts);
+                    // Deliver frame events (check disposed again to avoid race condition)
+                    if (!_disposed)
+                    {
+                        try
+                        {
+                            FrameDecoded?.Invoke(bmp);
+                            FrameDecodedWithTimestamp?.Invoke(bmp, pts);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"FFmpegUnifiedDecoder: Error invoking frame events: {ex}");
+                        }
+                    }
 
                     // Note: We rely on FFmpeg's -re flag for pacing, so no additional throttling needed
                 }
@@ -579,82 +642,84 @@ namespace ProjectionMapper.Services
 
         private void InitializeAudio()
         {
-            try
+            lock (_audioLock)
             {
-                // Validate audio format before proceeding
-                if (_audioFormat == null)
-                {
-                    Debug.WriteLine("FFmpegUnifiedDecoder: Audio format is null, skipping audio initialization");
-                    return;
-                }
-
-                // Create wave provider with buffer
-                _waveProvider = new BufferedWaveProvider(_audioFormat)
-                var waveProvider = new BufferedWaveProvider(_audioFormat)
-                {
-                    BufferDuration = TimeSpan.FromMilliseconds(750),
-                    DiscardOnBufferOverflow = true,
-                    ReadFully = true
-                };
-
-                if (waveProvider == null)
-                {
-                    Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create BufferedWaveProvider");
-                    return;
-                }
-
-                // Create wave player
-                _wavePlayer = new WaveOutEvent
-                var wavePlayer = new WaveOutEvent
-                {
-                    DesiredLatency = 120,
-                    NumberOfBuffers = 3
-                };
-
-                _wavePlayer.Init(_waveProvider);
-                if (wavePlayer == null)
-                {
-                    Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create WaveOutEvent");
-                    return;
-                }
-
-                // Initialize the wave player with the provider - this can fail if no audio device is available
-                wavePlayer.Init(waveProvider);
-
-                // Only assign to fields after successful initialization
-                _waveProvider = waveProvider;
-                _wavePlayer = wavePlayer;
-
-                UpdateAudioPlayback();
-
-                // CRITICAL: Only start playback if audio is already enabled
-                // Otherwise, let the decode loop auto-start when buffer has data
-                if (_audioEnabled)
-                {
-                    _wavePlayer.Play();
-                    Debug.WriteLine($"FFmpegUnifiedDecoder: Started playback immediately, AudioEnabled={_audioEnabled}");
-                }
-                else
-                {
-                    Debug.WriteLine($"FFmpegUnifiedDecoder: Playback NOT started (AudioEnabled={_audioEnabled}), will auto-start when enabled");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex}");
-                Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex.Message}");
-                // Clean up partially initialized audio components
                 try
                 {
-                    _wavePlayer?.Dispose();
+                    // Validate audio format before proceeding
+                    if (_audioFormat == null)
+                    {
+                        Debug.WriteLine("FFmpegUnifiedDecoder: Audio format is null, skipping audio initialization");
+                        return;
+                    }
+
+                    // Create wave provider with buffer
+                    var waveProvider = new BufferedWaveProvider(_audioFormat)
+                    {
+                        BufferDuration = TimeSpan.FromMilliseconds(750),
+                        DiscardOnBufferOverflow = true,
+                        ReadFully = true
+                    };
+
+                    if (waveProvider == null)
+                    {
+                        Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create BufferedWaveProvider");
+                        return;
+                    }
+
+                    // Create wave player
+                    var wavePlayer = new WaveOutEvent
+                    {
+                        DesiredLatency = 120,
+                        NumberOfBuffers = 3
+                    };
+
+                    if (wavePlayer == null)
+                    {
+                        Debug.WriteLine("FFmpegUnifiedDecoder: Failed to create WaveOutEvent");
+                        return;
+                    }
+
+                    // Initialize the wave player with the provider - this can fail if no audio device is available
+                    wavePlayer.Init(waveProvider);
+
+                    // Only assign to fields after successful initialization
+                    _waveProvider = waveProvider;
+                    _wavePlayer = wavePlayer;
+
+                    UpdateAudioPlaybackLocked();
+
+                    // CRITICAL: Only start playback if audio is already enabled
+                    // Otherwise, let the decode loop auto-start when buffer has data
+                    if (_audioEnabled)
+                    {
+                        _wavePlayer.Play();
+                        Debug.WriteLine($"FFmpegUnifiedDecoder: Started playback immediately, AudioEnabled={_audioEnabled}");
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"FFmpegUnifiedDecoder: Playback NOT started (AudioEnabled={_audioEnabled}), will auto-start when enabled");
+                    }
                 }
-                catch { }
-                _wavePlayer = null;
-                _waveProvider = null;
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"FFmpegUnifiedDecoder: Audio initialization failed: {ex.Message}");
+                    // Clean up partially initialized audio components
+                    try
+                    {
+                        _wavePlayer?.Dispose();
+                    }
+                    catch { }
+                    _wavePlayer = null;
+                    _waveProvider = null;
+                }
             }
         }
 
-        private void UpdateAudioPlayback()
+        /// <summary>
+        /// Updates audio playback state. Must be called with _audioLock held.
+        /// </summary>
+        private void UpdateAudioPlaybackLocked()
         {
             if (_wavePlayer is WaveOutEvent waveOut)
             {
@@ -823,8 +888,21 @@ namespace ProjectionMapper.Services
             }
         }
 
+        /// <summary>
+        /// Marks this decoder as disposing. Call this BEFORE starting background disposal
+        /// to prevent other threads from accessing the decoder during disposal.
+        /// This is used by fire-and-forget disposal patterns.
+        /// </summary>
+        public void MarkDisposing()
+        {
+            _disposed = true;
+        }
+
         public void Dispose()
         {
+            // Mark as disposed first to prevent event invocation
+            _disposed = true;
+
             // Stop any ongoing decoding
             _cts?.Cancel();
 
@@ -834,28 +912,30 @@ namespace ProjectionMapper.Services
             // Final cleanup
             CleanupProcess();
 
-            // Dispose audio components
-            try
+            // Dispose audio components with proper locking
+            lock (_audioLock)
             {
-                if (_wavePlayer != null)
+                try
                 {
-                    _wavePlayer.Stop();
-                    try { _wavePlayer.Stop(); } catch { }
-                    _wavePlayer.Dispose();
-                    _wavePlayer = null;
+                    if (_wavePlayer != null)
+                    {
+                        try { _wavePlayer.Stop(); } catch { }
+                        try { _wavePlayer.Dispose(); } catch { }
+                        _wavePlayer = null;
+                    }
                 }
-            }
-            catch { }
+                catch { }
 
-            try
-            {
-                if (_waveProvider != null)
+                try
                 {
-                    _waveProvider.ClearBuffer();
-                    _waveProvider = null;
+                    if (_waveProvider != null)
+                    {
+                        try { _waveProvider.ClearBuffer(); } catch { }
+                        _waveProvider = null;
+                    }
                 }
+                catch { }
             }
-            catch { }
         }
     }
 }

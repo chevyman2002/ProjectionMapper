@@ -977,10 +977,10 @@ namespace ProjectionMapper.Services
         /// <param name="layerId">The layer ID to stop audio for.</param>
         public void StopAudioForLayer(string layerId)
         {
-            try
+        try
             {
                 if (string.IsNullOrEmpty(layerId)) return;
-                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
+                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null && !tup.decoder.IsDisposed)
                 {
                     tup.decoder.AudioEnabled = false;
                     Debug.WriteLine($"VideoService: Audio disabled for {layerId}");
@@ -1001,7 +1001,12 @@ namespace ProjectionMapper.Services
             {
                 foreach (var kv in _decoders.ToArray())
                 {
-                    try { if (kv.Value.decoder != null) kv.Value.decoder.AudioEnabled = false; } catch { }
+                    try 
+                    { 
+                        if (kv.Value.decoder != null && !kv.Value.decoder.IsDisposed) 
+                            kv.Value.decoder.AudioEnabled = false; 
+                    } 
+                    catch { }
                 }
                 Debug.WriteLine("VideoService.StopAllAudio: Stopped audio for all decoders");
             }
@@ -1018,7 +1023,12 @@ namespace ProjectionMapper.Services
                 lock (_loopingLock) { _globalLoopingEnabled = false; }
                 foreach (var kv in _decoders.ToArray())
                 {
-                    try { if (kv.Value.decoder != null) kv.Value.decoder.Loop = false; } catch { }
+                    try 
+                    { 
+                        if (kv.Value.decoder != null && !kv.Value.decoder.IsDisposed) 
+                            kv.Value.decoder.Loop = false; 
+                    } 
+                    catch { }
                 }
                 Debug.WriteLine("VideoService.DisableLoopingForAll: Loop disabled for all existing decoders");
             }
@@ -1035,7 +1045,12 @@ namespace ProjectionMapper.Services
                 lock (_loopingLock) { _globalLoopingEnabled = true; }
                 foreach (var kv in _decoders.ToArray())
                 {
-                    try { if (kv.Value.decoder != null) kv.Value.decoder.Loop = true; } catch { }
+                    try 
+                    { 
+                        if (kv.Value.decoder != null && !kv.Value.decoder.IsDisposed) 
+                            kv.Value.decoder.Loop = true; 
+                    } 
+                    catch { }
                 }
                 Debug.WriteLine("VideoService.EnableLoopingForAll: Loop enabled for all existing decoders");
             }
@@ -1257,6 +1272,10 @@ namespace ProjectionMapper.Services
 
                 // Update state immediately without waiting for disposal
                 _decoders[layerId] = (t.decoder, t.cts, t.model, t.lastFrame, true, currentPosition);
+
+                // CRITICAL: Mark the decoder as disposing immediately to prevent access violations
+                // from other threads that might try to access it during the background disposal
+                try { t.decoder?.MarkDisposing(); } catch { }
 
                 // Dispose decoder in background (fire and forget)
                 _ = Task.Run(async () =>
