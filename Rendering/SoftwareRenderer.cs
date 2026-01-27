@@ -335,12 +335,43 @@ namespace ProjectionMapper.Rendering
             if (quad == null || quad.Length < 4) return null;
             try
             {
-                // Convert source to Bgra32 for sampling
-                BitmapSource src32 = src.Format == PixelFormats.Bgra32 ? src : new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+                // Convert source to Bgra32 for sampling - CRITICAL: Ensure it's frozen for thread safety
+                BitmapSource src32;
+                if (src.Format == PixelFormats.Bgra32)
+                {
+                    src32 = src;
+                }
+                else
+                {
+                    var converted = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+                    if (!converted.IsFrozen)
+                    {
+                        try { converted.Freeze(); } catch { }
+                    }
+                    src32 = converted;
+                }
+
+                // Verify the source bitmap is accessible
+                if (!src32.IsFrozen)
+                {
+                    Debug.WriteLine("WarpBitmapToQuad: Source bitmap is not frozen, skipping warp");
+                    return null;
+                }
+
                 int srcW = src32.PixelWidth, srcH = src32.PixelHeight;
+                if (srcW <= 0 || srcH <= 0) return null;
+
                 int srcStride = srcW * 4;
                 var srcPixels = new byte[srcH * srcStride];
-                src32.CopyPixels(srcPixels, srcStride, 0);
+                try
+                {
+                    src32.CopyPixels(srcPixels, srcStride, 0);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"WarpBitmapToQuad: Failed to copy source pixels: {ex}");
+                    return null;
+                }
 
                 // Build homography H that maps (u,v,1) -> (x,y,1), where src (u,v) = (0,0),(1,0),(0,1),(1,1)
                 // dst points are quad[0..3] in same order.
