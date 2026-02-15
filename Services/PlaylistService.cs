@@ -176,7 +176,7 @@ namespace ProjectionMapper.Services
                     _cts?.Cancel();
                     _cts?.Dispose();
                     _cts = new CancellationTokenSource();
-                    
+
                     _groups = groups.OrderBy(g => g.Order).ToList();
                     _currentGroupIndex = 0;
                     _isPlaying = true;
@@ -186,6 +186,9 @@ namespace ProjectionMapper.Services
                 }
 
                 Debug.WriteLine($"PlaylistService.StartPlaylistAsync: Starting playlist with {groups.Count} groups");
+
+                // CRITICAL: Enable playlist mode to block all rendering until we explicitly set active layers
+                _videoService.EnablePlaylistMode();
 
                 // Disable looping for ALL videos in the project when playlist mode starts
                 // This prevents videos from restarting independently and allows proper group-based advancement
@@ -315,6 +318,10 @@ namespace ProjectionMapper.Services
                 }
 
                 Debug.WriteLine("PlaylistService.StopPlaylistAsync: Stopping all playback");
+
+                // Disable playlist mode so all videos can render again
+                _videoService.DisablePlaylistMode();
+
                 await _videoService.StopAllAsync().ConfigureAwait(false);
 
                 // Only re-enable looping when explicitly exiting playlist mode (e.g., switching to legacy mode)
@@ -513,7 +520,7 @@ namespace ProjectionMapper.Services
             {
                 PlaylistGroupModel? currentGroup;
                 CancellationToken ct;
-                
+
                 lock (_lock)
                 {
                     currentGroup = CurrentGroup;
@@ -527,6 +534,14 @@ namespace ProjectionMapper.Services
                 }
 
                 Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Starting group '{currentGroup.Name}' (index {_currentGroupIndex}) with {currentGroup.SourceIds.Count} videos, mode={currentGroup.PlaybackMode}");
+
+                // CRITICAL FIX: Wait for all videos in this group to have their decoders ready
+                // This ensures we don't start the group before all videos can actually play
+                var ready = await _videoService.WaitForDecodersReadyAsync(currentGroup.SourceIds, timeoutMs: 5000).ConfigureAwait(false);
+                if (!ready)
+                {
+                    Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: WARNING - Not all decoders ready for group '{currentGroup.Name}', proceeding with available decoders");
+                }
 
                 // CRITICAL FIX: Filter source IDs to only include videos that have registered decoders
                 // This prevents tracking completion for videos that were deleted or never loaded
@@ -543,13 +558,20 @@ namespace ProjectionMapper.Services
                     Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: WARNING - Only {activeSourceIds.Count} of {currentGroup.SourceIds.Count} videos have registered decoders");
                 }
 
-                // OPTIMIZATION: Stop audio globally and hide non-group videos in parallel
-                var prepareTasks = new List<Task>
-                {
-                    Task.Run(() => _videoService.StopAllAudio()),
-                    _videoService.HideAllExceptGroupAsync(activeSourceIds)
-                };
-                await Task.WhenAll(prepareTasks).ConfigureAwait(false);
+                // CRITICAL: Pause ALL video decoders first to prevent race conditions
+                // This ensures no old frames are still being rendered while we set up the new group
+                // Use PauseAllAsync instead of StopAllAsync to preserve decoder registrations
+                await _videoService.PauseAllAsync().ConfigureAwait(false);
+
+                // Small delay to ensure all decoders have fully stopped
+                await Task.Delay(100).ConfigureAwait(false);
+
+                // Now stop audio (already stopped but be sure)
+                _videoService.StopAllAudio();
+
+                // CRITICAL: Set which layers are allowed to render BEFORE starting videos
+                // This ensures only the current group's videos appear on screen
+                _videoService.SetActiveRenderLayers(activeSourceIds);
 
                 // Handle based on playback mode
                 if (currentGroup.PlaybackMode == GroupPlaybackMode.Sequential)
@@ -572,7 +594,7 @@ namespace ProjectionMapper.Services
             catch (Exception ex)
             {
                 Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: Error starting group: {ex}");
-                
+
                 // If a group fails to start, try to advance to the next group
                 await AdvanceToNextGroupAsync().ConfigureAwait(false);
             }
@@ -615,8 +637,8 @@ namespace ProjectionMapper.Services
             // Start all videos in the group
             await _videoService.StartGroupVideosAsync(activeSourceIds).ConfigureAwait(false);
 
-            // Enable audio for the preferred video
-            EnableGroupAudio(group, activeSourceIds);
+            // Enable audio for the preferred video (with delay to allow decoder initialization)
+            await EnableGroupAudioAsync(group, activeSourceIds).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -683,10 +705,10 @@ namespace ProjectionMapper.Services
             // Start just this video
             await _videoService.StartGroupVideosAsync(new List<string> { currentVideoId }).ConfigureAwait(false);
 
-            // Enable audio if this video should play audio
+            // Enable audio if this video should play audio (with delay to allow decoder initialization)
             if (group != null)
             {
-                EnableGroupAudio(group, new List<string> { currentVideoId });
+                await EnableGroupAudioAsync(group, new List<string> { currentVideoId }).ConfigureAwait(false);
             }
         }
 
@@ -750,25 +772,33 @@ namespace ProjectionMapper.Services
 
         /// <summary>
         /// Enables audio for the preferred video in the group.
+        /// Includes a delay to allow the decoder to fully initialize before enabling audio,
+        /// preventing crashes from accessing uninitialized audio components.
         /// </summary>
-        private void EnableGroupAudio(PlaylistGroupModel group, List<string> activeSourceIds)
+        private async Task EnableGroupAudioAsync(PlaylistGroupModel group, List<string> activeSourceIds)
         {
             try
             {
                 var preferredAudioLayerId = GetPreferredAudioSourceId(group);
                 if (!string.IsNullOrEmpty(preferredAudioLayerId) && activeSourceIds.Contains(preferredAudioLayerId))
                 {
-                    Debug.WriteLine($"PlaylistService.EnableGroupAudio: Enabling audio for preferred layer {preferredAudioLayerId}");
+                    // CRITICAL: Wait for the decoder to initialize its audio components
+                    // before enabling audio. This prevents crashes from accessing
+                    // uninitialized NAudio/WaveOut components.
+                    Debug.WriteLine($"PlaylistService.EnableGroupAudioAsync: Waiting for decoder to initialize before enabling audio for {preferredAudioLayerId}");
+                    await Task.Delay(500).ConfigureAwait(false);
+
+                    Debug.WriteLine($"PlaylistService.EnableGroupAudioAsync: Enabling audio for preferred layer {preferredAudioLayerId}");
                     _videoService.StartAudioForLayer(preferredAudioLayerId);
                 }
                 else
                 {
-                    Debug.WriteLine("PlaylistService.EnableGroupAudio: No preferred audio layer found for this group (PlayAudio=false for all or preferred layer not active)");
+                    Debug.WriteLine("PlaylistService.EnableGroupAudioAsync: No preferred audio layer found for this group (PlayAudio=false for all or preferred layer not active)");
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"PlaylistService.EnableGroupAudio: Error enabling preferred group audio: {ex}");
+                Debug.WriteLine($"PlaylistService.EnableGroupAudioAsync: Error enabling preferred group audio: {ex}");
             }
         }
 

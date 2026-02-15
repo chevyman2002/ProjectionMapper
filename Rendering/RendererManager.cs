@@ -274,12 +274,8 @@ namespace ProjectionMapper.Rendering
         /// </summary>
         public void SetMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints)
         {
-            if (!ShowMeshOverlay)
-            {
-                // If overlays disabled globally, ensure cleared
-                ClearAllOverlays();
-                return;
-            }
+            // NOTE: ShowMeshOverlay is no longer used as a global blocker.
+            // Individual mesh layer visibility is controlled by the layer's Visible property.
 
             try
             {
@@ -307,7 +303,9 @@ namespace ProjectionMapper.Rendering
         /// </summary>
         public void AddMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints, string layerId)
         {
-            if (!ShowMeshOverlay || quadPoints == null || quadPoints.Length < 4) return;
+            // NOTE: ShowMeshOverlay is no longer used as a global blocker.
+            // Individual mesh layer visibility is controlled by the layer's Visible property.
+            if (quadPoints == null || quadPoints.Length < 4) return;
 
             try
             {

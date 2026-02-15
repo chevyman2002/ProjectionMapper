@@ -1002,6 +1002,13 @@ namespace ProjectionMapper.Views
         private void InputHandle_BL_DragDelta(object sender, DragDeltaEventArgs e) => MoveCorner(2, e.HorizontalChange, e.VerticalChange);
         private void InputHandle_BR_DragDelta(object sender, DragDeltaEventArgs e) => MoveCorner(3, e.HorizontalChange, e.VerticalChange);
 
+        /// <summary>
+        /// Moves a corner of the mesh quad. When Shift is held, maintains 90-degree corners
+        /// by moving adjacent corners to keep the quad rectangular.
+        /// </summary>
+        /// <param name="index">Corner index: 0=TL, 1=TR, 2=BL, 3=BR</param>
+        /// <param name="dx">Horizontal change in pixels</param>
+        /// <param name="dy">Vertical change in pixels</param>
         private void MoveCorner(int index, double dx, double dy)
         {
             if (_isDisposed) return;
@@ -1009,7 +1016,43 @@ namespace ProjectionMapper.Views
             _suppressVmRebind = true;
             try
             {
-                _corners[index] = new Point(_corners[index].X + dx, _corners[index].Y + dy);
+                // Check if Shift is held to maintain rectangular shape
+                bool maintainRectangle = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
+
+                if (maintainRectangle)
+                {
+                    // Move the dragged corner and adjust adjacent corners to maintain 90-degree angles
+                    // Corner indices: 0=TL, 1=TR, 2=BL, 3=BR
+                    switch (index)
+                    {
+                        case 0: // TL: move TL, adjust TR (same Y) and BL (same X)
+                            _corners[0] = new Point(_corners[0].X + dx, _corners[0].Y + dy);
+                            _corners[1] = new Point(_corners[1].X, _corners[0].Y);      // TR gets same Y as TL
+                            _corners[2] = new Point(_corners[0].X, _corners[2].Y);      // BL gets same X as TL
+                            break;
+                        case 1: // TR: move TR, adjust TL (same Y) and BR (same X)
+                            _corners[1] = new Point(_corners[1].X + dx, _corners[1].Y + dy);
+                            _corners[0] = new Point(_corners[0].X, _corners[1].Y);      // TL gets same Y as TR
+                            _corners[3] = new Point(_corners[1].X, _corners[3].Y);      // BR gets same X as TR
+                            break;
+                        case 2: // BL: move BL, adjust BR (same Y) and TL (same X)
+                            _corners[2] = new Point(_corners[2].X + dx, _corners[2].Y + dy);
+                            _corners[3] = new Point(_corners[3].X, _corners[2].Y);      // BR gets same Y as BL
+                            _corners[0] = new Point(_corners[2].X, _corners[0].Y);      // TL gets same X as BL
+                            break;
+                        case 3: // BR: move BR, adjust BL (same Y) and TR (same X)
+                            _corners[3] = new Point(_corners[3].X + dx, _corners[3].Y + dy);
+                            _corners[2] = new Point(_corners[2].X, _corners[3].Y);      // BL gets same Y as BR
+                            _corners[1] = new Point(_corners[3].X, _corners[1].Y);      // TR gets same X as BR
+                            break;
+                    }
+                }
+                else
+                {
+                    // Normal behavior: move only the dragged corner (allows non-rectangular quads)
+                    _corners[index] = new Point(_corners[index].X + dx, _corners[index].Y + dy);
+                }
+
                 ApplyLayout();
                 WriteBackMeshPoints();
             }

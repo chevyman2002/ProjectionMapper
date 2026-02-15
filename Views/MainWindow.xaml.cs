@@ -259,7 +259,9 @@ namespace ProjectionMapper
 
         /// <summary>
         /// Handles the global mesh overlay visibility toggle.
-        /// When unchecked, hides all mesh overlays on all outputs.
+        /// When checked, enables Visible for all mesh layers on all videos.
+        /// When unchecked, disables Visible for all mesh layers on all videos.
+        /// Individual mesh layers can still be toggled independently after this.
         /// </summary>
         private void OnGlobalShowMeshOverlayChanged(object sender, RoutedEventArgs e)
         {
@@ -274,19 +276,28 @@ namespace ProjectionMapper
                 }
 
                 bool show = PART_GlobalShowMeshOverlayCheckbox.IsChecked == true;
-                _rendererManager.ShowMeshOverlay = show;
-                Debug.WriteLine($"MainWindow: Global mesh overlay visibility set to {show}");
 
-                if (show)
+                // NOTE: We do NOT use _rendererManager.ShowMeshOverlay as a global blocker.
+                // The global checkbox simply checks/unchecks the individual Visible property
+                // for each mesh layer. Individual layers can be toggled independently afterward.
+
+                Debug.WriteLine($"MainWindow: Global mesh overlay toggle - setting all mesh layers Visible={show}");
+
+                int toggledCount = 0;
+                foreach (var video in _vm.ImportedVideos)
                 {
-                    // Refresh all mesh overlays to make them visible again
-                    RefreshAllMeshOverlays();
+                    foreach (var mesh in video.MeshLayers)
+                    {
+                        if (mesh == null) continue;
+
+                        // Toggle the Visible property - this controls overlay visibility
+                        // The PropertyChanged event will trigger overlay updates automatically
+                        mesh.Visible = show;
+                        toggledCount++;
+                    }
                 }
-                else
-                {
-                    // Clear all overlays from all hosts
-                    _rendererManager.ClearAllOverlays();
-                }
+
+                Debug.WriteLine($"MainWindow: Toggled Visible for {toggledCount} mesh layers");
             }
             catch (Exception ex)
             {
@@ -313,7 +324,7 @@ namespace ProjectionMapper
 
                         var targetMonitor = mesh.TargetMonitorIndex;
                         var quadPoints = _rendererManager.MapNormalizedToRendererPoints(mesh.OutputMeshPoints, targetMonitor >= 0 ? targetMonitor : null);
-                        
+
                         if (quadPoints != null && quadPoints.Length >= 4)
                         {
                             _rendererManager.AddMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, quadPoints, true, layerId);
@@ -1681,6 +1692,20 @@ namespace ProjectionMapper
                     return;
                 }
 
+                // CRITICAL FIX: Wait for all video decoders to be ready before starting playlist
+                // This prevents race conditions where the playlist tries to start videos
+                // before their decoders have finished initializing, which can cause crashes.
+                var allSourceIds = groups.SelectMany(g => g.SourceIds).Where(id => !string.IsNullOrEmpty(id)).Distinct().ToList();
+                if (allSourceIds.Count > 0)
+                {
+                    Debug.WriteLine($"MainWindow: Waiting for {allSourceIds.Count} video decoders to initialize before starting playlist...");
+                    var ready = await _videoService.WaitForDecodersReadyAsync(allSourceIds, timeoutMs: 15000).ConfigureAwait(false);
+                    if (!ready)
+                    {
+                        Debug.WriteLine("MainWindow: Warning - Not all decoders ready after timeout, proceeding anyway");
+                    }
+                }
+
                 Debug.WriteLine("MainWindow: Auto-starting playlist playback after project load");
                 await _playlistService.StartPlaylistAsync(groups).ConfigureAwait(false);
                 _vm.SetPlaybackState(true);
@@ -1877,6 +1902,42 @@ namespace ProjectionMapper
             catch (Exception ex)
             {
                 Debug.WriteLine($"MainWindow: CreateMeshMenuItem_Click failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Handles clicking on a sliced mesh creation option.
+        /// Creates multiple mesh layers that divide the source video into equal horizontal slices.
+        /// </summary>
+        private void CreateSlicedMeshMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is not MenuItem menuItem || menuItem.Tag is not string tagValue)
+                {
+                    Debug.WriteLine("MainWindow: CreateSlicedMeshMenuItem_Click - invalid sender or tag");
+                    return;
+                }
+
+                if (!int.TryParse(tagValue, out int sliceCount) || sliceCount < 2)
+                {
+                    Debug.WriteLine($"MainWindow: CreateSlicedMeshMenuItem_Click - invalid slice count: {tagValue}");
+                    return;
+                }
+
+                // Invoke the view-model command to create sliced meshes for the currently selected imported video
+                if (_vm?.CreateSlicedMeshCommand != null && _vm.CreateSlicedMeshCommand.CanExecute(sliceCount))
+                {
+                    _vm.CreateSlicedMeshCommand.Execute(sliceCount);
+                }
+                else
+                {
+                    Debug.WriteLine("MainWindow: CreateSlicedMeshCommand cannot execute or is null");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: CreateSlicedMeshMenuItem_Click failed: {ex}");
             }
         }
 

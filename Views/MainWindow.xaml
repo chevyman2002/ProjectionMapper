@@ -184,6 +184,13 @@
                                     <StackPanel.ContextMenu>
                                         <ContextMenu Opened="VideoContextMenu_Opened">
                                             <MenuItem Header="Create Mesh Layer" Click="CreateMeshMenuItem_Click" />
+                                            <MenuItem Header="Create Sliced Mesh Layers">
+                                                <MenuItem Header="2 Horizontal Slices" Click="CreateSlicedMeshMenuItem_Click" Tag="2" />
+                                                <MenuItem Header="4 Horizontal Slices" Click="CreateSlicedMeshMenuItem_Click" Tag="4" />
+                                                <MenuItem Header="6 Horizontal Slices" Click="CreateSlicedMeshMenuItem_Click" Tag="6" />
+                                                <MenuItem Header="8 Horizontal Slices" Click="CreateSlicedMeshMenuItem_Click" Tag="8" />
+                                                <MenuItem Header="10 Horizontal Slices" Click="CreateSlicedMeshMenuItem_Click" Tag="10" />
+                                            </MenuItem>
                                             <MenuItem Header="Delete Source" Click="DeleteSourceMenuItem_Click" />
                                             <Separator />
                                             <MenuItem Header="Remove from Group" 
@@ -245,7 +252,7 @@
                     <TextBlock FontWeight="Bold" Text="Properties" Margin="0,0,0,8"/>
                     <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
                         <TextBlock Text="Show Mesh Overlay (global):" VerticalAlignment="Center" Margin="0,0,6,0" />
-                        <CheckBox x:Name="PART_GlobalShowMeshOverlayCheckbox" IsChecked="True" VerticalAlignment="Center" 
+                        <CheckBox x:Name="PART_GlobalShowMeshOverlayCheckbox" IsChecked="False" VerticalAlignment="Center" 
                                   Checked="OnGlobalShowMeshOverlayChanged" Unchecked="OnGlobalShowMeshOverlayChanged" />
                     </StackPanel>
                     
