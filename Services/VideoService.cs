@@ -41,6 +41,11 @@ namespace ProjectionMapper.Services
         private readonly object _loopingLock = new();
         private volatile bool _globalLoopingEnabled = true;
 
+        // CRITICAL: Track which layers are currently allowed to render output
+        // When playlist mode is active, only layers in the active group should render
+        private readonly ConcurrentDictionary<string, bool> _activeRenderLayers = new();
+        private volatile bool _playlistModeActive = false;
+
         public VideoService(RendererManager rendererManager, string? ffmpegPath = null)
         {
             _rendererManager = rendererManager ?? throw new ArgumentNullException(nameof(rendererManager));
@@ -58,6 +63,51 @@ namespace ProjectionMapper.Services
         /// Used by PlaylistService to track group completion.
         /// </summary>
         public event Action<string>? VideoCompleted;
+
+        /// <summary>
+        /// Enables playlist mode - only layers explicitly set as active will render.
+        /// </summary>
+        public void EnablePlaylistMode()
+        {
+            _playlistModeActive = true;
+            _activeRenderLayers.Clear();
+            Debug.WriteLine("VideoService: Playlist mode enabled - all layers blocked from rendering until explicitly activated");
+        }
+
+        /// <summary>
+        /// Disables playlist mode - all layers can render.
+        /// </summary>
+        public void DisablePlaylistMode()
+        {
+            _playlistModeActive = false;
+            _activeRenderLayers.Clear();
+            Debug.WriteLine("VideoService: Playlist mode disabled - all layers can render");
+        }
+
+        /// <summary>
+        /// Sets the list of layers that are allowed to render in playlist mode.
+        /// </summary>
+        public void SetActiveRenderLayers(System.Collections.Generic.IEnumerable<string> layerIds)
+        {
+            _activeRenderLayers.Clear();
+            foreach (var id in layerIds)
+            {
+                if (!string.IsNullOrEmpty(id))
+                {
+                    _activeRenderLayers[id] = true;
+                }
+            }
+            Debug.WriteLine($"VideoService: Set {_activeRenderLayers.Count} layers as active for rendering");
+        }
+
+        /// <summary>
+        /// Checks if a layer is allowed to render in the current mode.
+        /// </summary>
+        private bool IsLayerAllowedToRender(string layerId)
+        {
+            if (!_playlistModeActive) return true;
+            return _activeRenderLayers.ContainsKey(layerId);
+        }
 
         private void InvokeOnUi(Action action)
         {
@@ -256,6 +306,44 @@ namespace ProjectionMapper.Services
         private void ProcessDecodedFrameOnUi(LayerModel layer, string layerKey, FFmpegUnifiedDecoder decoder, CancellationTokenSource cts, BitmapSource bmp, int defaultW, int defaultH)
         {
             if (bmp == null) return;
+
+            // CRITICAL: Check if decoder is disposed or paused before processing frame
+            // This prevents race conditions where frames from a paused/disposed decoder
+            // are still being rendered
+            if (decoder.IsDisposed)
+            {
+                return;
+            }
+
+            // Check if this layer is currently paused - if so, don't process new frames
+            if (_decoders.TryGetValue(layerKey, out var currentTuple) && currentTuple.isPaused)
+            {
+                return;
+            }
+
+            // CRITICAL: In playlist mode, only render frames for active layers
+            // This prevents all videos from rendering when only one group should be playing
+            if (!IsLayerAllowedToRender(layerKey))
+            {
+                // Still cache the frame for preview purposes, but don't render to output
+                try
+                {
+                    BitmapSource cachedFrame = bmp;
+                    if (!cachedFrame.IsFrozen)
+                    {
+                        var clone = cachedFrame.Clone();
+                        clone.Freeze();
+                        cachedFrame = clone;
+                    }
+
+                    if (_decoders.TryGetValue(layerKey, out var existing))
+                    {
+                        _decoders[layerKey] = (existing.decoder, existing.cts, existing.model, cachedFrame, existing.isPaused, existing.savedPosition);
+                    }
+                }
+                catch { }
+                return;
+            }
 
             BitmapSource sourceFrozen = bmp;
             try
@@ -959,10 +1047,14 @@ namespace ProjectionMapper.Services
             try
             {
                 if (string.IsNullOrEmpty(layerId)) return;
-                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null)
+                if (_decoders.TryGetValue(layerId, out var tup) && tup.decoder != null && !tup.decoder.IsDisposed)
                 {
                     tup.decoder.AudioEnabled = true;
                     Debug.WriteLine($"VideoService: Audio enabled for {layerId}");
+                }
+                else
+                {
+                    Debug.WriteLine($"VideoService.StartAudioForLayer: Decoder not ready or disposed for {layerId}");
                 }
             }
             catch (Exception ex)
@@ -1254,47 +1346,52 @@ namespace ProjectionMapper.Services
                 return;
             }
 
+            // If already paused, nothing to do
+            if (t.isPaused)
+            {
+                return;
+            }
+
             try
             {
                 TimeSpan currentPosition = TimeSpan.Zero;
+                FFmpegUnifiedDecoder? decoderToDispose = null;
+
                 try
                 {
-                    if (t.decoder != null)
+                    if (t.decoder != null && !t.decoder.IsDisposed)
                     {
                         currentPosition = t.decoder.CurrentPosition;
                         t.decoder.SaveCurrentPosition();
+                        decoderToDispose = t.decoder;
                     }
                 }
                 catch { }
 
+                // CRITICAL: Mark the decoder as disposing FIRST to prevent any more frames from being processed
+                try { decoderToDispose?.MarkDisposing(); } catch { }
+
                 // Cancel the decoder task
                 try { t.cts?.Cancel(); } catch { }
 
-                // Update state immediately without waiting for disposal
-                _decoders[layerId] = (t.decoder, t.cts, t.model, t.lastFrame, true, currentPosition);
+                // Update state immediately - mark as paused and remove decoder reference
+                _decoders[layerId] = (null, null, t.model, t.lastFrame, true, currentPosition);
 
-                // CRITICAL: Mark the decoder as disposing immediately to prevent access violations
-                // from other threads that might try to access it during the background disposal
-                try { t.decoder?.MarkDisposing(); } catch { }
-
-                // Dispose decoder in background (fire and forget)
-                _ = Task.Run(async () =>
+                // Dispose decoder in background but don't fire-and-forget - wait briefly
+                if (decoderToDispose != null)
                 {
-                    try
+                    await Task.Run(() =>
                     {
-                        await Task.Delay(50).ConfigureAwait(false);
-                        t.decoder?.Dispose();
-                        
-                        // Update to remove the decoder reference
-                        if (_decoders.TryGetValue(layerId, out var current) && current.decoder == t.decoder)
+                        try
                         {
-                            _decoders[layerId] = (null, current.cts, current.model, current.lastFrame, true, current.savedPosition);
+                            decoderToDispose.Dispose();
                         }
-                    }
-                    catch { }
-                });
-
-                await Task.CompletedTask.ConfigureAwait(false);
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"VideoService.SoftPauseLayerAsync: Decoder disposal failed for {layerId}: {ex}");
+                        }
+                    }).ConfigureAwait(false);
+                }
             }
             catch (Exception ex)
             {
@@ -1341,6 +1438,71 @@ namespace ProjectionMapper.Services
         {
             if (string.IsNullOrEmpty(layerId)) return false;
             return _decoders.ContainsKey(layerId);
+        }
+
+        /// <summary>
+        /// Waits until all specified layers have their decoders initialized and producing frames.
+        /// This prevents race conditions when starting playlist playback immediately after project load.
+        /// </summary>
+        /// <param name="layerIds">The layer IDs to wait for.</param>
+        /// <param name="timeoutMs">Maximum time to wait in milliseconds (default: 10 seconds).</param>
+        /// <returns>True if all decoders are ready, false if timeout occurred.</returns>
+        public async Task<bool> WaitForDecodersReadyAsync(System.Collections.Generic.IEnumerable<string> layerIds, int timeoutMs = 10000)
+        {
+            if (layerIds == null) return true;
+
+            var idsToWait = layerIds.Where(id => !string.IsNullOrEmpty(id)).ToList();
+            if (idsToWait.Count == 0) return true;
+
+            Debug.WriteLine($"VideoService.WaitForDecodersReadyAsync: Waiting for {idsToWait.Count} decoders to be ready (timeout: {timeoutMs}ms)");
+
+            var sw = Stopwatch.StartNew();
+            var pollInterval = 100; // Check every 100ms
+
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                var allReady = true;
+                var readyCount = 0;
+
+                foreach (var layerId in idsToWait)
+                {
+                    if (_decoders.TryGetValue(layerId, out var tuple))
+                    {
+                        // A decoder is considered ready ONLY if it has produced at least one frame
+                        // This ensures the decoder is fully initialized and can produce output
+                        if (tuple.lastFrame != null)
+                        {
+                            readyCount++;
+                        }
+                        else
+                        {
+                            allReady = false;
+                        }
+                    }
+                    else
+                    {
+                        // Decoder not even registered yet
+                        allReady = false;
+                    }
+                }
+
+                if (allReady)
+                {
+                    Debug.WriteLine($"VideoService.WaitForDecodersReadyAsync: All {idsToWait.Count} decoders ready after {sw.ElapsedMilliseconds}ms");
+                    return true;
+                }
+
+                // Log progress periodically
+                if (sw.ElapsedMilliseconds > 0 && sw.ElapsedMilliseconds % 1000 < pollInterval)
+                {
+                    Debug.WriteLine($"VideoService.WaitForDecodersReadyAsync: {readyCount}/{idsToWait.Count} decoders ready after {sw.ElapsedMilliseconds}ms");
+                }
+
+                await Task.Delay(pollInterval).ConfigureAwait(false);
+            }
+
+            Debug.WriteLine($"VideoService.WaitForDecodersReadyAsync: Timeout after {timeoutMs}ms, some decoders may not be ready");
+            return false;
         }
 
         /// <summary>
@@ -1457,7 +1619,7 @@ namespace ProjectionMapper.Services
 
             if (!t.isPaused)
             {
-                Debug.WriteLine($"VideoService.FastResumeLayerAsync: Layer {layerId} is not paused");
+                Debug.WriteLine($"VideoService.FastResumeLayerAsync: Layer {layerId} is not paused, already running");
                 return;
             }
 
@@ -1472,6 +1634,21 @@ namespace ProjectionMapper.Services
             {
                 var layer = t.model;
                 var savedPosition = t.savedPosition;
+
+                // CRITICAL: Clean up any existing decoder that might still be hanging around
+                if (t.decoder != null && !t.decoder.IsDisposed)
+                {
+                    try
+                    {
+                        t.decoder.MarkDisposing();
+                        t.cts?.Cancel();
+                        t.decoder.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"VideoService.FastResumeLayerAsync: Error disposing old decoder for {layerId}: {ex}");
+                    }
+                }
 
                 // Create new decoder without the 700ms wait
                 var decoder = new FFmpegUnifiedDecoder(layer.SourcePath,

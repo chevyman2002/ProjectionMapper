@@ -173,6 +173,7 @@ namespace ProjectionMapper.ViewModels
                 RestartCommand = new AsyncRelayCommand(ExecuteRestartCommandAsync);
 
                 CreateMeshCommand = new RelayCommand(ExecuteCreateMeshCommand, _ => SelectedImportedVideo != null);
+                CreateSlicedMeshCommand = new RelayCommand(ExecuteCreateSlicedMeshCommand, _ => SelectedImportedVideo != null);
                 DeleteMeshCommand = new RelayCommand(ExecuteDeleteMeshCommand, _ => SelectedMeshLayer != null || SelectedMeshLayers.Count > 0);
                 CopyMeshCommand = new RelayCommand(ExecuteCopyMeshCommand, _ => SelectedMeshLayer != null || SelectedMeshLayers.Count > 0);
                 PasteMeshCommand = new RelayCommand(ExecutePasteMeshCommand, _ => SelectedImportedVideo != null && _copiedMeshes != null && _copiedMeshes.Count > 0);
@@ -553,6 +554,7 @@ namespace ProjectionMapper.ViewModels
 
         // Mesh tree commands
         public ICommand CreateMeshCommand { get; private set; }
+        public ICommand CreateSlicedMeshCommand { get; private set; }
         public ICommand DeleteMeshCommand { get; private set; }
         public ICommand CopyMeshCommand { get; private set; }
         public ICommand PasteMeshCommand { get; private set; }
@@ -816,6 +818,157 @@ namespace ProjectionMapper.ViewModels
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Creates multiple mesh layers that divide the source video into equal horizontal slices.
+        /// Each slice spans half the width (left or right) and 1/(N/2) of the height.
+        /// The slices are arranged in a 2-column grid on both input and output.
+        /// </summary>
+        /// <param name="parameter">The number of slices to create (2, 4, 6, 8, or 10)</param>
+        private void ExecuteCreateSlicedMeshCommand(object? parameter)
+        {
+            if (SelectedImportedVideo == null) return;
+
+            // Parse the slice count from the parameter
+            int sliceCount = 4; // Default to 4 slices
+            if (parameter is int intParam)
+            {
+                sliceCount = intParam;
+            }
+            else if (parameter is string strParam && int.TryParse(strParam, out int parsed))
+            {
+                sliceCount = parsed;
+            }
+
+            if (sliceCount < 2 || sliceCount > 10)
+            {
+                System.Diagnostics.Debug.WriteLine($"ExecuteCreateSlicedMeshCommand: Invalid slice count {sliceCount}, using 4");
+                sliceCount = 4;
+            }
+
+            var host = SelectedImportedVideo.HostLayer;
+            if (host == null)
+            {
+                System.Diagnostics.Debug.WriteLine("ExecuteCreateSlicedMeshCommand: Host layer is null");
+                return;
+            }
+
+            // Always use 2 columns, calculate rows based on slice count
+            int columns = 2;
+            int rows = (sliceCount + 1) / 2; // Round up: 2->1, 4->2, 6->3, 8->4, 10->5
+
+            // Calculate slice dimensions (normalized 0..1)
+            float sliceWidth = 1.0f / columns;  // 0.5 for left/right halves
+            float sliceHeight = 1.0f / rows;
+
+            // Calculate output mesh dimensions - use 80% of output area, arranged in grid
+            int outputGridWidth = (int)(host.Width * 0.8);
+            int outputGridHeight = (int)(host.Height * 0.8);
+            int outputStartX = host.X + (host.Width - outputGridWidth) / 2;
+            int outputStartY = host.Y + (host.Height - outputGridHeight) / 2;
+            int outputSliceWidth = outputGridWidth / columns;
+            int outputSliceHeight = outputGridHeight / rows;
+
+            var createdMeshes = new List<LayerViewModel>();
+            int slicesCreated = 0;
+
+            // Create mesh layers for each slice in the grid
+            for (int row = 0; row < rows; row++)
+            {
+                for (int col = 0; col < columns; col++)
+                {
+                    // Stop if we've created enough slices (handles odd slice counts)
+                    if (slicesCreated >= sliceCount) break;
+
+                    // Calculate normalized input coordinates for this slice
+                    float inputLeft = col * sliceWidth;
+                    float inputRight = inputLeft + sliceWidth;
+                    float inputTop = row * sliceHeight;
+                    float inputBottom = inputTop + sliceHeight;
+
+                    // Calculate output position for this slice (same grid layout)
+                    int outputX = outputStartX + (col * outputSliceWidth);
+                    int outputY = outputStartY + (row * outputSliceHeight);
+
+                    var layerModel = new LayerModel
+                    {
+                        Id = Guid.NewGuid().ToString("N"),
+                        Name = GenerateUniqueMeshName(),
+                        SourceId = host?.Id,
+                        X = outputX,
+                        Y = outputY,
+                        Width = outputSliceWidth,
+                        Height = outputSliceHeight,
+                        Visible = true
+                    };
+
+                    // Set normalized input mesh points for this slice
+                    try
+                    {
+                        var inputMesh = layerModel.MeshPoints;
+                        inputMesh[0] = new Vector2(inputLeft, inputTop);     // TL
+                        inputMesh[1] = new Vector2(inputRight, inputTop);    // TR
+                        inputMesh[2] = new Vector2(inputLeft, inputBottom);  // BL
+                        inputMesh[3] = new Vector2(inputRight, inputBottom); // BR
+
+                        // Set output mesh points to match the same grid layout
+                        var outputMesh = layerModel.OutputMeshPoints;
+                        float outLeft = (float)(outputX - host.X) / host.Width;
+                        float outTop = (float)(outputY - host.Y) / host.Height;
+                        float outRight = (float)(outputX + outputSliceWidth - host.X) / host.Width;
+                        float outBottom = (float)(outputY + outputSliceHeight - host.Y) / host.Height;
+
+                        outputMesh[0] = new Vector2(outLeft, outTop);     // TL
+                        outputMesh[1] = new Vector2(outRight, outTop);    // TR
+                        outputMesh[2] = new Vector2(outLeft, outBottom);  // BL
+                        outputMesh[3] = new Vector2(outRight, outBottom); // BR
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"ExecuteCreateSlicedMeshCommand: Failed to set mesh points for slice {slicesCreated}: {ex}");
+                    }
+
+                    var vm = new LayerViewModel(layerModel);
+                    createdMeshes.Add(vm);
+
+                    // Record undo action for mesh creation
+                    try
+                    {
+                        var action = new CreateMeshAction(SelectedImportedVideo, vm, MeshLayerCreated);
+                        _undoRedoService.RecordAction(action);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"Failed to record create mesh action for slice {slicesCreated}: {ex}");
+                    }
+
+                    SelectedImportedVideo.MeshLayers.Add(vm);
+
+                    // Notify host so it can register this mesh with services (VideoService)
+                    MeshLayerCreated?.Invoke(layerModel);
+
+                    slicesCreated++;
+                }
+            }
+
+            // Select the first created mesh
+            if (createdMeshes.Count > 0)
+            {
+                SelectedMeshLayer = createdMeshes[0];
+            }
+
+            // Prevent host from submitting full-frame into renderer (avoid duplicate output)
+            try
+            {
+                if (host != null)
+                {
+                    host.PreviewOnly = true;
+                }
+            }
+            catch { }
+
+            System.Diagnostics.Debug.WriteLine($"ExecuteCreateSlicedMeshCommand: Created {createdMeshes.Count} sliced mesh layers ({columns}x{rows} grid)");
         }
 
         private void ExecuteDeleteMeshCommand(object? _)

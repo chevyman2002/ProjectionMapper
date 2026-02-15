@@ -187,16 +187,16 @@ namespace ProjectionMapper.Views
             if (oldVm != null)
             {
                 oldVm.PropertyChanged -= SelectedLayer_PropertyChanged;
-                // Clear the old layer from renderer and remove its overlay
+
+                // NOTE: We do NOT remove the overlay when deselecting a layer.
+                // The overlay should remain visible if the layer's Visible property is true.
+                // Only clear the preview frame, not the overlay.
                 var layerId = oldVm.Model?.Id ?? oldVm.Id;
                 if (!string.IsNullOrEmpty(layerId))
                 {
-                    // clear layer by submitting null frame; no destQuad -> null, opacity 0
+                    // Clear the preview frame for this layer (opacity 0)
+                    // This does NOT affect the mesh overlay visibility
                     RendererManager?.SubmitLayerFrame(layerId, null, new Rect(), null, 0.0);
-                    
-                    // Remove the mesh overlay for this layer
-                    var targetMonitor = oldVm.Model?.TargetMonitorIndex;
-                    try { RendererManager?.RemoveMeshOverlayForMonitor(targetMonitor >= 0 ? targetMonitor : null, layerId); } catch { }
                 }
             }
             if (newVm != null)
@@ -839,7 +839,43 @@ namespace ProjectionMapper.Views
             _suppressVmRebind = true;
             try
             {
-                _corners[index] = new Point(_corners[index].X + dx, _corners[index].Y + dy);
+                // Check if Shift is held to maintain rectangular shape
+                bool maintainRectangle = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
+
+                if (maintainRectangle)
+                {
+                    // Move the dragged corner and adjust adjacent corners to maintain 90-degree angles
+                    // Corner indices: 0=TL, 1=TR, 2=BL, 3=BR
+                    switch (index)
+                    {
+                        case 0: // TL: move TL, adjust TR (same Y) and BL (same X)
+                            _corners[0] = new Point(_corners[0].X + dx, _corners[0].Y + dy);
+                            _corners[1] = new Point(_corners[1].X, _corners[0].Y);      // TR gets same Y as TL
+                            _corners[2] = new Point(_corners[0].X, _corners[2].Y);      // BL gets same X as TL
+                            break;
+                        case 1: // TR: move TR, adjust TL (same Y) and BR (same X)
+                            _corners[1] = new Point(_corners[1].X + dx, _corners[1].Y + dy);
+                            _corners[0] = new Point(_corners[0].X, _corners[1].Y);      // TL gets same Y as TR
+                            _corners[3] = new Point(_corners[1].X, _corners[3].Y);      // BR gets same X as TR
+                            break;
+                        case 2: // BL: move BL, adjust BR (same Y) and TL (same X)
+                            _corners[2] = new Point(_corners[2].X + dx, _corners[2].Y + dy);
+                            _corners[3] = new Point(_corners[3].X, _corners[2].Y);      // BR gets same Y as BL
+                            _corners[0] = new Point(_corners[2].X, _corners[0].Y);      // TL gets same X as BL
+                            break;
+                        case 3: // BR: move BR, adjust BL (same Y) and TR (same X)
+                            _corners[3] = new Point(_corners[3].X + dx, _corners[3].Y + dy);
+                            _corners[2] = new Point(_corners[2].X, _corners[3].Y);      // BL gets same Y as BR
+                            _corners[1] = new Point(_corners[3].X, _corners[1].Y);      // TR gets same X as BR
+                            break;
+                    }
+                }
+                else
+                {
+                    // Normal behavior: move only the dragged corner (allows non-rectangular quads)
+                    _corners[index] = new Point(_corners[index].X + dx, _corners[index].Y + dy);
+                }
+
                 ApplyLayout();
                 WriteBackMeshPoints();
             }
