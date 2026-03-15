@@ -13,7 +13,6 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Diagnostics;
-using System.Threading.Tasks;
 
 namespace ProjectionMapper.Rendering
 {
@@ -30,6 +29,12 @@ namespace ProjectionMapper.Rendering
             = new();
 
         public event Action<BitmapSource?>? FrameReady;
+
+        // Serializes RenderTargetBitmap.Render() calls across all renderer instances.
+        // WPF's MIL/DUCE composition infrastructure is not safe for concurrent access from
+        // multiple threads — even dedicated STA render-loop threads. Static so all three
+        // instances (main preview + monitor 1 + monitor 2) share one lock.
+        private static readonly object _renderLock = new();
 
         public void Dispose()
         {
@@ -164,130 +169,120 @@ namespace ProjectionMapper.Rendering
 
             try
             {
-                var dv = new DrawingVisual();
-                using (var dc = dv.RenderOpen())
+                // Phase 1: Pre-compute all per-layer bitmaps (including quad warping) OUTSIDE
+                // the WPF composition lock. WarpBitmapToQuad works exclusively on raw byte arrays
+                // and BitmapSource.Create — no WPF drawing objects are touched — so it is safe to
+                // call concurrently across the three renderer instances. The expensive Parallel.For
+                // homography sampling runs here, not inside the serialized lock below.
+                var layerSnapshot = _layers.ToArray();
+                var compositeItems = new List<(BitmapSource Bitmap, Rect Dest, double Opacity)>(layerSnapshot.Length);
+
+                foreach (var kv in layerSnapshot.OrderBy(k => k.Key))
                 {
-                    // clear background - transparent by default
-                    dc.DrawRectangle(Brushes.Black, null, new Rect(0, 0, _width, _height));
+                    var entry = kv.Value;
+                    if (entry.Frame == null) continue;
 
-                    // Compose layers by key order for determinism
-                    // Take a snapshot of the layers to avoid concurrent modification issues
-                    var layerSnapshot = _layers.ToArray();
-                    
-                    foreach (var kv in layerSnapshot.OrderBy(k => k.Key))
+                    var frame = entry.Frame;
+                    if (!frame.IsFrozen)
                     {
-                        var entry = kv.Value;
-                        if (entry.Frame == null) continue;
+                        Debug.WriteLine($"SoftwareRenderer: Skipping non-frozen frame for layer {kv.Key}");
+                        continue;
+                    }
 
-                        var frame = entry.Frame;
+                    try
+                    {
+                        BitmapSource compositeBitmap = frame;
+                        Rect compositeDest = entry.DestRect;
 
-                        // CRITICAL: Verify frame is frozen before accessing from render thread
-                        if (!frame.IsFrozen)
+                        if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
                         {
-                            Debug.WriteLine($"SoftwareRenderer: Skipping non-frozen frame for layer {kv.Key}");
-                            continue;
-                        }
+                            var quad = entry.DestQuad;
+                            var w = _width;
+                            var h = _height;
 
-                        try
-                        {
-                            // Check if destQuad is the corners, if so, use rect drawing
-                            if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
-                            {
-                                var w = _width;
-                                var h = _height;
-                                if (Math.Abs(entry.DestQuad[0].X - 0) < 1 && Math.Abs(entry.DestQuad[0].Y - 0) < 1 &&
-                                    Math.Abs(entry.DestQuad[1].X - w) < 1 && Math.Abs(entry.DestQuad[1].Y - 0) < 1 &&
-                                    Math.Abs(entry.DestQuad[2].X - 0) < 1 && Math.Abs(entry.DestQuad[2].Y - h) < 1 &&
-                                    Math.Abs(entry.DestQuad[3].X - w) < 1 && Math.Abs(entry.DestQuad[3].Y - h) < 1)
-                                {
-                                    entry.DestQuad = null; // Use rect drawing for corners
-                                }
-                            }
+                            // Skip warping when the quad exactly covers the full-frame corners.
+                            bool isFullFrame =
+                                Math.Abs(quad[0].X) < 1 && Math.Abs(quad[0].Y) < 1 &&
+                                Math.Abs(quad[1].X - w) < 1 && Math.Abs(quad[1].Y) < 1 &&
+                                Math.Abs(quad[2].X) < 1 && Math.Abs(quad[2].Y - h) < 1 &&
+                                Math.Abs(quad[3].X - w) < 1 && Math.Abs(quad[3].Y - h) < 1;
 
-                            if (entry.DestQuad != null && entry.DestQuad.Length >= 4)
+                            if (!isFullFrame)
                             {
                                 try
                                 {
-                                    // Warp into bounding box and draw
-                                    var quad = entry.DestQuad;
-                                    // compute integer bounding box
                                     int minX = (int)Math.Floor(Math.Max(0.0, Math.Min(Math.Min(quad[0].X, quad[1].X), Math.Min(quad[2].X, quad[3].X))));
                                     int minY = (int)Math.Floor(Math.Max(0.0, Math.Min(Math.Min(quad[0].Y, quad[1].Y), Math.Min(quad[2].Y, quad[3].Y))));
                                     int maxX = (int)Math.Ceiling(Math.Min(_width, Math.Max(Math.Max(quad[0].X, quad[1].X), Math.Max(quad[2].X, quad[3].X))));
                                     int maxY = (int)Math.Ceiling(Math.Min(_height, Math.Max(Math.Max(quad[0].Y, quad[1].Y), Math.Max(quad[2].Y, quad[3].Y))));
 
-                                    int w = Math.Max(1, maxX - minX);
-                                    int h = Math.Max(1, maxY - minY);
+                                    int bboxW = Math.Max(1, maxX - minX);
+                                    int bboxH = Math.Max(1, maxY - minY);
 
-                                    var warped = WarpBitmapToQuad(frame, quad, minX, minY, w, h);
+                                    var warped = WarpBitmapToQuad(frame, quad, minX, minY, bboxW, bboxH);
                                     if (warped != null)
                                     {
-                                        var dest = new Rect(minX, minY, w, h);
-                                        // apply opacity
-                                        if (entry.Opacity < 0.999)
-                                        {
-                                            dc.PushOpacity(entry.Opacity);
-                                            dc.DrawImage(warped, dest);
-                                            dc.Pop();
-                                        }
-                                        else
-                                        {
-                                            dc.DrawImage(warped, dest);
-                                        }
+                                        compositeBitmap = warped;
+                                        compositeDest = new Rect(minX, minY, bboxW, bboxH);
                                     }
                                 }
                                 catch (Exception ex)
                                 {
-                                    Debug.WriteLine($"SoftwareRenderer: warp draw failed for layer {kv.Key}: {ex}");
-                                    // fallback to rect drawing below
-                                    if (entry.Opacity < 0.999)
-                                    {
-                                        dc.PushOpacity(entry.Opacity);
-                                        dc.DrawImage(frame, entry.DestRect);
-                                        dc.Pop();
-                                    }
-                                    else
-                                    {
-                                        dc.DrawImage(frame, entry.DestRect);
-                                    }
+                                    Debug.WriteLine($"SoftwareRenderer: warp pre-compute failed for layer {kv.Key}: {ex}");
+                                    // fall through — compositeItem retains the unwarped frame + DestRect
                                 }
                             }
-                            else
+                        }
+
+                        compositeItems.Add((compositeBitmap, compositeDest, entry.Opacity));
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"SoftwareRenderer: Error preparing layer {kv.Key}: {ex}");
+                    }
+                }
+
+                // Phase 2: Compose all pre-computed frames into a RenderTargetBitmap.
+                // The ENTIRE WPF drawing pipeline — DrawingVisual, DrawingContext.DrawImage(), and
+                // RenderTargetBitmap.Render() — is serialized via a static lock because WPF's
+                // MIL/DUCE composition layer is not safe for concurrent access across the three
+                // renderer instances running on parallel STA render-loop threads.
+                RenderTargetBitmap? rtb;
+                lock (_renderLock)
+                {
+                    var dv = new DrawingVisual();
+                    using (var dc = dv.RenderOpen())
+                    {
+                        dc.DrawRectangle(Brushes.Black, null, new Rect(0, 0, _width, _height));
+                        foreach (var item in compositeItems)
+                        {
+                            try
                             {
-                                // default path: draw as rectangle
-                                if (entry.Opacity < 0.999)
+                                if (item.Opacity < 0.999)
                                 {
-                                    dc.PushOpacity(entry.Opacity);
-                                    dc.DrawImage(frame, entry.DestRect);
+                                    dc.PushOpacity(item.Opacity);
+                                    dc.DrawImage(item.Bitmap, item.Dest);
                                     dc.Pop();
                                 }
                                 else
                                 {
-                                    dc.DrawImage(frame, entry.DestRect);
+                                    dc.DrawImage(item.Bitmap, item.Dest);
                                 }
                             }
-                        }
-                        catch (InvalidOperationException ex) when (ex.Message.Contains("different thread"))
-                        {
-                            Debug.WriteLine($"SoftwareRenderer: Cross-thread access detected for layer {kv.Key}, skipping frame");
-                            // Skip this frame to avoid crash
-                            continue;
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"SoftwareRenderer: Unexpected error rendering layer {kv.Key}: {ex}");
-                            continue;
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"SoftwareRenderer: DrawImage failed: {ex}");
+                            }
                         }
                     }
+
+                    rtb = new RenderTargetBitmap(_width, _height, 96, 96, PixelFormats.Pbgra32);
+                    rtb.Render(dv);
+                    try { rtb.Freeze(); } catch { }
                 }
 
-                // Render to bitmap and notify - always use 96 DPI since we work in pixel coordinates
-                // Using non-96 DPI would cause WPF to scale the drawing coordinates, breaking quad warping
-                var rtb = new RenderTargetBitmap(_width, _height, 96, 96, PixelFormats.Pbgra32);
-                rtb.Render(dv);
-                try { rtb.Freeze(); } catch { }
-                
-                // CRITICAL: Marshal FrameReady event to UI thread to prevent cross-thread access
+// Phase 3: Marshal FrameReady to the UI thread — outside the lock so we do not
+// hold the render lock during Dispatcher work.
                 try
                 {
                     var app = Application.Current;
@@ -295,14 +290,8 @@ namespace ProjectionMapper.Rendering
                     {
                         app.Dispatcher.BeginInvoke(() =>
                         {
-                            try
-                            {
-                                FrameReady?.Invoke(rtb);
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"SoftwareRenderer.FrameReady event failed: {ex}");
-                            }
+                            try { FrameReady?.Invoke(rtb); }
+                            catch (Exception ex) { Debug.WriteLine($"SoftwareRenderer.FrameReady event failed: {ex}"); }
                         });
                     }
                     else
@@ -335,29 +324,15 @@ namespace ProjectionMapper.Rendering
             if (quad == null || quad.Length < 4) return null;
             try
             {
-                // Convert source to Bgra32 for sampling - CRITICAL: Ensure it's frozen for thread safety
-                BitmapSource src32;
-                if (src.Format == PixelFormats.Bgra32)
-                {
-                    src32 = src;
-                }
-                else
-                {
-                    var converted = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
-                    if (!converted.IsFrozen)
-                    {
-                        try { converted.Freeze(); } catch { }
-                    }
-                    src32 = converted;
-                }
-
-                // Verify the source bitmap is accessible
-                if (!src32.IsFrozen)
-                {
-                    Debug.WriteLine("WarpBitmapToQuad: Source bitmap is not frozen, skipping warp");
-                    return null;
-                }
-
+// All frames from FFmpegUnifiedDecoder arrive as Bgra32.
+// FormatConvertedBitmap is a DispatcherObject and cannot be created on a background MTA thread
+// (doing so causes a native access violation). Guard here so we never try.
+if (src.Format != PixelFormats.Bgra32)
+{
+    Debug.WriteLine($"WarpBitmapToQuad: source format {src.Format} is not Bgra32 — skipping frame to prevent AV on background thread");
+    return null;
+}
+BitmapSource src32 = src;
                 int srcW = src32.PixelWidth, srcH = src32.PixelHeight;
                 if (srcW <= 0 || srcH <= 0) return null;
 
@@ -486,11 +461,13 @@ namespace ProjectionMapper.Rendering
                     }
                 });
 
-                // Create WriteableBitmap and write pixels - use 96 DPI to match pixel coordinates
-                var wb = new WriteableBitmap(outW, outH, 96, 96, PixelFormats.Bgra32, null);
-                wb.WritePixels(new Int32Rect(0, 0, outW, outH), outPixels, outW * 4, 0);
-                try { wb.Freeze(); } catch { }
-                return wb;
+// BitmapSource.Create with a pixel array is the documented thread-safe way to produce an
+// immutable bitmap from a background thread (same pattern used in FFmpegUnifiedDecoder.ReadVideoFrames).
+// WriteableBitmap is a DispatcherObject requiring WPF thread affinity — creating it on a background
+// MTA render-loop thread causes a native access violation (the intermittent crash on project load).
+var result = BitmapSource.Create(outW, outH, 96, 96, PixelFormats.Bgra32, null, outPixels, outW * 4);
+result.Freeze();
+return result;
             }
             catch (Exception ex)
             {

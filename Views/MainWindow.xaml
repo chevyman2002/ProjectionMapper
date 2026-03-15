@@ -65,6 +65,10 @@
         <!-- Tool bar -->
         <ToolBarTray DockPanel.Dock="Top" IsLocked="False">
             <ToolBar>
+                <Button Content="New" Command="{Binding NewProjectCommand}" ToolTip="New Project (Ctrl+N)" />
+                <Button Content="Open" Command="{Binding LoadProjectCommand}" ToolTip="Open Project (Ctrl+O)" />
+                <Button Content="Save" Command="{Binding SaveProjectCommand}" ToolTip="Save Project (Ctrl+S)" />
+                <Separator />
                 <Button Content="Import" Command="{Binding ImportCommand}" />
 
                 <!-- Play / Pause (icon changes based on IsPlaying) -->
@@ -105,12 +109,14 @@
         <!-- Main content: left panel (unified project tree + properties), center (input/output split horizontal) -->
         <Grid>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="250" />
-                <ColumnDefinition />
+                <ColumnDefinition Width="300" MinWidth="220" MaxWidth="600" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
 
             <!-- Left: Unified Project Tree + Properties -->
-            <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="0,0,1,0" Padding="6" Margin="0,0,10,0">
+            <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="0,0,1,0" Padding="6">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <StackPanel>
                     <!-- Playlist Mode Toggle -->
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
@@ -269,10 +275,8 @@
                             <CheckBox IsChecked="{Binding Visible, Mode=TwoWay}" VerticalAlignment="Center" />
                         </StackPanel>
 
-                        <!-- If a mesh layer is selected, allow rotation -->
+                        <!-- If a mesh layer is selected, show mesh layer properties -->
                         <StackPanel Margin="0,8,0,0" Visibility="{Binding Name, Converter={StaticResource NullToVisibilityConverter}}">
-                            <TextBlock Text="Rotation (deg):" FontWeight="Bold" />
-                            <Slider Minimum="-180" Maximum="180" Value="{Binding RotationDegrees, Mode=TwoWay}" />
 
                             <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                 <TextBlock Text="Output Display:" VerticalAlignment="Center" Margin="0,0,6,0" />
@@ -296,10 +300,14 @@
                     </StackPanel>
 
                 </StackPanel>
+                </ScrollViewer>
             </Border>
 
+            <!-- Resizable splitter between left panel and center content -->
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Center" VerticalAlignment="Stretch" Background="Gray" ShowsPreview="True" />
+
             <!-- Center: split input (top) and output (bottom) with a horizontal divider -->
-            <Border Grid.Column="1" Background="Black" Margin="4,4,4,4">
+            <Border Grid.Column="2" Background="Black" Margin="4,4,4,4">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*" />
