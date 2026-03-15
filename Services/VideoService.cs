@@ -173,6 +173,10 @@ namespace ProjectionMapper.Services
             decoder.FrameDecoded += bmp =>
             {
                 if (bmp == null) return;
+                // Early rejection: skip frames from cancelled decoder sessions
+                try { if (cts.IsCancellationRequested) return; }
+                catch (ObjectDisposedException) { return; }
+
                 InvokeOnUi(() =>
                 {
                     try
@@ -256,6 +260,19 @@ namespace ProjectionMapper.Services
         private void ProcessDecodedFrameOnUi(LayerModel layer, string layerKey, FFmpegUnifiedDecoder decoder, CancellationTokenSource cts, BitmapSource bmp, int defaultW, int defaultH)
         {
             if (bmp == null) return;
+
+            // Early rejection: if the CTS was cancelled, this frame is from an obsolete decoder session
+            try
+            {
+                if (cts == null || cts.IsCancellationRequested)
+                {
+                    return;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
 
             BitmapSource sourceFrozen = bmp;
             try
@@ -1239,6 +1256,13 @@ namespace ProjectionMapper.Services
                 return;
             }
 
+            // Guard: skip if already paused to prevent double-dispose race
+            if (t.isPaused)
+            {
+                Debug.WriteLine($"VideoService.SoftPauseLayerAsync: Layer {layerId} already paused, skipping");
+                return;
+            }
+
             try
             {
                 TimeSpan currentPosition = TimeSpan.Zero;
@@ -1252,28 +1276,34 @@ namespace ProjectionMapper.Services
                 }
                 catch { }
 
-                // Cancel the decoder task
+                // Cancel the decoder task first so ffmpeg ReadAsync exits before we dispose
                 try { t.cts?.Cancel(); } catch { }
 
-                // Update state immediately without waiting for disposal
-                _decoders[layerId] = (t.decoder, t.cts, t.model, t.lastFrame, true, currentPosition);
+                // Capture the decoder reference for disposal
+                var decoderToDispose = t.decoder;
 
-                // Dispose decoder in background (fire and forget)
-                _ = Task.Run(async () =>
+                // Mark as paused and null out the decoder reference immediately
+                // to prevent ProcessDecodedFrameOnUi from matching stale frames
+                _decoders[layerId] = (null, t.cts, t.model, t.lastFrame, true, currentPosition);
+
+                // Dispose decoder in background with enough time for pending I/O to observe cancellation
+                if (decoderToDispose != null)
                 {
-                    try
+                    _ = Task.Run(async () =>
                     {
-                        await Task.Delay(50).ConfigureAwait(false);
-                        t.decoder?.Dispose();
-                        
-                        // Update to remove the decoder reference
-                        if (_decoders.TryGetValue(layerId, out var current) && current.decoder == t.decoder)
+                        try
                         {
-                            _decoders[layerId] = (null, current.cts, current.model, current.lastFrame, true, current.savedPosition);
+                            // Allow time for ReadAsync to observe CTS cancellation and exit cleanly
+                            // before killing the process. This prevents access violation on pipe handle.
+                            await Task.Delay(200).ConfigureAwait(false);
+                            decoderToDispose.Dispose();
                         }
-                    }
-                    catch { }
-                });
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"VideoService.SoftPauseLayerAsync: Background dispose failed for {layerId}: {ex}");
+                        }
+                    });
+                }
 
                 await Task.CompletedTask.ConfigureAwait(false);
             }
@@ -1284,26 +1314,45 @@ namespace ProjectionMapper.Services
         }
 
         /// <summary>
-        /// Hides the source output and associated mesh layers.
+        /// Hides the source output and associated mesh layers by clearing them from the renderer.
+        /// Uses InvokeOnUi to ensure renderer operations happen on the UI thread.
         /// </summary>
-        private async Task HideSourceOutputAndMeshesAsync(string layerId)
+        internal async Task HideSourceOutputAndMeshesAsync(string layerId)
         {
             try
             {
                 if (string.IsNullOrEmpty(layerId)) return;
 
-                // Clear the layer from renderer
-                _rendererManager.SubmitLayerFrameForMonitor(layerId, null, new Rect(), null, 0.0, -1);
+                // Collect all layer IDs that need to be cleared
+                var layersToClear = new System.Collections.Generic.List<(string id, int targetMonitor)>
+                {
+                    (layerId, -1)
+                };
 
-                // Also clear any mesh layers that reference this source
                 foreach (var kv in _meshLayers.ToArray())
                 {
                     var mesh = kv.Value;
                     if (mesh != null && mesh.SourceId == layerId && !string.IsNullOrEmpty(mesh.Id))
                     {
-                        _rendererManager.SubmitLayerFrameForMonitor(mesh.Id, null, new Rect(), null, 0.0, mesh.TargetMonitorIndex);
+                        layersToClear.Add((mesh.Id, mesh.TargetMonitorIndex));
                     }
                 }
+
+                // Marshal renderer operations to UI thread to prevent cross-thread access violations
+                InvokeOnUi(() =>
+                {
+                    foreach (var (id, targetMonitor) in layersToClear)
+                    {
+                        try
+                        {
+                            _rendererManager.SubmitLayerFrameForMonitor(id, null, new Rect(), null, 0.0, targetMonitor);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"VideoService.HideSourceOutputAndMeshesAsync: Failed to clear layer {id}: {ex}");
+                        }
+                    }
+                });
 
                 await Task.CompletedTask.ConfigureAwait(false);
             }
@@ -1473,6 +1522,10 @@ namespace ProjectionMapper.Services
                 decoder.FrameDecoded += bmp =>
                 {
                     if (bmp == null) return;
+                    // Early rejection: skip frames from cancelled decoder sessions
+                    try { if (cts.IsCancellationRequested) return; }
+                    catch (ObjectDisposedException) { return; }
+
                     InvokeOnUi(() =>
                     {
                         try

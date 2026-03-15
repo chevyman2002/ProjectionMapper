@@ -213,14 +213,19 @@ namespace ProjectionMapper.Rendering
                 var app = System.Windows.Application.Current;
                 if (app == null || app.Dispatcher == null || app.Dispatcher.HasShutdownStarted || app.Dispatcher.HasShutdownFinished)
                 {
-                    try { action(); } catch (Exception ex) { Debug.WriteLine($"InvokeOnUi immediate action failed: {ex}"); }
+                    // Dispatcher unavailable or shutting down — do NOT call action() inline.
+                    // The caller may be a background render-loop thread; invoking WPF DispatcherObject
+                    // operations on a background MTA thread causes native access violations.
+                    Debug.WriteLine("InvokeOnUi: dispatcher unavailable or shutting down — skipping UI action");
+                    return;
                 }
-                else
-                {
-                    app.Dispatcher.BeginInvoke((Action)(() => { try { action(); } catch (Exception ex) { Debug.WriteLine($"InvokeOnUi dispatched action failed: {ex}"); } }));
-                }
+                app.Dispatcher.BeginInvoke((Action)(() => { try { action(); } catch (Exception ex) { Debug.WriteLine($"InvokeOnUi dispatched action failed: {ex}"); } }));
             }
-            catch (Exception ex) { try { action(); } catch (Exception ex2) { Debug.WriteLine($"InvokeOnUi outer catch: {ex}; inner: {ex2}"); } }
+            catch (Exception ex)
+            {
+                // Do NOT call action() inline here — the caller may be a background thread.
+                Debug.WriteLine($"InvokeOnUi failed: {ex}");
+            }
         }
 
         private void OnFrameReady(BitmapSource? bmp)
@@ -267,6 +272,9 @@ namespace ProjectionMapper.Rendering
         private readonly Dictionary<int, List<(Point[] QuadPoints, bool ShowPoints, string LayerId)>> _monitorMeshOverlays = new();
         private readonly List<(Point[] QuadPoints, bool ShowPoints, string LayerId)> _mainHostMeshOverlays = new();
 
+        // Coalescing: prevent duplicate BeginInvoke dispatches for the same monitor
+        private readonly HashSet<int> _pendingMonitorOverlayRefresh = new();
+
         /// <summary>
         /// Set mesh overlay (quad outline and optional points) on either the main attached host or a fullscreen host for a monitor.
         /// If monitorIndex is null, the main attached host will be used. If quadPoints is null the overlay will be cleared.
@@ -304,6 +312,8 @@ namespace ProjectionMapper.Rendering
         /// <summary>
         /// Add a mesh overlay for a specific layer to a monitor. Multiple overlays can be added and all will be displayed.
         /// When a specific monitorIndex is provided, the overlay is added to BOTH the main preview host AND the target monitor.
+        /// Fullscreen monitor overlays use a composited bitmap approach (no visual tree changes) to prevent
+        /// rotation glitches on wireless display adapters.
         /// </summary>
         public void AddMeshOverlayForMonitor(int? monitorIndex, Point[]? quadPoints, bool showPoints, string layerId)
         {
@@ -311,29 +321,19 @@ namespace ProjectionMapper.Rendering
 
             try
             {
-                // ALWAYS add to main host for the output preview pane
-                // Remove any existing overlay for this layer from main host
+                // Always add to main host for the output preview pane
                 _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
-                
-                // Add the new overlay to main host
                 _mainHostMeshOverlays.Add((quadPoints, showPoints, layerId));
-                
-                // Update the main host display
                 RefreshMeshOverlaysForMainHost();
 
-                // ALSO add to the specific monitor if one is specified
+                // Also add to the specific monitor if one is specified
                 if (monitorIndex.HasValue)
                 {
                     if (!_monitorMeshOverlays.ContainsKey(monitorIndex.Value))
                         _monitorMeshOverlays[monitorIndex.Value] = new List<(Point[], bool, string)>();
 
-                    // Remove any existing overlay for this layer
                     _monitorMeshOverlays[monitorIndex.Value].RemoveAll(x => x.LayerId == layerId);
-                    
-                    // Add the new overlay
                     _monitorMeshOverlays[monitorIndex.Value].Add((quadPoints, showPoints, layerId));
-
-                    // Update the display
                     RefreshMeshOverlaysForMonitor(monitorIndex.Value);
                 }
             }
@@ -348,11 +348,11 @@ namespace ProjectionMapper.Rendering
         {
             try
             {
-                // ALWAYS remove from main host for the output preview pane
+                // Remove from main host
                 _mainHostMeshOverlays.RemoveAll(x => x.LayerId == layerId);
                 RefreshMeshOverlaysForMainHost();
 
-                // ALSO remove from the specific monitor if one is specified
+                // Remove from the specific monitor
                 if (monitorIndex.HasValue)
                 {
                     if (_monitorMeshOverlays.TryGetValue(monitorIndex.Value, out var overlays))
@@ -361,8 +361,8 @@ namespace ProjectionMapper.Rendering
                         RefreshMeshOverlaysForMonitor(monitorIndex.Value);
                     }
                 }
-                
-                // Also try to remove from ALL monitors in case the target monitor changed
+
+                // Also sweep all monitors in case the target monitor changed
                 foreach (var kv in _monitorMeshOverlays.ToArray())
                 {
                     if (kv.Value != null)
@@ -379,31 +379,62 @@ namespace ProjectionMapper.Rendering
             catch (Exception ex) { Debug.WriteLine($"RemoveMeshOverlayForMonitor failed: {ex}"); }
         }
 
+        /// <summary>
+        /// Refresh all mesh overlays for a specific fullscreen monitor.
+        /// Uses composited bitmap rendering (SetCompositeMeshOverlay) instead of individual
+        /// Canvas children to prevent visual tree churn that causes rotation glitches
+        /// on wireless display adapters. Coalesces rapid calls via _pendingMonitorOverlayRefresh.
+        /// </summary>
         private void RefreshMeshOverlaysForMonitor(int monitorIndex)
         {
             try
             {
-                if (_fullscreenWindows.TryGetValue(monitorIndex, out var win) && win != null)
-                {
-                    InvokeOnUi(() =>
-                    {
-                        try
-                        {
-                            // Clear existing mesh overlays first
-                            win.HostControl.ClearMeshOverlay();
+                if (!_fullscreenWindows.TryGetValue(monitorIndex, out var win) || win == null) return;
 
-                            // Draw all overlays for this monitor using AddMeshOverlay to show multiple
-                            if (_monitorMeshOverlays.TryGetValue(monitorIndex, out var overlays))
-                            {
-                                foreach (var (quadPoints, showPoints, layerId) in overlays)
-                                {
-                                    win.HostControl.AddMeshOverlay(quadPoints, showPoints);
-                                }
-                            }
-                        }
-                        catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor inner failed: {ex}"); }
-                    });
+                // Coalesce: if a refresh is already queued for this monitor, skip
+                lock (_pendingMonitorOverlayRefresh)
+                {
+                    if (!_pendingMonitorOverlayRefresh.Add(monitorIndex))
+                        return;
                 }
+
+                // NOTE: Snapshot is taken INSIDE the lambda so it reads the latest overlay state
+                // at dispatch time. Taking it here (before dispatch) causes a race: rapid Remove+Add
+                // sequences coalesce to one dispatch that uses a stale empty snapshot, causing the
+                // bounding box to disappear after toggling visibility.
+                InvokeOnUi(() =>
+                {
+                    lock (_pendingMonitorOverlayRefresh)
+                    {
+                        _pendingMonitorOverlayRefresh.Remove(monitorIndex);
+                    }
+
+                    try
+                    {
+                        // Fresh snapshot at dispatch time captures the current (latest) overlay state.
+                        List<(Point[] QuadPoints, bool ShowPoints, string LayerId)>? overlaysCopy = null;
+                        if (_monitorMeshOverlays.TryGetValue(monitorIndex, out var overlaysNow) && overlaysNow.Count > 0)
+                        {
+                            overlaysCopy = new List<(Point[], bool, string)>(overlaysNow);
+                        }
+
+                        if (overlaysCopy == null || overlaysCopy.Count == 0)
+                        {
+                            win.HostControl.ClearCompositeMeshOverlay();
+                        }
+                        else
+                        {
+                            // Build the list format expected by SetCompositeMeshOverlay
+                            var compositeList = new List<(Point[], bool)>(overlaysCopy.Count);
+                            foreach (var (quadPoints, showPoints, _) in overlaysCopy)
+                            {
+                                compositeList.Add((quadPoints, showPoints));
+                            }
+                            win.HostControl.SetCompositeMeshOverlay(compositeList);
+                        }
+                    }
+                    catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor inner failed: {ex}"); }
+                });
             }
             catch (Exception ex) { Debug.WriteLine($"RefreshMeshOverlaysForMonitor failed: {ex}"); }
         }
@@ -449,7 +480,15 @@ namespace ProjectionMapper.Rendering
                 if (_host != null) InvokeOnUi(() => _host.ClearOverlay());
                 foreach (var win in _fullscreenWindows.Values.ToList())
                 {
-                    if (win?.HostControl != null) InvokeOnUi(() => win.HostControl.ClearOverlay());
+                    if (win?.HostControl != null) InvokeOnUi(() =>
+                    {
+                        try
+                        {
+                            win.HostControl.ClearOverlay();
+                            win.HostControl.ClearCompositeMeshOverlay();
+                        }
+                        catch { }
+                    });
                 }
             }
             catch { }
@@ -683,27 +722,55 @@ namespace ProjectionMapper.Rendering
 
                     _monitorRendererSizes[monitorIndex] = (renderW, renderH);
 
-                    // Try to get the DPI for this window's monitor
+                    // Try to get the DPI for this window's monitor using synchronous dispatch
+                    // to ensure DPI values are available before renderer initialization
                     double dpiX = 96, dpiY = 96;
                     try
                     {
-                        InvokeOnUi(() =>
+                        var app = System.Windows.Application.Current;
+                        if (app?.Dispatcher != null && !app.Dispatcher.HasShutdownStarted && !app.Dispatcher.HasShutdownFinished)
                         {
-                            try
+                            if (app.Dispatcher.CheckAccess())
                             {
-                                var helper = new WindowInteropHelper(window);
-                                if (helper.Handle != IntPtr.Zero)
+                                // Already on UI thread — execute directly
+                                try
                                 {
-                                    (dpiX, dpiY) = GetWindowDpi(helper.Handle);
+                                    var helper = new WindowInteropHelper(window);
+                                    if (helper.Handle != IntPtr.Zero)
+                                    {
+                                        (dpiX, dpiY) = GetWindowDpi(helper.Handle);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine($"ShowFullScreenWindow: Failed to get window DPI (direct): {ex}");
                                 }
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                Debug.WriteLine($"ShowFullScreenWindow: Failed to get window DPI: {ex}");
+                                // Off UI thread — synchronous Invoke so values are available immediately
+                                app.Dispatcher.Invoke(() =>
+                                {
+                                    try
+                                    {
+                                        var helper = new WindowInteropHelper(window);
+                                        if (helper.Handle != IntPtr.Zero)
+                                        {
+                                            (dpiX, dpiY) = GetWindowDpi(helper.Handle);
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Debug.WriteLine($"ShowFullScreenWindow: Failed to get window DPI (invoke): {ex}");
+                                    }
+                                });
                             }
-                        });
+                        }
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ShowFullScreenWindow: DPI detection failed: {ex}");
+                    }
 
                     // If the DPI detection returned 96 but we're using a larger physical resolution,
                     // the monitor likely has DPI scaling. Calculate an approximate DPI based on
@@ -735,12 +802,32 @@ namespace ProjectionMapper.Rendering
                     // Store renderer
                     _monitorRenderers[monitorIndex] = monitorRenderer;
 
-                    // Start a render loop for the monitor renderer
+                    Debug.WriteLine($"ShowFullScreenWindow: Created renderer for monitor {monitorIndex} at {renderW}x{renderH} @ {dpiX}x{dpiY} DPI");
+
+                    // Pre-initialize the composite overlay bitmap BEFORE starting the render loop.
+                    // PART_CompositeOverlay.Source must be assigned while the window is idle (no frames
+                    // in flight) because assigning it for the first time triggers a WPF layout pass.
+                    // On Miracast / wireless display adapters, that layout pass causes the adapter to
+                    // renegotiate the display session, manifesting as a 90° rotation of the monitor output.
+                    // Using BeginInvoke (async) lets the render loop start first and racing frame delivery
+                    // against the Source assignment under high load can trigger a native MIL crash
+                    // (STATUS_STACK_BUFFER_OVERRUN / 0xC0000409).  Calling InitializeCompositeOverlay
+                    // synchronously here — before loop.Start() — guarantees the assignment completes in a
+                    // quiet state before any rendering or frame-delivery activity begins.
+                    // InitializeCompositeOverlay internally uses Dispatcher.Invoke when called off the UI
+                    // thread, so it is safe to call from either the UI thread or a background thread.
+                    int logicalOverlayW = (dpiX > 0) ? (int)Math.Ceiling(renderW * 96.0 / dpiX) : renderW;
+                    int logicalOverlayH = (dpiY > 0) ? (int)Math.Ceiling(renderH * 96.0 / dpiY) : renderH;
+                    if (logicalOverlayW > 0 && logicalOverlayH > 0 && window.HostControl != null)
+                    {
+                        try { window.HostControl.InitializeCompositeOverlay(logicalOverlayW, logicalOverlayH); } catch { }
+                    }
+
+                    // Start the render loop AFTER the overlay is pre-initialized so the first frame
+                    // delivery never races with the initial Source assignment.
                     var loop = new RenderLoop(async ct => await monitorRenderer.RenderFrameAsync(ct).ConfigureAwait(false), targetFps: 30.0);
                     loop.Start();
                     _monitorRenderLoops[monitorIndex] = loop;
-
-                    Debug.WriteLine($"ShowFullScreenWindow: Created renderer for monitor {monitorIndex} at {renderW}x{renderH} @ {dpiX}x{dpiY} DPI");
                 }
                 catch (Exception ex)
                 {

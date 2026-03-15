@@ -12,5 +12,8 @@
         <Image x:Name="PART_Backbuffer" Stretch="Uniform" SnapsToDevicePixels="True" />
         <!-- Overlay canvas drawn on top of the backbuffer. All visuals here are non-interactive and used for mesh preview outlines. -->
         <Canvas x:Name="PART_Overlay" IsHitTestVisible="False" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+        <!-- Composited overlay image for fullscreen monitors: a single frozen bitmap avoids visual tree churn that can
+             cause rotation glitches on wireless display adapters (Miracast/WiDi). -->
+        <Image x:Name="PART_CompositeOverlay" Stretch="Fill" IsHitTestVisible="False" />
     </Grid>
 </UserControl>

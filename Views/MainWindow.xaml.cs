@@ -1334,6 +1334,8 @@ namespace ProjectionMapper
                     // Physical dimensions default to virtual (will be updated if DPI scaling detected)
                     int physicalW = virtualW;
                     int physicalH = virtualH;
+                    int logicalW = virtualW;
+                    int logicalH = virtualH;
 
                     try
                     {
@@ -1346,6 +1348,9 @@ namespace ProjectionMapper
                         {
                             if (dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0)
                             {
+                                logicalW = dm.dmPelsWidth;
+                                logicalH = dm.dmPelsHeight;
+
                                 // For displays with DPI scaling:
                                 // - EnumDisplayMonitors gives us virtual/scaled coordinates (e.g., 2880x1620 at 150% DPI)
                                 // - EnumDisplaySettings gives us the logical resolution (e.g., 1920x1080)
@@ -1384,10 +1389,20 @@ namespace ProjectionMapper
                     _monitors.Add(new MonitorInfo(virtualW, virtualH, virtualLeft, virtualTop, physicalW, physicalH));
 
                     var isPrimaryStr = isPrimary ? " (Primary)" : "";
+                    // Show the logical resolution (matches Windows Display Settings) with native res if DPI-scaled
+                    string resolutionStr;
+                    if (physicalW != logicalW || physicalH != logicalH)
+                    {
+                        resolutionStr = $"{logicalW}x{logicalH} (native {physicalW}x{physicalH})";
+                    }
+                    else
+                    {
+                        resolutionStr = $"{physicalW}x{physicalH}";
+                    }
                     var monitorItem = new MonitorItem
                     {
                         Index = i,
-                        Name = $"Display {i + 1}: {physicalW}x{physicalH}{isPrimaryStr}"
+                        Name = $"Display {i + 1}: {resolutionStr}{isPrimaryStr}"
                     };
                     _monitorItems.Add(monitorItem);
 
@@ -1397,17 +1412,32 @@ namespace ProjectionMapper
                 // Populate PART_MeshMonitorCombo (for mesh layers)
                 if (PART_MeshMonitorCombo != null)
                 {
+                    // Remember the current selection so we can restore it after repopulating
+                    int previousSelectedIndex = PART_MeshMonitorCombo.SelectedIndex;
+
+                    PART_MeshMonitorCombo.SelectionChanged -= OnMeshMonitorComboSelectionChanged;
+
                     PART_MeshMonitorCombo.Items.Clear();
                     PART_MeshMonitorCombo.Items.Add("(None)");
                     foreach (var item in _monitorItems)
                     {
                         PART_MeshMonitorCombo.Items.Add(item.Name);
                     }
-                    PART_MeshMonitorCombo.SelectedIndex = 0;
 
-                    // Wire up selection changed event for PART_MeshMonitorCombo
-                    PART_MeshMonitorCombo.SelectionChanged -= OnMeshMonitorComboSelectionChanged;
+                    // Restore previous selection if still valid, otherwise default to (None)
+                    if (previousSelectedIndex >= 0 && previousSelectedIndex < PART_MeshMonitorCombo.Items.Count)
+                    {
+                        PART_MeshMonitorCombo.SelectedIndex = previousSelectedIndex;
+                    }
+                    else
+                    {
+                        PART_MeshMonitorCombo.SelectedIndex = 0;
+                    }
+
+                    // Wire up events (idempotent unsubscribe + subscribe)
                     PART_MeshMonitorCombo.SelectionChanged += OnMeshMonitorComboSelectionChanged;
+                    PART_MeshMonitorCombo.DropDownOpened -= OnMeshMonitorComboDropDownOpened;
+                    PART_MeshMonitorCombo.DropDownOpened += OnMeshMonitorComboDropDownOpened;
                 }
 
                 Debug.WriteLine($"MainWindow: Found {_monitorItems.Count} monitors");
@@ -1426,9 +1456,9 @@ namespace ProjectionMapper
             try
             {
                 if (_vm.SelectedMeshLayer == null) return;
-                
+
                 var selectedIndex = PART_MeshMonitorCombo.SelectedIndex - 1; // -1 because "None" is at index 0
-                
+
                 // Use the ViewModel property to trigger PropertyChanged notification
                 // This allows the overlay system to detect the change and update overlays accordingly
                 _vm.SelectedMeshLayer.TargetMonitorIndex = selectedIndex;
@@ -1439,6 +1469,33 @@ namespace ProjectionMapper
             catch (Exception ex)
             {
                 Debug.WriteLine($"MainWindow: OnMeshMonitorComboSelectionChanged failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Re-enumerate monitors each time the dropdown is opened so newly connected displays appear.
+        /// </summary>
+        private void OnMeshMonitorComboDropDownOpened(object? sender, EventArgs e)
+        {
+            try
+            {
+                Debug.WriteLine("MainWindow: Monitor combo dropdown opened, refreshing monitor list");
+                EnumerateMonitors();
+
+                // If a mesh layer is selected, restore the combo selection to match its target monitor
+                if (_vm.SelectedMeshLayer != null)
+                {
+                    var targetIdx = _vm.SelectedMeshLayer.TargetMonitorIndex;
+                    var comboIdx = targetIdx + 1; // +1 because "(None)" is at index 0
+                    if (comboIdx >= 0 && comboIdx < PART_MeshMonitorCombo.Items.Count)
+                    {
+                        PART_MeshMonitorCombo.SelectedIndex = comboIdx;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MainWindow: OnMeshMonitorComboDropDownOpened failed: {ex}");
             }
         }
 
@@ -1660,6 +1717,7 @@ namespace ProjectionMapper
 
         /// <summary>
         /// Ensures playlist playback starts automatically when playlist mode is active after loading a project.
+        /// Adds a brief delay to allow decoders to fully initialize before starting group transitions.
         /// </summary>
         private async Task EnsurePlaylistAutostartAsync()
         {
@@ -1681,10 +1739,35 @@ namespace ProjectionMapper
                     return;
                 }
 
+                // Allow decoders time to fully start and produce initial frames before
+                // the playlist hides/pauses most of them. This prevents racing between
+                // decoder initialization and disposal (which causes access violations
+                // on pipe handles when ffmpeg ReadAsync is still pending).
+                await Task.Delay(500).ConfigureAwait(false);
+
                 Debug.WriteLine("MainWindow: Auto-starting playlist playback after project load");
                 await _playlistService.StartPlaylistAsync(groups).ConfigureAwait(false);
-                _vm.SetPlaybackState(true);
-                _vm.StatusText = "Playing (Playlist Mode)";
+
+                // Update VM on UI thread since we may be on a thread pool thread after ConfigureAwait(false)
+                try
+                {
+                    Dispatcher.BeginInvoke(() =>
+                    {
+                        try
+                        {
+                            _vm.SetPlaybackState(true);
+                            _vm.StatusText = "Playing (Playlist Mode)";
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"MainWindow: EnsurePlaylistAutostartAsync VM update failed: {ex}");
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"MainWindow: EnsurePlaylistAutostartAsync Dispatcher failed: {ex}");
+                }
             }
             catch (Exception ex)
             {

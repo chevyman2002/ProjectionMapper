@@ -23,6 +23,7 @@ namespace ProjectionMapper.Services
         private readonly string? _ffmpegPath;
         private Process? _process;
         private CancellationTokenSource? _cts;
+        private volatile int _disposed; // 0 = not disposed, 1 = disposed (atomic guard)
 
         // Audio components
         private IWavePlayer? _wavePlayer;
@@ -821,36 +822,40 @@ _waveProvider.AddSamples(buffer, 0, bytesRead);
 
         public void Dispose()
         {
-       // Stop any ongoing decoding
-            _cts?.Cancel();
+            // Atomic guard: only the first caller actually disposes
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            // Stop any ongoing decoding
+            try { _cts?.Cancel(); } catch { }
 
             // Wait briefly to allow tasks to observe cancellation
-        try { Thread.Sleep(50); } catch { }
+            try { Thread.Sleep(100); } catch { }
 
-  // Final cleanup
- CleanupProcess();
+            // Final cleanup
+            CleanupProcess();
 
-   // Dispose audio components
+            // Dispose audio components
             try
-         {
-          if (_wavePlayer != null)
-       {
-            try { _wavePlayer.Stop(); } catch { }
-        _wavePlayer.Dispose();
-   _wavePlayer = null;
-          }
-     }
-  catch { }
-
-         try
-       {
-     if (_waveProvider != null)
-     {
- _waveProvider.ClearBuffer();
-       _waveProvider = null;
-       }
+            {
+                var player = Interlocked.Exchange(ref _wavePlayer, null);
+                if (player != null)
+                {
+                    try { player.Stop(); } catch { }
+                    player.Dispose();
+                }
             }
-   catch { }
+            catch { }
+
+            try
+            {
+                var provider = _waveProvider;
+                _waveProvider = null;
+                provider?.ClearBuffer();
+            }
+            catch { }
         }
     }
 }

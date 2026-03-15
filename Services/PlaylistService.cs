@@ -651,10 +651,12 @@ namespace ProjectionMapper.Services
 
         /// <summary>
         /// Starts the current video in a sequential group.
+        /// Only hides/shows within the group since non-group layers are already hidden by StartCurrentGroupAsync.
         /// </summary>
         private async Task StartCurrentSequentialVideoAsync(PlaylistGroupModel? group)
         {
             string? currentVideoId;
+            List<string> allActiveIds;
             lock (_lock)
             {
                 if (_sequentialVideoIndex < 0 || _sequentialVideoIndex >= _sequentialActiveSourceIds.Count)
@@ -663,6 +665,7 @@ namespace ProjectionMapper.Services
                     return;
                 }
                 currentVideoId = _sequentialActiveSourceIds[_sequentialVideoIndex];
+                allActiveIds = new List<string>(_sequentialActiveSourceIds);
             }
 
             if (string.IsNullOrEmpty(currentVideoId))
@@ -677,8 +680,18 @@ namespace ProjectionMapper.Services
             _videoCompletionStatus.Clear();
             _videoCompletionStatus[currentVideoId] = false;
 
-            // Hide all other videos in the group, show only current
-            await _videoService.HideAllExceptGroupAsync(new List<string> { currentVideoId }).ConfigureAwait(false);
+            // Soft-pause other videos in the group (not all videos — non-group ones are already hidden)
+            var otherGroupIds = allActiveIds.Where(id => id != currentVideoId).ToList();
+            if (otherGroupIds.Count > 0)
+            {
+                var hideTasks = new List<Task>();
+                foreach (var otherId in otherGroupIds)
+                {
+                    hideTasks.Add(_videoService.SoftPauseLayerAsync(otherId));
+                    hideTasks.Add(_videoService.HideSourceOutputAndMeshesAsync(otherId));
+                }
+                await Task.WhenAll(hideTasks).ConfigureAwait(false);
+            }
 
             // Start just this video
             await _videoService.StartGroupVideosAsync(new List<string> { currentVideoId }).ConfigureAwait(false);
