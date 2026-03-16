@@ -555,7 +555,8 @@ namespace ProjectionMapper.Services
 
             try
             {
-                if (!string.IsNullOrEmpty(mesh.SourceId) && _decoders.TryGetValue(mesh.SourceId, out var tuple) && tuple.lastFrame != null)
+                if (!string.IsNullOrEmpty(mesh.SourceId) && _decoders.TryGetValue(mesh.SourceId, out var tuple) && tuple.lastFrame != null
+                    && (!_playlistModeActive || IsLayerAllowedToRender(mesh.SourceId)))
                 {
                     var sourceFrame = tuple.lastFrame;
                     BitmapSource frameForMesh = sourceFrame;
@@ -1543,10 +1544,13 @@ namespace ProjectionMapper.Services
             if (layerIds == null || layerIds.Count == 0)
                 return new System.Collections.Generic.List<string>();
 
+            // Check for model registration rather than a live decoder: decoders may have been
+            // paused or disposed by PauseAllAsync just before this call, but the layer is still
+            // registered and should be included so it can be fast-resumed for the group.
             var activeIds = new System.Collections.Generic.List<string>();
             foreach (var id in layerIds)
             {
-                if (!string.IsNullOrEmpty(id) && _decoders.ContainsKey(id))
+                if (!string.IsNullOrEmpty(id) && _decoders.TryGetValue(id, out var t) && t.model != null)
                 {
                     activeIds.Add(id);
                 }

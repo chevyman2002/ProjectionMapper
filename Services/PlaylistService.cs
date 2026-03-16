@@ -549,6 +549,9 @@ namespace ProjectionMapper.Services
                 if (activeSourceIds.Count == 0)
                 {
                     Debug.WriteLine($"PlaylistService.StartCurrentGroupAsync: No active videos in group '{currentGroup.Name}', skipping to next group");
+                    // Clear render layers and hide all outputs so empty-group transitions don't leave stale frames on screen
+                    _videoService.SetActiveRenderLayers(Enumerable.Empty<string>());
+                    await _videoService.HideAllExceptGroupAsync(new System.Collections.Generic.List<string>()).ConfigureAwait(false);
                     await AdvanceToNextGroupAsync().ConfigureAwait(false);
                     return;
                 }
@@ -572,6 +575,12 @@ namespace ProjectionMapper.Services
                 // CRITICAL: Set which layers are allowed to render BEFORE starting videos
                 // This ensures only the current group's videos appear on screen
                 _videoService.SetActiveRenderLayers(activeSourceIds);
+
+                // CRITICAL: Clear stale renderer frames for any layer NOT in this group.
+                // PauseAllAsync stops decoding but leaves the last submitted bitmap visible on the
+                // renderer until something overwrites it. Without this, every non-group video keeps
+                // its frozen last-frame on the projector output indefinitely.
+                await _videoService.HideAllExceptGroupAsync(activeSourceIds).ConfigureAwait(false);
 
                 // Handle based on playback mode
                 if (currentGroup.PlaybackMode == GroupPlaybackMode.Sequential)
