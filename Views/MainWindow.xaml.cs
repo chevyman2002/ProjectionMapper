@@ -1476,6 +1476,13 @@ namespace ProjectionMapper
                 Debug.WriteLine($"MainWindow: Set target monitor to {selectedIndex} for mesh layer");
 
                 EnsureMonitorWindows();
+
+                // Route the cached frame immediately, even while playback is paused.
+                var meshLayerId = _vm.SelectedMeshLayer.Id;
+                if (!string.IsNullOrEmpty(meshLayerId))
+                {
+                    _videoService.RefreshMeshLayerRendering(meshLayerId);
+                }
             }
             catch (Exception ex)
             {

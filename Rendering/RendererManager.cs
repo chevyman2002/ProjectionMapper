@@ -6,6 +6,7 @@ using ProjectionMapper.Views;
 using System;
 using System.Numerics;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -20,6 +21,7 @@ namespace ProjectionMapper.Rendering
     public sealed class RendererManager : IDisposable
     {
         private readonly IRenderer _renderer;
+        private readonly object _layerSubmissionLock = new();
         private RenderLoop? _renderLoop;
         private bool _started;
         private bool _disposed;
@@ -29,10 +31,10 @@ namespace ProjectionMapper.Rendering
         private readonly Dictionary<int, FullScreenOutputWindow> _fullscreenWindows = new();
 
         // Per-monitor renderers for separate composition
-        private readonly Dictionary<int, IRenderer> _monitorRenderers = new();
+        private readonly ConcurrentDictionary<int, IRenderer> _monitorRenderers = new();
         private readonly Dictionary<int, RenderLoop> _monitorRenderLoops = new();
         // Track monitor renderer pixel sizes (width, height)
-        private readonly Dictionary<int, (int Width, int Height)> _monitorRendererSizes = new();
+        private readonly ConcurrentDictionary<int, (int Width, int Height)> _monitorRendererSizes = new();
 
         /// <summary>
         /// Get the renderer size for a specific monitor. Returns (0,0) if the monitor is not registered.
@@ -526,44 +528,58 @@ namespace ProjectionMapper.Rendering
         {
             try
             {
-                // Get target monitor size for coordinate scaling
-                int monitorW = 0, monitorH = 0;
-                if (targetMonitorIndex >= 0 && _monitorRendererSizes.TryGetValue(targetMonitorIndex, out var monSize))
+                lock (_layerSubmissionLock)
                 {
-                    monitorW = monSize.Width;
-                    monitorH = monSize.Height;
-                }
-
-                // Submit to main renderer with coordinates scaled to main renderer size
-                // destQuad is in target monitor coordinates, need to scale to main renderer coordinates
-                Point[]? mainQuad = destQuad;
-                Rect mainRect = destRect;
-                if (destQuad != null && monitorW > 0 && monitorH > 0 && OutputWidth > 0 && OutputHeight > 0)
-                {
-                    // Scale from monitor coordinates to main renderer coordinates
-                    double scaleX = (double)OutputWidth / monitorW;
-                    double scaleY = (double)OutputHeight / monitorH;
-                    mainQuad = new Point[4]
+                    // Get target monitor size for coordinate scaling
+                    int monitorW = 0, monitorH = 0;
+                    if (targetMonitorIndex >= 0 && _monitorRendererSizes.TryGetValue(targetMonitorIndex, out var monSize))
                     {
-                        new Point(destQuad[0].X * scaleX, destQuad[0].Y * scaleY),
-                        new Point(destQuad[1].X * scaleX, destQuad[1].Y * scaleY),
-                        new Point(destQuad[2].X * scaleX, destQuad[2].Y * scaleY),
-                        new Point(destQuad[3].X * scaleX, destQuad[3].Y * scaleY)
-                    };
-                    mainRect = new Rect(destRect.X * scaleX, destRect.Y * scaleY, destRect.Width * scaleX, destRect.Height * scaleY);
-                }
-                _renderer.SubmitLayerFrame(layerId, frame, mainRect, mainQuad, opacity);
+                        monitorW = monSize.Width;
+                        monitorH = monSize.Height;
+                    }
 
-                // If target monitor is unspecified (-1), we're done - only show in main preview
-                if (targetMonitorIndex == -1)
-                {
-                    return;
-                }
+                    // Submit to main renderer with coordinates scaled to main renderer size
+                    // destQuad is in target monitor coordinates, need to scale to main renderer coordinates
+                    Point[]? mainQuad = destQuad;
+                    Rect mainRect = destRect;
+                    if (destQuad != null && monitorW > 0 && monitorH > 0 && OutputWidth > 0 && OutputHeight > 0)
+                    {
+                        // Scale from monitor coordinates to main renderer coordinates
+                        double scaleX = (double)OutputWidth / monitorW;
+                        double scaleY = (double)OutputHeight / monitorH;
+                        mainQuad = new Point[4]
+                        {
+                            new Point(destQuad[0].X * scaleX, destQuad[0].Y * scaleY),
+                            new Point(destQuad[1].X * scaleX, destQuad[1].Y * scaleY),
+                            new Point(destQuad[2].X * scaleX, destQuad[2].Y * scaleY),
+                            new Point(destQuad[3].X * scaleX, destQuad[3].Y * scaleY)
+                        };
+                        mainRect = new Rect(destRect.X * scaleX, destRect.Y * scaleY, destRect.Width * scaleX, destRect.Height * scaleY);
+                    }
+                    _renderer.SubmitLayerFrame(layerId, frame, mainRect, mainQuad, opacity);
 
-                // Submit to the target monitor renderer with original coordinates (already in correct coordinate space)
-                if (_monitorRenderers.TryGetValue(targetMonitorIndex, out var monitorRenderer))
-                {
-                    monitorRenderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+                    // Renderers retain layer frames between submissions. Clear this layer from
+                    // every non-target output before routing it, including when set to None.
+                    // Snapshot the concurrent registry because output windows can change on the UI thread.
+                    foreach (var output in _monitorRenderers.ToArray())
+                    {
+                        if (output.Key != targetMonitorIndex)
+                        {
+                            output.Value.SubmitLayerFrame(layerId, null, new Rect(), null, 0.0);
+                        }
+                    }
+
+                    // If target monitor is unspecified (-1), we're done - only show in main preview
+                    if (targetMonitorIndex == -1)
+                    {
+                        return;
+                    }
+
+                    // Submit to the target monitor renderer with original coordinates (already in correct coordinate space)
+                    if (_monitorRenderers.TryGetValue(targetMonitorIndex, out var monitorRenderer))
+                    {
+                        monitorRenderer.SubmitLayerFrame(layerId, frame, destRect, destQuad, opacity);
+                    }
                 }
             }
             catch (Exception ex)
@@ -692,7 +708,7 @@ namespace ProjectionMapper.Rendering
                 if (_monitorRenderers.TryGetValue(monitorIndex, out var oldRenderer))
                 {
                     try { oldRenderer.Dispose(); } catch { }
-                    _monitorRenderers.Remove(monitorIndex);
+                    _monitorRenderers.TryRemove(monitorIndex, out _);
                 }
                 if (_fullscreenWindows.TryGetValue(monitorIndex, out var oldWin) && oldWin != window)
                 {
@@ -874,11 +890,11 @@ catch (Exception ex)
                 if (_monitorRenderers.TryGetValue(monitorIndex, out var renderer))
                 {
                     try { renderer.Dispose(); } catch (Exception exR) { Debug.WriteLine($"HideFullScreenWindow: renderer dispose failed for monitor {monitorIndex}: {exR}"); }
-                    _monitorRenderers.Remove(monitorIndex);
+                    _monitorRenderers.TryRemove(monitorIndex, out _);
                 }
 
                 // Remove stored size
-                if (_monitorRendererSizes.ContainsKey(monitorIndex)) _monitorRendererSizes.Remove(monitorIndex);
+                if (_monitorRendererSizes.ContainsKey(monitorIndex)) _monitorRendererSizes.TryRemove(monitorIndex, out _);
             }
             catch (Exception ex)
             {

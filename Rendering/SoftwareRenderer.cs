@@ -96,6 +96,14 @@ namespace ProjectionMapper.Rendering
         {
             if (string.IsNullOrEmpty(layerId)) return;
 
+            // A null submission clears retained content, including stale monitor assignments.
+            // Remove the entry rather than accumulating empty layers on unrelated outputs.
+            if (frame == null)
+            {
+                RemoveLayer(layerId);
+                return;
+            }
+
             // CRITICAL: Ensure BitmapSource is frozen to allow cross-thread access
             BitmapSource? safeFrame = null;
             if (frame != null)

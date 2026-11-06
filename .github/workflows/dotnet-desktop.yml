@@ -75,6 +75,9 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
+      - name: Verify output routing regressions
+        run: dotnet run --project tests/OutputRouting.Regression/OutputRouting.Regression.csproj --configuration Release
+
       - name: Run tests if present
         shell: pwsh
         run: |
